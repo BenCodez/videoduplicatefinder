@@ -21,14 +21,20 @@ namespace VDF.GUI.HeadlessTests;
 
 /// <summary>A view model holding two duplicate groups of two videos each, list already built.</summary>
 static class ResultsFixture {
+	// No directories or media are created: these remain unavailable-file fixtures on every OS.
+	public static string RootFolder { get; } = Path.GetFullPath(Path.Combine(Path.GetTempPath(), "vdf-headless-results-" + Guid.NewGuid().ToString("N")));
+	public static string HolidayFolder { get; } = Path.Combine(RootFolder, "D", "Videos", "Holiday");
+	public static string CopyFolder { get; } = Path.Combine(HolidayFolder, "copy");
+	public static string ArchiveFolder { get; } = Path.Combine(RootFolder, "E", "Archive", "Old");
+
 	public static MainWindowVM CreatePopulatedViewModel() {
 		var vm = new MainWindowVM();
 		var first = Guid.NewGuid();
 		var second = Guid.NewGuid();
-		Add(vm, @"D:\Videos\Holiday\beach_2019_final.mp4", first, 100f, 1_900_000_000, 1920, best: true);
-		Add(vm, @"D:\Videos\Holiday\copy\beach_2019_final (1).mp4", first, 98.4f, 700_000_000, 1280, best: false);
-		Add(vm, @"E:\Archive\Old\wedding.mkv", second, 100f, 3_100_000_000, 3840, best: true);
-		Add(vm, @"E:\Archive\Old\wedding_small.mp4", second, 91.2f, 400_000_000, 854, best: false);
+		Add(vm, Path.Combine(HolidayFolder, "beach_2019_final.mp4"), first, 100f, 1_900_000_000, 1920, best: true);
+		Add(vm, Path.Combine(CopyFolder, "beach_2019_final (1).mp4"), first, 98.4f, 700_000_000, 1280, best: false);
+		Add(vm, Path.Combine(ArchiveFolder, "wedding.mkv"), second, 100f, 3_100_000_000, 3840, best: true);
+		Add(vm, Path.Combine(ArchiveFolder, "wedding_small.mp4"), second, 91.2f, 400_000_000, 854, best: false);
 		vm.RebuildResultsList();
 		return vm;
 	}
