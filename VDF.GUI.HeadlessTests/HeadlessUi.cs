@@ -71,6 +71,9 @@ public static class HeadlessUi {
 		initialized = true;
 		// Names are asserted as text, so pin the language instead of following the OS.
 		App.Lang.LoadLanguage("en");
+		// Match desktop startup: load settings in the main window before any
+		// dialog subscribes to the settings instance for live appearance updates.
+		Shell();
 	}
 
 	static MainWindow? shell;
