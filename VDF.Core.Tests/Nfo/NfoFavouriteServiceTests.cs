@@ -15,7 +15,9 @@ public sealed class NfoFavouriteServiceTests : IDisposable {
 	}
 	static NfoOptions Enabled() => new() { Enabled = true };
 	string Write(string relativePath, string contents = "") {
-		string path = Path.Combine(_directory, relativePath);
+		// Sources come from DirectoryInfo.FullName, which uses native separators.
+		// Path.Combine alone preserves forward slashes inside Windows fixture paths.
+		string path = Path.GetFullPath(Path.Combine(_directory, relativePath));
 		Directory.CreateDirectory(Path.GetDirectoryName(path)!);
 		File.WriteAllText(path, contents, new UTF8Encoding(false));
 		return path;
@@ -319,6 +321,23 @@ public sealed class NfoFavouriteServiceTests : IDisposable {
 		NfoResult result = _service.Inspect(video, options);
 		Assert.True(result.IsFavourite);
 		Assert.Equal(season, Assert.Single(result.Sources));
+	}
+
+	[Fact]
+	public void InheritanceWithUnicodeDirectories_ReturnsCanonicalNativeSourcePaths() {
+		string video = Write("Séries/東京/Saison 1/Épisode 1/épisode.mkv");
+		string episode = Write("Séries/東京/Saison 1/Épisode 1/épisode.nfo", "<episodedetails><favorite>false</favorite></episodedetails>");
+		string season = Write("Séries/東京/Saison 1/season.nfo", "<season><favorite>true</favorite></season>");
+		string series = Write("Séries/東京/tvshow.nfo", "<tvshow><favorite>false</favorite></tvshow>");
+		var options = Enabled();
+		options.InheritSeries = options.InheritSeason = true;
+
+		NfoResult result = _service.Inspect(video, options);
+
+		Assert.True(result.IsFavourite);
+		Assert.False(result.IsUncertain);
+		Assert.Equal(new[] { episode, season, series }, result.Sources);
+		Assert.All(result.Sources, source => Assert.Equal(Path.GetFullPath(source), source));
 	}
 
 	[Fact]
