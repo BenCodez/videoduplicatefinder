@@ -386,9 +386,9 @@ namespace VDF.Core {
 						isScanning = false; // search-only: no StartCompare to clear it
 				}
 				else {
+					isScanning = false;
 					ScanAborted?.Invoke(this, new EventArgs());
 					Logger.Instance.Info(T("Log.ScanAborted"));
-					isScanning = false;
 				}
 			}
 			catch (Exception ex) {
@@ -3115,19 +3115,18 @@ namespace VDF.Core {
 
 		public void Stop() {
 			Logger.Instance.Info("Scan stopped by user");
-			if (isScanning)
-				cancelationTokenSource.Cancel();
+			if (!isScanning) {
+				// No worker is alive to acknowledge Stop. Active workers signal their own
+				// completion after cancellation; emitting early permits an overlapping scan.
+				ScanAborted?.Invoke(this, EventArgs.Empty);
+				return;
+			}
+			cancelationTokenSource.Cancel();
 			// Cancel before resuming: workers parked in WaitWhilePaused observe the
 			// cancelled token and throw instead of waking up and fully processing one
 			// more file each (with a dead token that would poison its results).
 			if (pauseTokenSource.IsPaused)
 				Resume();
-			else
-				// No scan task is alive to observe the cancellation, so nothing would ever
-				// raise ScanAborted. A frontend that still believes a scan is running (its
-				// Stop was clickable) would otherwise wait on its busy overlay forever (#821)
-				// — tell it the scan is over so it can reset.
-				ScanAborted?.Invoke(this, new EventArgs());
 		}
 	}
 }

@@ -1,6 +1,9 @@
 name: Docker (Web UI)
 
-on: [push]
+on:
+  push:
+    branches: [master]
+    tags: ['v*.*.*']
 
 jobs:
   build-and-push:

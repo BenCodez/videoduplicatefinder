@@ -66,6 +66,7 @@ namespace VDF.Core.ViewModels {
 					int i = selAudio[0];
 					AudioFormat = file.mediaInfo.Streams[i].CodecName ?? "<Unknown>";
 					AudioChannel = file.mediaInfo.Streams[i].ChannelLayout ?? "<Unknown>";
+					AudioChannels = file.mediaInfo.Streams[i].Channels;
 					AudioSampleRate = file.mediaInfo.Streams[i].SampleRate;
 					AudioBitRateKbs = Math.Round((decimal)file.mediaInfo.Streams[i].BitRate / 1000);
 				}
@@ -212,6 +213,8 @@ namespace VDF.Core.ViewModels {
 		public string? AudioFormat { get; set; }
 		[JsonInclude]
 		public string? AudioChannel { get; set; }
+		[JsonInclude]
+		public int AudioChannels { get; set; }
 		[JsonInclude]
 		public int AudioSampleRate { get; set; }
 		public bool IsBestAudioSampleRate { get; set; }

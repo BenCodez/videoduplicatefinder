@@ -69,4 +69,35 @@ public class ScanEngineAbortTests {
 
 		Assert.True(aborted);
 	}
+
+	[Fact]
+	public async Task Stop_WithActiveUnpausedWorkerWaitsForCancellationAcknowledgement() {
+		string directory = Directory.CreateTempSubdirectory("vdf-stop-worker").FullName;
+		using var release = new ManualResetEventSlim();
+		var enumerated = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+		var aborted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+		var engine = new ScanEngine();
+		engine.Settings.CustomDatabaseFolder = directory;
+		engine.Settings.UseNativeFfmpegBinding = false;
+		engine.Settings.IncludeList.Add(directory);
+		int abortCount = 0;
+		engine.FilesEnumerated += (_, _) => { enumerated.TrySetResult(); release.Wait(TimeSpan.FromSeconds(15)); };
+		engine.ScanAborted += (_, _) => { Interlocked.Increment(ref abortCount); aborted.TrySetResult(); };
+		try {
+			var starting = Task.Run(() => engine.StartSearch(searchAndCompare: false));
+			await enumerated.Task.WaitAsync(TimeSpan.FromSeconds(15));
+			engine.Stop();
+			Assert.False(aborted.Task.IsCompleted, "An active worker still owns the engine; a frontend must not start another scan yet.");
+			release.Set();
+			await aborted.Task.WaitAsync(TimeSpan.FromSeconds(15));
+			await starting;
+			Assert.Equal(1, Volatile.Read(ref abortCount));
+		}
+		finally {
+			release.Set();
+			VDF.Core.Utils.DatabaseUtils.CustomDatabaseFolder = null;
+			VDF.Core.Utils.DatabaseUtils.InvalidateDatabaseFolder();
+			try { Directory.Delete(directory, true); } catch { }
+		}
+	}
 }
