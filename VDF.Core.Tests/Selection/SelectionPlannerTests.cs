@@ -25,6 +25,45 @@ public class SelectionPlannerTests {
         Assert.EndsWith(expected, Keeper(new[] { old, newer }, new() { Profile = profile }));
     }
 
+    [Theory]
+    [InlineData(SelectionProfile.NewestFirst, 1, true)]
+    [InlineData(SelectionProfile.NewestFirst, -1, false)]
+    [InlineData(SelectionProfile.OldestFirst, 1, false)]
+    [InlineData(SelectionProfile.OldestFirst, -1, true)]
+    public void DateProfilesPreserveSingleTickDifferencesInStrictAndWeightedModes(SelectionProfile profile, int tickOffset, bool keepChanged) {
+        var first = Candidate("a-first.mp4"); var changed = Candidate("z-changed.mp4");
+        changed.Item.DateModified = first.Item.DateModified.AddTicks(tickOffset);
+        changed.Item.DateCreated = first.Item.DateCreated.AddTicks(tickOffset);
+        first.EmbeddedDateUtc = first.Item.DateModified;
+        changed.EmbeddedDateUtc = changed.Item.DateModified;
+        foreach (var mode in Enum.GetValues<SelectionMode>()) {
+            foreach (var source in Enum.GetValues<SelectionDateSource>()) {
+                var options = new SelectionOptions { Profile = profile, Mode = mode, DateSource = source, FolderWeight = 0, Criteria = [] };
+                Assert.Equal(keepChanged ? changed.Item.Path : first.Item.Path, Keeper([changed, first], options));
+            }
+        }
+    }
+
+    [Theory]
+    [InlineData("ModificationDate", false)]
+    [InlineData("ModificationDate", true)]
+    [InlineData("CreationDate", false)]
+    [InlineData("CreationDate", true)]
+    public void ExplicitDateCriteriaPreserveSingleTickDifferencesAndMissingDateAvailability(string criterion, bool preferLower) {
+        var first = Candidate("a-first.mp4"); var preferred = Candidate("z-preferred.mp4");
+        var missing = Candidate("0-missing.mp4");
+        preferred.Item.DateModified = first.Item.DateModified.AddTicks(preferLower ? -1 : 1);
+        preferred.Item.DateCreated = first.Item.DateCreated.AddTicks(preferLower ? -1 : 1);
+        missing.Item.DateModified = missing.Item.DateCreated = default;
+        foreach (var mode in Enum.GetValues<SelectionMode>()) {
+            var options = new SelectionOptions {
+                Profile = SelectionProfile.Custom, Mode = mode, FolderWeight = 0,
+                Criteria = [new() { Name = criterion, PreferLower = preferLower }]
+            };
+            Assert.Equal(preferred.Item.Path, Keeper([missing, first, preferred], options));
+        }
+    }
+
     [Fact]
     public void DefaultUsesModifiedTimeInsteadOfCopiedCreationTime() {
         var old = Candidate("old.mp4", 1); var newer = Candidate("new.mp4", 2);
@@ -39,7 +78,8 @@ public class SelectionPlannerTests {
     public void MissingDatesNeverWinAsExtremeTimestamp(SelectionProfile profile) {
         var missing = Candidate("a.mp4"); missing.Item.DateModified = default;
         var known = Candidate("b.mp4", 2);
-        Assert.Equal(known.Item.Path, Keeper(new[] { missing, known }, new() { Profile = profile }));
+        foreach (var mode in Enum.GetValues<SelectionMode>())
+            Assert.Equal(known.Item.Path, Keeper(new[] { missing, known }, new() { Profile = profile, Mode = mode, FolderWeight = 0, Criteria = [] }));
     }
 
     [Fact]
@@ -53,9 +93,11 @@ public class SelectionPlannerTests {
     [Fact]
     public void EqualDatesUseStablePathOrderRegardlessOfInputOrder() {
         var a = Candidate("a.mp4"); var b = Candidate("b.mp4");
-        var options = new SelectionOptions { Profile = SelectionProfile.NewestFirst };
-        Assert.Equal(a.Item.Path, Keeper(new[] { b, a }, options));
-        Assert.Equal(a.Item.Path, Keeper(new[] { a, b }, options));
+        foreach (var mode in Enum.GetValues<SelectionMode>()) {
+            var options = new SelectionOptions { Profile = SelectionProfile.NewestFirst, Mode = mode, FolderWeight = 0, Criteria = [] };
+            Assert.Equal(a.Item.Path, Keeper(new[] { b, a }, options));
+            Assert.Equal(a.Item.Path, Keeper(new[] { a, b }, options));
+        }
     }
 
     [Fact]

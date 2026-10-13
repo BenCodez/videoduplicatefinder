@@ -263,6 +263,31 @@ public sealed class AutomationIntegrationTests : IDisposable {
 	}));
 
 	[Fact]
+	public Task LockedFilePreservesItsProtectionAcrossSavingAndReplanning() => HeadlessUi.Run(() => WithSettings(async () => {
+		var vm = new MainWindowVM(); var group = Guid.NewGuid();
+		var row = Add(vm, group, "locked.mp4", 2020); Add(vm, group, "lock-survivor.mp4", 2025);
+		await vm.ProtectAutomationItemCommand.Execute(row);
+		var identity = row.AutomationIdentity;
+		Assert.NotNull(identity);
+		using (var held = new FileStream(row.ItemInfo.Path, FileMode.Open, FileAccess.ReadWrite, FileShare.None)) {
+			Assert.True(File.Exists(row.ItemInfo.Path));
+			Assert.Null(FileIdentity.Capture(row.ItemInfo.Path));
+			await vm.SaveAutomationReviewRecordsAsync();
+			await vm.InitialiseAutomationReviewAsync();
+			Assert.True(row.ManuallyProtected && row.IsProtected && row.ProtectionUncertain);
+			Assert.False(row.AutomationSnapshotInvalid);
+			Assert.Equal(identity, row.AutomationIdentity);
+			var store = new ReviewStore(vm.AutomationReviewFile); await store.LoadAsync();
+			Assert.True(store.Records.Single(r => r.Identity.Path == row.ItemInfo.Path).ManuallyProtected);
+		}
+		await vm.InitialiseAutomationReviewAsync();
+		Assert.True(row.ManuallyProtected && row.IsProtected);
+		Assert.False(row.ProtectionUncertain);
+		Assert.True((await new CleanupProtectionGuard(folder).InspectAsync(identity!)).IsProtected);
+		await vm.PrepareAutomationRescanAsync();
+	}));
+
+	[Fact]
 	public Task UnavailableFileRetainsItsStoredManualProtection() => HeadlessUi.Run(() => WithSettings(async () => {
 		var vm = new MainWindowVM(); var group = Guid.NewGuid();
 		var row = Add(vm, group, "offline.mp4", 2020); Add(vm, group, "mounted.mp4", 2025);

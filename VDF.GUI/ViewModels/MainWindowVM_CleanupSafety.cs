@@ -3,11 +3,14 @@ using VDF.Core.Review;
 using VDF.Core.Selection;
 using VDF.Core.Utils;
 using System.Threading;
+using Avalonia.Threading;
+using ReactiveUI;
+using VDF.Core.Cleanup;
 
 namespace VDF.GUI.ViewModels;
 
 public partial class MainWindowVM {
-    sealed record ApprovedRemoval(DuplicateItemVM Item, FileIdentity Target, FileIdentity Keeper);
+    internal sealed record ApprovedRemoval(DuplicateItemVM Item, FileIdentity Target, FileIdentity Keeper);
     readonly SemaphoreSlim cleanupOperationGate = new(1, 1);
     string LegacyCleanupJournal => Path.Combine(CoreUtils.ResolveDatabaseFolder(Data.SettingsFile.Instance.CustomDatabaseFolder), "LegacyCleanupHistory.json");
 
@@ -16,7 +19,7 @@ public partial class MainWindowVM {
         await new VDF.Core.Cleanup.QuarantineService(QuarantineHistoryFile).HistoryAsync();
     }
 
-    async Task<Dictionary<DuplicateItemVM, ApprovedRemoval>> PrepareCleanupGuardAsync(IReadOnlyList<DuplicateItemVM> requested) {
+    internal async Task<Dictionary<DuplicateItemVM, ApprovedRemoval>> PrepareCleanupGuardAsync(IReadOnlyList<DuplicateItemVM> requested) {
         var candidates = await BuildAutomationCandidatesAsync();
         var matcher = new FolderRuleMatcher(Data.SettingsFile.Instance.AutomationSelection.FolderRules,
             Data.SettingsFile.Instance.AutomationSelection.OverlapPolicy);
@@ -50,6 +53,88 @@ public partial class MainWindowVM {
             }
             return approved;
         });
+    }
+
+    internal async Task ReplaceApprovedWithLinkAsync(CleanupProtectionGuard removal, ApprovedRemoval action,
+        Dictionary<DuplicateItemVM, ApprovedRemoval> approved, IReadOnlyList<FileIdentity> group, bool hardLink) {
+        if (hardLink) await automationReviewSaveGate.WaitAsync();
+        bool hardLinkAttempted = false;
+        try {
+            if (hardLink) await Dispatcher.UIThread.InvokeAsync(async () => {
+                var store = await GetAutomationReviewStoreAsync();
+                static bool DeliberateProtection(bool protect, ReviewChoice choice) => protect ||
+                    choice is ReviewChoice.Keep or ReviewChoice.Ignore or ReviewChoice.RejectGroup;
+                bool persisted = store.Records.Any(record => action.Keeper.Matches(record.Identity) &&
+                    DeliberateProtection(record.ManuallyProtected, record.Choice));
+                bool pending = Duplicates.Any(row => AutomationPathComparer.Equals(row.ItemInfo.Path, action.Keeper.Path) &&
+                    (row.AutomationIdentity is not null ? action.Keeper.Matches(row.AutomationIdentity) :
+                        row.AutomationFileSnapshot?.Matches(action.Keeper) == true) &&
+                    DeliberateProtection(row.ManuallyProtected, row.ManualReviewChoice));
+                if (persisted || pending)
+                    throw new IOException("Hardlink replacement would change a deliberately protected keeper's identity. Use quarantine or choose a keeper without a deliberate protection decision.");
+            });
+            await removal.RemoveAsync(action.Target, action.Keeper, claim => {
+                hardLinkAttempted = hardLink;
+                CreateVerifiedReplacementLink(claim, action.Target.Path, action.Keeper.Path, hardLink);
+            }, groupMembers: group);
+        }
+        finally {
+            try {
+                // Linking can change the keeper's stamp even if a subsequent
+                // removal/journal step fails. Serialize the mutation and refresh
+                // with autosaves so none can discard its prior manual protection.
+                if (hardLinkAttempted) {
+                    try {
+                        if (!await Dispatcher.UIThread.InvokeAsync(() => RefreshCleanupKeeperAfterHardLinkCoreAsync(action.Keeper, approved)))
+                            Logger.Instance.Warn("The hardlink keeper changed during refresh; remaining cleanup requires a rescan.");
+                    }
+                    catch (Exception ex) {
+                        Logger.Instance.Warn($"The hardlink keeper review could not be refreshed; remaining cleanup requires a rescan: {ex.Message}");
+                    }
+                }
+            }
+            finally { if (hardLink) automationReviewSaveGate.Release(); }
+        }
+    }
+
+    internal Task<bool> RefreshCleanupKeeperAfterHardLinkAsync(FileIdentity previous,
+        Dictionary<DuplicateItemVM, ApprovedRemoval> approved) => Dispatcher.UIThread.InvokeAsync(async () => {
+        await automationReviewSaveGate.WaitAsync();
+        try { return await RefreshCleanupKeeperAfterHardLinkCoreAsync(previous, approved); }
+        finally { automationReviewSaveGate.Release(); }
+    });
+
+    async Task<bool> RefreshCleanupKeeperAfterHardLinkCoreAsync(FileIdentity previous,
+        Dictionary<DuplicateItemVM, ApprovedRemoval> approved) {
+            var verified = await Task.Run<(FileIdentity Identity, FileSnapshot Snapshot, DateTime Created)?>(() => {
+                var current = IdentityReader.Capture(previous.Path, true, CancellationToken.None);
+                var snapshot = FileIdentity.CaptureSnapshot(previous.Path);
+                if (current is null || snapshot is null || !snapshot.Matches(current) ||
+                    current.StableFileId != previous.StableFileId || current.Length != previous.Length ||
+                    current.LastWriteUtc != previous.LastWriteUtc || current.Sha256 != previous.Sha256) return null;
+                return (current, snapshot, new FileInfo(previous.Path).CreationTimeUtc);
+            });
+            if (verified is not { } refreshed) return false;
+            var store = await GetAutomationReviewStoreAsync();
+            var records = store.Records.Select(record => previous.Matches(record.Identity) ? new ReviewRecord {
+                Identity = refreshed.Identity, Choice = record.Choice, ManuallyProtected = record.ManuallyProtected,
+                AutomaticallySelected = record.AutomaticallySelected, IsKeeper = record.IsKeeper,
+                Profile = record.Profile, Reason = record.Reason, UpdatedUtc = DateTime.UtcNow
+            } : record).ToList();
+            // Carry a matching manual review across this verified intentional
+            // link-count change before allowing another action to use the keeper.
+            await store.SaveAsync(records);
+            if (!refreshed.Snapshot.MatchesCurrent()) return false;
+            foreach (var row in Duplicates.Where(row => AutomationPathComparer.Equals(row.ItemInfo.Path, previous.Path))) {
+                if (row.AutomationIdentity is not null && !previous.Matches(row.AutomationIdentity)) continue;
+                row.AutomationIdentity = refreshed.Identity;
+                row.AutomationFileSnapshot = refreshed.Snapshot;
+                row.ItemInfo.DateCreated = refreshed.Created;
+                row.RaisePropertyChanged(nameof(DuplicateItemVM.ShownDate));
+            }
+            foreach (var entry in approved.ToList())
+                if (previous.Matches(entry.Value.Keeper)) approved[entry.Key] = entry.Value with { Keeper = refreshed.Identity };
+            return true;
     }
 
     static bool MatchesDisplayedScan(DuplicateItemVM row, FileIdentity? identity) => identity is not null &&

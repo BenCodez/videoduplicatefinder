@@ -100,13 +100,18 @@ public partial class MainWindowVM {
 			return rows.Select(snapshot => {
 			string path = snapshot.Row.ItemInfo.Path;
 			bool available = File.Exists(path);
-			bool stale = available && snapshot.Identity != null && !snapshot.Identity.MatchesCurrent();
-			bool changed = snapshot.Invalid || stale || (available && ((!AutomationScanMetadataMatches(snapshot.Row.ItemInfo)) ||
-				(snapshot.FileSnapshot != null && !snapshot.FileSnapshot.MatchesCurrent())));
+			var currentSnapshot = available ? FileIdentity.CaptureSnapshot(path) : null;
+			// A failed read (for example an exclusive lock) does not prove replacement.
+			// Keep its review, but withhold selection/cleanup until validation succeeds.
+			bool stale = snapshot.Invalid || (currentSnapshot != null &&
+				(!AutomationScanMetadataMatches(snapshot.Row.ItemInfo) ||
+				(snapshot.Identity != null && !currentSnapshot.Matches(snapshot.Identity)) ||
+				(snapshot.FileSnapshot != null && currentSnapshot != snapshot.FileSnapshot)));
+			bool changed = stale || (available && currentSnapshot == null);
 			ReviewRecord? review = !snapshot.Restored && savedPaths.Contains(path) ? store.Find(path) : null;
 			var nfo = automationNfo.Inspect(path, nfoOptions);
 			DateTime? embedded = available && options.DateSource == SelectionDateSource.Embedded ? ReadEmbeddedDate(path) : null;
-			return new AutomationInspection(snapshot, available && !changed, stale || changed, changed, review, nfo, embedded);
+			return new AutomationInspection(snapshot, available && !changed, stale, changed, review, nfo, embedded);
 			}).ToList();
 		});
 
@@ -143,7 +148,7 @@ public partial class MainWindowVM {
 				if (inspection.Available || inspection.Stale || !savedPaths.Contains(row.ItemInfo.Path)) row.AutomationReviewRestored = true;
 				row.IsNfoFavourite = inspection.Nfo.IsFavourite;
 				row.ProtectionUncertain = inspection.Nfo.IsUncertain || inspection.MetadataChanged;
-				row.ProtectionReason = inspection.MetadataChanged ? "File changed since this scan. Rescan before selection or cleanup." : inspection.Nfo.Reason;
+				row.ProtectionReason = inspection.MetadataChanged ? "File cannot be validated against this scan. Retry when available or rescan before selection or cleanup." : inspection.Nfo.Reason;
 				candidates[row.ItemInfo.Path] = new SelectionCandidate(row.ItemInfo) {
 					IsAvailable = inspection.Available,
 					ManuallyProtected = row.ManuallyProtected,
@@ -323,12 +328,14 @@ public partial class MainWindowVM {
 				var identity = state.Row.AutomationSnapshotInvalid || !AutomationScanMetadataMatches(state.Row.ItemInfo) ? null :
 					state.Identity != null && state.Identity.MatchesCurrent() ? state.Identity : FileIdentity.Capture(state.Path);
 				if (identity != null && state.Row.AutomationFileSnapshot != null && !state.Row.AutomationFileSnapshot.Matches(identity)) identity = null;
-				return (State: state, Identity: identity, Exists: File.Exists(state.Path));
+				return (State: state, Identity: identity);
 			}).ToList());
 			var liveRows = Duplicates.ToHashSet();
 			foreach (var entry in captured) {
 				var state = entry.State;
-				if (entry.Identity == null) { if (entry.Exists) merged.Remove(state.Path); continue; }
+				// Inconclusive validation must never erase a durable protection. Cleanup
+				// independently validates the saved identity before it can authorize work.
+				if (entry.Identity == null) continue;
 				// A review belongs to the captured file. Never attach it to a replacement at the same path.
 				if (state.Identity != null && state.Identity != entry.Identity) { merged.Remove(state.Path); continue; }
 				bool currentRow = liveRows.Contains(state.Row) && AutomationPathComparer.Equals(state.Row.ItemInfo.Path, state.Path);

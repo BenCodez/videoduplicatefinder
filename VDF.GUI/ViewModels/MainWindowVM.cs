@@ -2005,9 +2005,9 @@ Non-Windows setup:
 								if (protectedNow) throw new IOException("The file is protected; cleanup was cancelled.");
 								var group = Duplicates.Where(row => row.ItemInfo.GroupId == item.ItemInfo.GroupId)
 									.Select(row => row.AutomationIdentity).Where(identity => identity is not null).Cast<VDF.Core.Review.FileIdentity>().ToArray();
-								await removal.RemoveAsync(action.Target, action.Keeper, claim => {
-									if (createLinks) CreateVerifiedReplacementLink(claim, action.Target.Path, action.Keeper.Path, createHardLinksInstead);
-									else if (permanently) File.Delete(claim);
+								if (createLinks) await ReplaceApprovedWithLinkAsync(removal, action, approved, group, createHardLinksInstead);
+								else await removal.RemoveAsync(action.Target, action.Keeper, claim => {
+									if (permanently) File.Delete(claim);
 									else if (!MoveCleanupClaimToTrash(claim, action.Target.Path)) throw new IOException("Moving to trash failed; the original file was retained.");
 								}, groupMembers: group);
 								freed += CheckedSizeOf(item);

@@ -12,12 +12,13 @@ public sealed class CleanupReviewCacheTests {
 	[InlineData(true)]
 	public Task AutomaticReviewSaveCannotReplaceUnreadableCurrentLedgerFromCachedDecisions(bool missing) => HeadlessUi.Run(async () => {
 		string folder = Directory.CreateTempSubdirectory("vdf-cached-review-").FullName;
-		string original = JsonSerializer.Serialize(SettingsFile.Instance, GuiJsonContext.Default.SettingsFile);
+		var settings = SettingsFile.Instance;
+		string originalDatabase = settings.CustomDatabaseFolder;
 		string settingsPath = Path.Combine(folder, "Settings.json");
 		try {
-			File.WriteAllText(settingsPath, JsonSerializer.Serialize(new SettingsFile { CustomDatabaseFolder = folder }, GuiJsonContext.Default.SettingsFile));
 			SettingsFile.SetSettingsPath(settingsPath);
-			SettingsFile.LoadSettings(settingsPath);
+			settings.CustomDatabaseFolder = folder;
+			SettingsFile.SaveSettings();
 			var vm = new MainWindowVM();
 			await vm.InitialiseAutomationReviewAsync();
 			string path = vm.AutomationReviewFile;
@@ -35,8 +36,9 @@ public sealed class CleanupReviewCacheTests {
 			Assert.Equal(backup, File.ReadAllBytes(path + ".bak"));
 		}
 		finally {
-			File.WriteAllText(settingsPath, original);
-			SettingsFile.LoadSettings(settingsPath);
+			// Appearance and the shared headless shell subscribe to this instance.
+			// Preserve it so later tests keep receiving property changes.
+			settings.CustomDatabaseFolder = originalDatabase;
 			SettingsFile.SetSettingsPath(null);
 			try { Directory.Delete(folder, true); } catch { }
 		}

@@ -70,6 +70,8 @@ File identity includes filesystem identity, timestamps and a content digest. Rep
 files cannot inherit old removal decisions. Renamed files require review again rather
 than guessing a moved-file association. Initial identity capture reads the file; known
 unchanged filesystem snapshots reuse digests where a reliable change stamp is available.
+Temporary read failures retain saved protection and block selection or cleanup until
+the file can be validated again; they are not treated as evidence of replacement.
 
 Legacy backup checkmarks without validated review identities are cleared on import;
 review those results again. Current review journals restore decisions after validating
@@ -107,6 +109,12 @@ conservatively without overwriting another file. The OS trash may display the te
 claim name on Windows; the journal records the original path. macOS Trash preserves
 the media filename, and Linux trash metadata preserves its name and encoded restore
 path. Prefer quarantine for integrated restore.
+
+Hardlink replacement refreshes the keeper's verified identity between batch actions.
+It refuses a keeper with a deliberate manual protection, Keep, Ignore or Reject decision:
+creating a hardlink changes filesystem identity metadata, and a crash before saving
+that change could invalidate its saved protection. Use quarantine for those keepers.
+Automatic keeper recommendations alone do not impose this restriction.
 
 Quarantine stages and verifies a copy before claiming/removing the original, including
 across filesystems. An available keeper must remain. History records outcomes and restore

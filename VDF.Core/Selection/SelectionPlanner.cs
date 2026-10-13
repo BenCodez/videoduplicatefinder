@@ -81,12 +81,12 @@ public static class SelectionPlanner {
             void AddScore(string name, double weight, bool lower) {
                 if (!double.IsFinite(weight) || weight <= 0) return;
                 var values = items.Select(e => Value(e, name, options)).ToArray();
-                var known = values.Where(v => v.HasValue && double.IsFinite(v.Value)).Select(v => v!.Value).ToArray();
+                var known = values.Where(v => v.HasValue).Select(v => v!.Value).ToArray();
                 if (known.Length == 0) return;
-                double min = known.Min(), max = known.Max();
+                decimal min = known.Min(), max = known.Max();
                 for (int i = 0; i < scored.Length; i++) {
-                    double normalized = values[i] is not { } value ? 0 : max == min ? 1 : lower ? (max - value) / (max - min) : (value - min) / (max - min);
-                    scored[i].Score += weight * normalized;
+                    decimal normalized = values[i] is not { } value ? 0 : max == min ? 1 : lower ? (max - value) / (max - min) : (value - min) / (max - min);
+                    scored[i].Score += weight * (double)normalized;
                 }
             }
         }
@@ -111,13 +111,15 @@ public static class SelectionPlanner {
         }
     }
 
-    static double? Value(Evaluated e, string name, SelectionOptions options) {
+    // Keep integer timestamps exact in strict comparisons and subtract before
+    // weighted normalization; converting absolute ticks to double loses close dates.
+    static decimal? Value(Evaluated e, string name, SelectionOptions options) {
         var item = e.Candidate.Item;
         return name switch {
             "FolderPriority" => e.Folder.Priority,
             "Resolution" => Pixels(item.FrameSize),
-            "VideoBitrate" => item.BitRateKbs > 0 ? (double)item.BitRateKbs : null,
-            "AudioBitrate" => item.AudioBitRateKbs > 0 ? (double)item.AudioBitRateKbs : null,
+            "VideoBitrate" => item.BitRateKbs > 0 ? item.BitRateKbs : null,
+            "AudioBitrate" => item.AudioBitRateKbs > 0 ? item.AudioBitRateKbs : null,
             "AudioChannels" => item.AudioChannels > 0 ? item.AudioChannels : null,
             "Codec" => Preference(item.Format, options.PreferredCodecs),
             "Hdr" => item.HdrFormatRank,
@@ -127,7 +129,7 @@ public static class SelectionPlanner {
             "Date" => e.Date?.Ticks,
             "ModificationDate" => DateOf(e.Candidate, SelectionDateSource.Modification)?.Ticks,
             "CreationDate" => DateOf(e.Candidate, SelectionDateSource.Creation)?.Ticks,
-            "Duration" => item.Duration > TimeSpan.Zero ? item.Duration.TotalSeconds : null,
+            "Duration" => item.Duration > TimeSpan.Zero ? (decimal)item.Duration.TotalSeconds : null,
             "Size" => item.SizeLong > 0 ? item.SizeLong : null,
             "Container" => Preference(Path.GetExtension(item.Path).TrimStart('.'), options.PreferredContainers),
             "Metadata" => new[] { item.FrameSize, item.Format, item.AudioFormat, item.AudioLanguages, item.SubtitleLanguages, item.HdrFormat }.Count(s => !string.IsNullOrWhiteSpace(s)),
@@ -135,12 +137,12 @@ public static class SelectionPlanner {
         };
     }
 
-    static double? Pixels(string? dimensions) {
+    static decimal? Pixels(string? dimensions) {
         var parts = dimensions?.Split('x');
-        return parts?.Length == 2 && int.TryParse(parts[0], out int w) && int.TryParse(parts[1], out int h) && w > 0 && h > 0 ? (double)w * h : null;
+        return parts?.Length == 2 && int.TryParse(parts[0], out int w) && int.TryParse(parts[1], out int h) && w > 0 && h > 0 ? (decimal)w * h : null;
     }
 
-    static double Preference(string? value, List<string> preferences) {
+    static decimal Preference(string? value, List<string> preferences) {
         int index = preferences.FindIndex(p => p.Equals(value, StringComparison.OrdinalIgnoreCase));
         return index < 0 ? 0 : preferences.Count - index;
     }
