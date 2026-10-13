@@ -295,18 +295,19 @@ namespace VDF.Core.Utils {
 		/// <summary>
 		/// Moves a file to the system trash/recycle bin on Linux and macOS.
 		/// Returns true if the file was successfully moved to trash, false if trash is unavailable
-		/// (caller should fall back to permanent deletion).
+		/// (caller must report the failure without permanently deleting the source).
 		/// Not intended for Windows — use SHFileOperation there.
 		/// </summary>
-		internal static bool MoveToTrash(string filePath) {
+		internal static bool MoveToTrash(string filePath) => MoveToTrash(filePath, filePath);
+		internal static bool MoveToTrash(string filePath, string originalPath) {
 			if (RuntimeInformation.IsOSPlatform(OSPlatform.OSX))
-				return MoveToTrashMacOS(filePath);
+				return MoveToTrashMacOS(filePath, originalPath);
 			if (RuntimeInformation.IsOSPlatform(OSPlatform.Linux))
-				return MoveToTrashLinux(filePath);
+				return MoveToTrashLinux(filePath, originalPath);
 			return false;
 		}
 
-		static bool MoveToTrashLinux(string filePath) {
+		static bool MoveToTrashLinux(string filePath, string originalPath) {
 			// Freedesktop.org Trash specification: https://specifications.freedesktop.org/trash-spec/
 			string dataHome = Environment.GetEnvironmentVariable("XDG_DATA_HOME")
 				?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".local", "share");
@@ -326,7 +327,7 @@ namespace VDF.Core.Utils {
 			if (!IsOnSameFileSystem(filePath, filesDir))
 				return false;
 
-			string fileName = Path.GetFileName(filePath);
+			string fileName = Path.GetFileName(originalPath);
 			string destPath = Path.Combine(filesDir, fileName);
 			string infoPath = Path.Combine(infoDir, fileName + ".trashinfo");
 
@@ -338,7 +339,8 @@ namespace VDF.Core.Utils {
 				infoPath = Path.Combine(infoDir, newName + ".trashinfo");
 			}
 
-			string trashInfo = $"[Trash Info]\nPath={filePath}\nDeletionDate={DateTime.Now:yyyy-MM-ddTHH:mm:ss}\n";
+			string encodedOriginal = string.Join('/', Path.GetFullPath(originalPath).Split('/').Select(Uri.EscapeDataString));
+			string trashInfo = $"[Trash Info]\nPath={encodedOriginal}\nDeletionDate={DateTime.Now:yyyy-MM-ddTHH:mm:ss}\n";
 			try {
 				File.WriteAllText(infoPath, trashInfo);
 				File.Move(filePath, destPath);
@@ -375,13 +377,16 @@ namespace VDF.Core.Utils {
 			return bestMatch;
 		}
 
-		static bool MoveToTrashMacOS(string filePath) {
+		static bool MoveToTrashMacOS(string filePath, string originalPath) {
 			// ~/.Trash is the standard macOS trash for the home volume.
 			// For files on other volumes, macOS uses <volume>/.Trashes/<uid>/ — but that
-			// requires cross-volume copy+delete. Fall back to permanent deletion in that case.
+			// requires cross-volume copy+delete. Report trash unavailable in that case.
 			string trashDir = Path.Combine(
 				Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".Trash");
+			return MoveToTrashDirectory(filePath, originalPath, trashDir);
+		}
 
+		internal static bool MoveToTrashDirectory(string filePath, string originalPath, string trashDir) {
 			try {
 				Directory.CreateDirectory(trashDir);
 			}
@@ -393,7 +398,9 @@ namespace VDF.Core.Utils {
 			if (!IsOnSameFileSystem(filePath, trashDir))
 				return false;
 
-			string fileName = Path.GetFileName(filePath);
+			// The physical source can be a private cleanup claim. Show the original
+			// media filename in Trash; the cleanup ledger retains its original path.
+			string fileName = Path.GetFileName(originalPath);
 			string destPath = Path.Combine(trashDir, fileName);
 
 			// Resolve name conflicts
