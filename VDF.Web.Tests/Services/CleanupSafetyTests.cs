@@ -95,6 +95,42 @@ public sealed class CleanupSafetyTests : IAsyncLifetime {
 	}
 
 	[Fact]
+	public async Task RemovalRespectsProtectionOnAnotherAliasOfTheTarget() {
+		var (target, keeper) = SeedPair(capture: false);
+		string alias = Path.Combine(folder, "protected-target-alias.mp4");
+		HardLinkUtils.CreateHardLink(alias, target.Path);
+		scan.CaptureCleanupSnapshots();
+		var aliasIdentity = FileIdentity.Capture(alias)!;
+		var store = new ReviewStore(Path.Combine(folder, "ReviewedFiles.json"));
+		await store.SaveAsync([new() { Identity = aliasIdentity, ManuallyProtected = true }]);
+
+		AssertRetained(await Remove(target, links: false), target, keeper);
+
+		Assert.True(aliasIdentity.MatchesCurrent(forceHash: true));
+		Assert.False(File.Exists(Path.Combine(folder, "LegacyCleanupHistory.json")));
+	}
+
+	[Fact]
+	public async Task HardlinkReplacementRespectsProtectionOnAnotherAliasOfTheKeeper() {
+		var (target, keeper) = SeedPair(capture: false);
+		string alias = Path.Combine(folder, "protected-alias.mp4");
+		HardLinkUtils.CreateHardLink(alias, keeper.Path);
+		scan.CaptureCleanupSnapshots();
+		var keeperIdentity = FileIdentity.Capture(keeper.Path)!;
+		var aliasIdentity = FileIdentity.Capture(alias)!;
+		var store = new ReviewStore(Path.Combine(folder, "ReviewedFiles.json"));
+		await store.SaveAsync([new() { Identity = aliasIdentity, ManuallyProtected = true }]);
+
+		AssertRetained(await Remove(target, links: true), target, keeper);
+
+		Assert.True(keeperIdentity.MatchesCurrent(forceHash: true));
+		Assert.True(aliasIdentity.MatchesCurrent(forceHash: true));
+		await store.LoadAsync();
+		Assert.True(store.Find(alias)!.ManuallyProtected);
+		Assert.False(File.Exists(Path.Combine(folder, "LegacyCleanupHistory.json")));
+	}
+
+	[Fact]
 	public async Task HardlinkReplacementRechecksAKeeperProtectedDuringClaimValidation() {
 		var (target, keeper) = SeedPair();
 		var keeperIdentity = FileIdentity.Capture(keeper.Path)!;

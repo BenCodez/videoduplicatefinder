@@ -60,15 +60,18 @@ public partial class MainWindowVM {
         if (hardLink) await automationReviewSaveGate.WaitAsync();
         bool hardLinkAttempted = false;
         try {
+			if (hardLink) await removal.ValidateHardLinkKeeperAsync(action.Keeper);
             if (hardLink) await Dispatcher.UIThread.InvokeAsync(async () => {
                 var store = await GetAutomationReviewStoreAsync();
                 static bool DeliberateProtection(bool protect, ReviewChoice choice) => protect ||
                     choice is ReviewChoice.Keep or ReviewChoice.Ignore or ReviewChoice.RejectGroup;
-                bool persisted = store.Records.Any(record => action.Keeper.Matches(record.Identity) &&
+                bool persisted = store.Records.Any(record => action.Keeper.SameFileSnapshot(record.Identity) &&
                     DeliberateProtection(record.ManuallyProtected, record.Choice));
-                bool pending = Duplicates.Any(row => AutomationPathComparer.Equals(row.ItemInfo.Path, action.Keeper.Path) &&
-                    (row.AutomationIdentity is not null ? action.Keeper.Matches(row.AutomationIdentity) :
-                        row.AutomationFileSnapshot?.Matches(action.Keeper) == true) &&
+                bool pending = Duplicates.Any(row =>
+                    (row.AutomationIdentity is not null ? action.Keeper.SameFileSnapshot(row.AutomationIdentity) :
+                        row.AutomationFileSnapshot is { } snapshot && snapshot.StableFileId == action.Keeper.StableFileId &&
+                        snapshot.Length == action.Keeper.Length && snapshot.LastWriteUtc == action.Keeper.LastWriteUtc &&
+                        snapshot.CreationUtc == action.Keeper.CreationUtc && snapshot.ChangeStamp == action.Keeper.ChangeStamp) &&
                     DeliberateProtection(row.ManuallyProtected, row.ManualReviewChoice));
                 if (persisted || pending)
                     throw new IOException("Hardlink replacement would change a deliberately protected keeper's identity. Use quarantine or choose a keeper without a deliberate protection decision.");

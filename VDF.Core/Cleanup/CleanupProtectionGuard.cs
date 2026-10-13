@@ -21,6 +21,7 @@ public sealed class CleanupProtectionGuard {
 	readonly SemaphoreSlim _reviewGate = new(1, 1);
 	FileIdentity? _reviewIdentity;
 	IReadOnlyDictionary<string, ReviewRecord> _reviews = new Dictionary<string, ReviewRecord>();
+	HashSet<(string Id, long Length, DateTime Modified, DateTime Created, string Stamp, string Hash)> _retainedFiles = new();
 	internal Func<string?, CancellationToken, Task>? BeforeLiveCheckAsync { get; set; }
 	public CleanupProtectionGuard(string stateFolder) {
 		_stateFolder = SafePaths.Normalize(stateFolder, rejectTraversal: true);
@@ -36,19 +37,22 @@ public sealed class CleanupProtectionGuard {
 	public async Task ValidateHardLinkKeeperAsync(FileIdentity keeper, CancellationToken ct = default) {
 		ArgumentNullException.ThrowIfNull(keeper);
 		if (!keeper.IsWellFormed()) throw new IOException("A valid keeper identity is required.");
-		var reviews = await GetReviewsAsync(ct).ConfigureAwait(false);
-		if (reviews.TryGetValue(keeper.Path, out var review) && review.Identity.Matches(keeper) &&
-			(review.ManuallyProtected || review.Choice is ReviewChoice.Keep or ReviewChoice.Ignore or ReviewChoice.RejectGroup))
+		await GetReviewsAsync(ct).ConfigureAwait(false);
+		// All hardlink aliases share the metadata that linking changes. Index by
+		// the verified native/content snapshot so another path's protection counts.
+		if (_retainedFiles.Contains(RetentionKey(keeper)))
 			throw new IOException("Hardlink replacement would change a deliberately protected keeper's identity. Use quarantine or choose a keeper without a deliberate protection decision.");
 	}
+
+	static (string, long, DateTime, DateTime, string, string) RetentionKey(FileIdentity identity) =>
+		(identity.StableFileId, identity.Length, identity.LastWriteUtc, identity.CreationUtc, identity.ChangeStamp, identity.Sha256);
 
 	async Task<CleanupProtectionCheck> InspectCoreAsync(FileIdentity target, string? claimPath, CancellationToken ct) {
 		ArgumentNullException.ThrowIfNull(target);
 		if (!target.IsWellFormed()) throw new IOException("A valid reviewed media identity is required.");
 		CleanupProtectionPolicy policy = await CleanupProtectionPolicyStore.LoadAsync(_stateFolder, ct).ConfigureAwait(false);
-		var reviews = await GetReviewsAsync(ct).ConfigureAwait(false);
-		if (reviews.TryGetValue(target.Path, out var review) && review.Identity.Matches(target) &&
-			(review.ManuallyProtected || review.Choice is ReviewChoice.Keep or ReviewChoice.Ignore or ReviewChoice.RejectGroup))
+		await GetReviewsAsync(ct).ConfigureAwait(false);
+		if (_retainedFiles.Contains(RetentionKey(target)))
 			return new(true, "A validated manual protection or review decision requires retaining this file.");
 		var folder = new FolderRuleMatcher(policy.FolderRules, policy.OverlapPolicy).Match(target.Path);
 		if (folder.Protected || folder.Uncertain) return new(true, folder.Reason);
@@ -134,6 +138,9 @@ public sealed class CleanupProtectionGuard {
 			var store = new ReviewStore(path);
 			await store.LoadForCleanupAsync().ConfigureAwait(false);
 			_reviews = store.Records.ToDictionary(record => record.Identity.Path, record => record, VDF.Core.Utils.PathComparer.ForCurrentPlatform);
+			_retainedFiles = store.Records.Where(record => record.ManuallyProtected ||
+				record.Choice is ReviewChoice.Keep or ReviewChoice.Ignore or ReviewChoice.RejectGroup)
+				.Select(record => RetentionKey(record.Identity)).ToHashSet();
 			_reviewIdentity = current;
 			return _reviews;
 		}
