@@ -48,6 +48,7 @@
                     <SolidColorBrush x:Key="VdfSelectedHoverTextBrush" Color="#255B55" />
                     <SolidColorBrush x:Key="VdfTombBrush" Color="#A93B31" />
                     <SolidColorBrush x:Key="VdfMutedBrush" Color="#8A9793" />
+                    <SolidColorBrush x:Key="VdfMutedTextBrush" Color="#3F4650" />
                     <SolidColorBrush x:Key="VdfMutedSoftBrush" Color="#F7FAF9" />
                     <SolidColorBrush x:Key="VdfMutedBorderBrush" Color="#DBE3E0" />
                     <!-- Accent-colored text on a soft accent surface (selected settings section,
@@ -108,6 +109,7 @@
                     <SolidColorBrush x:Key="VdfSelectedHoverTextBrush" Color="#FFFFFF" />
                     <SolidColorBrush x:Key="VdfTombBrush" Color="#C05248" />
                     <SolidColorBrush x:Key="VdfMutedBrush" Color="#6D7B76" />
+                    <SolidColorBrush x:Key="VdfMutedTextBrush" Color="#C8CDD4" />
                     <SolidColorBrush x:Key="VdfMutedSoftBrush" Color="#1C2422" />
                     <SolidColorBrush x:Key="VdfMutedBorderBrush" Color="#2A3330" />
                     <SolidColorBrush x:Key="VdfAccentTextBrush" Color="#8ADBC9" />
@@ -148,6 +150,7 @@
                     <SolidColorBrush x:Key="VdfSelectedHoverTextBrush" Color="#000000" />
                     <SolidColorBrush x:Key="VdfTombBrush" Color="#8A2A22" />
                     <SolidColorBrush x:Key="VdfMutedBrush" Color="#C8CDD4" />
+                    <SolidColorBrush x:Key="VdfMutedTextBrush" Color="#C8CDD4" />
                     <SolidColorBrush x:Key="VdfMutedSoftBrush" Color="#1C2422" />
                     <SolidColorBrush x:Key="VdfMutedBorderBrush" Color="#C8CDD4" />
                     <SolidColorBrush x:Key="VdfAccentTextBrush" Color="#A8F0E0" />
@@ -212,6 +215,7 @@
                     <SolidColorBrush x:Key="VdfSelectedHoverTextBrush" Color="#FFFFFF" />
                     <SolidColorBrush x:Key="VdfTombBrush" Color="#8A2A22" />
                     <SolidColorBrush x:Key="VdfMutedBrush" Color="#3F4650" />
+                    <SolidColorBrush x:Key="VdfMutedTextBrush" Color="#3F4650" />
                     <SolidColorBrush x:Key="VdfMutedSoftBrush" Color="#F7FAF9" />
                     <SolidColorBrush x:Key="VdfMutedBorderBrush" Color="#3F4650" />
                     <SolidColorBrush x:Key="VdfAccentTextBrush" Color="#06433A" />

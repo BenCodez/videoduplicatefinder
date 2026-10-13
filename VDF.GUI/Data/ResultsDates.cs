@@ -28,5 +28,12 @@ namespace VDF.GUI.Data {
 		/// <summary>Results saved before the modified date was recorded fall back to the created date.</summary>
 		internal static DateTime Of(DuplicateItem item, bool modified) =>
 			modified && item.DateModified != default ? item.DateModified : item.DateCreated;
+
+		internal static DateTime ForDisplay(DateTime stored) => ForDisplay(stored, TimeZoneInfo.Local);
+		internal static DateTime ForDisplay(DateTime stored, TimeZoneInfo timezone) {
+			if (stored == default) return stored;
+			var utc = stored.Kind == DateTimeKind.Local ? stored.ToUniversalTime() : DateTime.SpecifyKind(stored, DateTimeKind.Utc);
+			return TimeZoneInfo.ConvertTimeFromUtc(utc, timezone);
+		}
 	}
 }

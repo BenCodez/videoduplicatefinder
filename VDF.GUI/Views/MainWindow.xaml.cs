@@ -345,6 +345,11 @@ namespace VDF.GUI.Views {
 		}
 
 		async void ConfirmClose() {
+			try { await ApplicationHelpers.MainWindowDataContext.PrepareAutomationRescanAsync(); }
+			catch (Exception) {
+				await MessageBoxService.Show("Review decisions could not be saved. Check configuration storage before closing.");
+				return;
+			}
 			try {
 				if (!keepBackupFile)
 					File.Delete(ApplicationHelpers.MainWindowDataContext.BackupScanResultsFile);
@@ -362,11 +367,15 @@ namespace VDF.GUI.Views {
 			SettingsFile.SaveSettings();
 		}
 
-		void MainWindow_Startup(object? sender, ControlledApplicationLifetimeStartupEventArgs e) {
+		async void MainWindow_Startup(object? sender, ControlledApplicationLifetimeStartupEventArgs e) {
 			var vm = ApplicationHelpers.MainWindowDataContext;
 			vm.NotifyStartupSettingsError();
-			vm.LoadDatabase();
-			vm.RestoreBackupScanResults();
+			try {
+				await vm.LoadStartupStateAsync();
+			}
+			catch (Exception) {
+				await MessageBoxService.Show("Startup state could not be loaded. Scheduled scans remain paused until the problem is resolved.");
+			}
 		}
 
 

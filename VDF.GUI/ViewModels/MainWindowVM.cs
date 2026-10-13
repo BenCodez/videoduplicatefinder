@@ -109,10 +109,6 @@ namespace VDF.GUI.ViewModels {
 
 		void ChangeIsBusyMessage() => IsBusyOverlayText = BusyMessages[Random.Shared.Next(BusyMessages.Length)];
 
-		readonly DispatcherTimer scheduledScanTimer = new();
-		DateTime lastScheduledScanDate = DateTime.MinValue;
-		bool scheduledScanInProgress;
-		bool scheduleTimeInvalidNotified;
 
 		bool _IsScanning;
 		public bool IsScanning {
@@ -436,10 +432,7 @@ namespace VDF.GUI.ViewModels {
 			Duplicates.CollectionChanged += Duplicates_CollectionChanged;
 			InitAnnouncements();
 
-			scheduledScanTimer.Interval = TimeSpan.FromMinutes(1);
-			scheduledScanTimer.Tick += (_, __) => CheckScheduledScan();
-			scheduledScanTimer.Start();
-			CheckScheduledScan();
+			SetupScheduledScanning();
 
 			// Skip the initial (empty) value: it rebuilt the list half a second after start,
 			// replacing results restored from the backup under the user's keyboard focus.
@@ -539,8 +532,13 @@ namespace VDF.GUI.ViewModels {
 		}
 
 		void DuplicateItemVM_PropertyChanged(object? sender, PropertyChangedEventArgs e) {
+			if (e.PropertyName == nameof(DuplicateItemVM.ExplicitSelectionVersion) && sender is DuplicateItemVM explicitItem) {
+				TrackReviewChange(explicitItem);
+				return;
+			}
 			if (e.PropertyName != nameof(DuplicateItemVM.Checked) || sender == null) return;
 			RecordCheckedChangeForUndo((DuplicateItemVM)sender);
+			TrackReviewChange((DuplicateItemVM)sender);
 			if (((DuplicateItemVM)sender).Checked) {
 				DuplicatesCheckedCounter++;
 				DuplicatesCheckedSizeInternal += CheckedSizeOf((DuplicateItemVM)sender);
@@ -622,9 +620,9 @@ namespace VDF.GUI.ViewModels {
 			return true;
 		}
 
-		public void RestoreBackupScanResults() {
+		public async Task RestoreBackupScanResultsAsync() {
 			if (File.Exists(BackupScanResultsFile))
-				ImportScanResultsIncludingThumbnails(BackupScanResultsFile);
+				await ImportScanResultsIncludingThumbnails(BackupScanResultsFile, startup: true);
 		}
 
 		/// <summary>
@@ -641,7 +639,7 @@ namespace VDF.GUI.ViewModels {
 			await MessageBoxService.Show(string.Format(App.Lang["Message.SettingsLoadFailed"], error));
 		}
 
-		public async void LoadDatabase() {
+		public async Task LoadDatabaseAsync() {
 			IsBusy = true;
 			IsBusyOverlayText = "Loading database...";
 			// Pass the configured folder — the parameterless overload loads the DEFAULT
@@ -654,61 +652,6 @@ namespace VDF.GUI.ViewModels {
 			}
 			// The Setup screen's DB-known counts were computed against an empty database.
 			RebuildSetupFolders();
-		}
-
-		void CheckScheduledScan() {
-			if (!SettingsFile.Instance.EnableScheduledScan || IsScanning || scheduledScanInProgress)
-				return;
-			if (!TryParseScheduledTime(SettingsFile.Instance.ScheduledScanTime, out var scheduledTime)) {
-				if (!scheduleTimeInvalidNotified) {
-					Logger.Instance.Warn(App.Lang["Log.InvalidScheduledScanTime"]);
-					scheduleTimeInvalidNotified = true;
-				}
-				return;
-			}
-			scheduleTimeInvalidNotified = false;
-			var now = DateTime.Now;
-			if (lastScheduledScanDate.Date == now.Date)
-				return;
-			if (now.TimeOfDay < scheduledTime)
-				return;
-			TryStartScheduledScan();
-		}
-
-		static bool TryParseScheduledTime(string value, out TimeSpan time) {
-			time = default;
-			if (string.IsNullOrWhiteSpace(value)) return false;
-			if (TimeSpan.TryParse(value, out time))
-				return true;
-			return TimeSpan.TryParseExact(value, "hh\\:mm", null, out time);
-		}
-
-		void TryStartScheduledScan() {
-			if (IsScanning || IsBusy) return;
-			if (!string.IsNullOrEmpty(SettingsFile.Instance.CustomDatabaseFolder) && !Directory.Exists(SettingsFile.Instance.CustomDatabaseFolder)) {
-				Logger.Instance.Warn(App.Lang["Log.ScheduledScanSkippedMissingDatabaseFolder"]);
-				return;
-			}
-			if (Duplicates.Count > 0) {
-				Logger.Instance.Warn(App.Lang["Log.ScheduledScanSkippedWithResults"]);
-				return;
-			}
-			if ((SettingsFile.Instance.UseNativeFfmpegBinding && !ScanEngine.NativeFFmpegExists) ||
-				(!SettingsFile.Instance.UseNativeFfmpegBinding && !ScanEngine.FFmpegExists)) {
-				Logger.Instance.Warn(App.Lang["Log.ScheduledScanSkippedMissingFfmpeg"]);
-				return;
-			}
-			if (!ScanEngine.FFprobeExists) {
-				Logger.Instance.Warn(App.Lang["Log.ScheduledScanSkippedMissingFfprobe"]);
-				return;
-			}
-			if (SettingsFile.Instance.Includes.Count == 0) {
-				Logger.Instance.Warn(App.Lang["Log.ScheduledScanSkippedNoFolders"]);
-				return;
-			}
-			scheduledScanInProgress = true;
-			lastScheduledScanDate = DateTime.Now.Date;
-			Dispatcher.UIThread.Post(() => StartScanCommand.Execute("FullScan").Subscribe());
 		}
 
 		void Scanner_Progress(object? sender, ScanProgressSnapshot e) =>
@@ -733,28 +676,33 @@ namespace VDF.GUI.ViewModels {
 				IsBusy = false;
 				IsReadyToCompare = false;
 				IsGathered = false;
-				scheduledScanInProgress = false;
+				CompleteScheduledScan("Cancelled or failed (see scan log)");
 				ScanDrives.Clear();
 			});
 
 		void Scanner_ScanDone(object? sender, EventArgs e) =>
-			Dispatcher.UIThread.InvokeAsync(() => {
+			Dispatcher.UIThread.InvokeAsync(FinishScanResultsAsync);
+
+		internal async Task FinishScanResultsAsync() {
+				string completionStatus = "Completed";
+				try {
 				IsScanning = false;
-				IsBusy = false;
+				IsBusy = true;
+				IsBusyOverlayText = "Loading results and restoring review decisions...";
 				IsReadyToCompare = true;
 				IsGathered = true;
 				RemainingTime = TimeSpan.Zero.Format();
 				ScanProgressValue = 0;
 				ScanDrives.Clear();
 				var completedScheduledScan = scheduledScanInProgress;
-				scheduledScanInProgress = false;
 
 				var blacklistedGids = ComputeBlacklistedGroupIds(
 					Scanner.Duplicates.Select(d => (d.GroupId, d.Path)));
 				if (blacklistedGids.Count > 0)
 					Scanner.Duplicates.RemoveWhere(d => blacklistedGids.Contains(d.GroupId));
 
-				AddDuplicatesInBulk(Scanner.Duplicates.Select(item => new DuplicateItemVM(item)));
+				var freshRows = await Task.Run(() => Scanner.Duplicates.Select(item => new DuplicateItemVM(item)).ToArray());
+				AddDuplicatesInBulk(freshRows);
 
 				// A completed scan that matched nothing drops back to the Setup screen; flag
 				// it so the screen shows a "no duplicates found" notice instead of looking
@@ -770,12 +718,14 @@ namespace VDF.GUI.ViewModels {
 				BuildActiveResultsView();
 				RebuildSearchPathIndex();
 				RefreshGroupStats();
+				await ApplyAutomaticSelectionAsync();
 
-				if (SettingsFile.Instance.AutoApplySelectionPresetEnabled &&
+				if (!SettingsFile.Instance.AutomationSelection.AutoAfterScan && SettingsFile.Instance.AutoApplySelectionPresetEnabled &&
 					!string.IsNullOrEmpty(SettingsFile.Instance.AutoApplySelectionPreset)) {
 					var preset = SettingsFile.Instance.CustomSelectionPresets
 						.FirstOrDefault(p => p.Name == SettingsFile.Instance.AutoApplySelectionPreset);
 					if (preset != null) {
+						using var legacyMutation = BeginAutomaticReviewMutation();
 						RunCustomSelection(preset.Data);
 						Logger.Instance.Info(string.Format(App.Lang["Log.AutoAppliedPreset"], preset.Name));
 					}
@@ -784,13 +734,19 @@ namespace VDF.GUI.ViewModels {
 					}
 				}
 
-				if (SettingsFile.Instance.RememberDeletedContent && SettingsFile.Instance.AutoCheckDeletedContentMatches)
+				if (SettingsFile.Instance.RememberDeletedContent && SettingsFile.Instance.AutoCheckDeletedContentMatches) {
+					using var legacyMutation = BeginAutomaticReviewMutation();
 					AutoCheckTombstoneMatches();
+				}
+				// Legacy presets/tombstone checks run after the improved-selection save.
+				// Persist their final automatic choices before reporting completion too.
+				await SaveAutomationReviewRecordsAsync();
 
 				AnnounceScanDone();
 
 				if (completedScheduledScan && SettingsFile.Instance.NotifyOnScheduledScanComplete) {
-					_ = MessageBoxService.Show(App.Lang["Message.ScheduledScanCompleted"]);
+					VDF.GUI.Utils.DesktopNotificationHelper.Notify(
+						App.Lang["Notification.ScanComplete.Title"], App.Lang["Message.ScheduledScanCompleted"]);
 				}
 
 				if (SettingsFile.Instance.NotifyOnScanComplete) {
@@ -798,7 +754,13 @@ namespace VDF.GUI.ViewModels {
 						App.Lang["Notification.ScanComplete.Title"],
 						string.Format(App.Lang["Notification.ScanComplete.Message"], TotalDuplicateGroups));
 				}
-			});
+				}
+				catch (Exception) {
+					completionStatus = "Failed to finish selection/review processing";
+					Logger.Instance.Error(completionStatus);
+				}
+				finally { IsBusy = false; CompleteScheduledScan(completionStatus); }
+		}
 
 		// Groups that contain a tombstone (a fingerprint of content the user already deleted) mean
 		// any LIVE member is a re-download of rejected content — pre-check it for deletion so the
@@ -865,15 +827,26 @@ namespace VDF.GUI.ViewModels {
 		});
 
 		public ReactiveCommand<Unit, Unit> CleanDatabaseCommand => ReactiveCommand.Create(() => {
+			if (ScanOrDataWorkActive) return;
 			IsBusy = true;
 			IsBusyOverlayText = App.Lang["Busy.CleaningDatabase"];
 			Scanner.CleanupDatabase();
-		});
+		}, CanStartScan);
+
+		bool ScanOrDataWorkActive => IsStartupLoading || IsBusy || IsScanning || HasActiveScanRun ||
+			IsAutomationWorking || ShowThumbnailRetrievalProgressBar;
+
+		async Task RunDatabaseChangeAsync(Func<Task> change) {
+			if (ScanOrDataWorkActive) return;
+			IsBusy = true;
+			try { await change(); }
+			finally { IsBusy = false; }
+		}
 
 		// Removes "ghost" entries: file gone from a MOUNTED drive + no comparable fingerprint data
 		// (tombstones — missing files WITH fingerprints — are untouched; offline drives too).
 		// Count-first so the confirm dialog shows exactly what would be removed.
-		public ReactiveCommand<Unit, Unit> PruneGhostEntriesCommand => ReactiveCommand.CreateFromTask(async () => {
+		public ReactiveCommand<Unit, Unit> PruneGhostEntriesCommand => ReactiveCommand.CreateFromTask(() => RunDatabaseChangeAsync(async () => {
 			int count = await Task.Run(ScanEngine.CountGhostEntries);
 			if (count == 0) {
 				await MessageBoxService.Show(App.Lang["Message.NoGhostEntries"]);
@@ -885,22 +858,22 @@ namespace VDF.GUI.ViewModels {
 			if (dlgResult != MessageBoxButtons.Yes) return;
 			int removed = await Task.Run(ScanEngine.PruneGhostEntries);
 			await MessageBoxService.Show(string.Format(App.Lang["Message.PruneGhostEntriesDone"], removed));
-		});
+		}), CanStartScan);
 
-		public ReactiveCommand<Unit, Unit> ClearDatabaseCommand => ReactiveCommand.CreateFromTask(async () => {
+		public ReactiveCommand<Unit, Unit> ClearDatabaseCommand => ReactiveCommand.CreateFromTask(() => RunDatabaseChangeAsync(async () => {
 			MessageBoxButtons? dlgResult = await MessageBoxService.Show(
 				App.Lang["Message.ClearDatabaseWarning"],
 				MessageBoxButtons.Yes | MessageBoxButtons.No);
 			if (dlgResult != MessageBoxButtons.Yes) return;
 			ScanEngine.ClearDatabase();
 			await MessageBoxService.Show(App.Lang["Message.Done"]);
-		});
+		}), CanStartScan);
 
-		public static ReactiveCommand<Unit, Unit> EditDataBaseCommand => ReactiveCommand.CreateFromTask(async () => {
+		public ReactiveCommand<Unit, Unit> EditDataBaseCommand => ReactiveCommand.CreateFromTask(() => RunDatabaseChangeAsync(async () => {
 			DatabaseViewer dlg = new();
 			bool res = await dlg.ShowDialog<bool>(ApplicationHelpers.MainWindow);
-		});
-		public static ReactiveCommand<Unit, Unit> ImportDataBaseFromJsonCommand => ReactiveCommand.CreateFromTask(async () => {
+		}), CanStartScan);
+		public ReactiveCommand<Unit, Unit> ImportDataBaseFromJsonCommand => ReactiveCommand.CreateFromTask(() => RunDatabaseChangeAsync(async () => {
 			var result = await Utils.PickerDialogUtils.OpenFilePicker(new FilePickerOpenOptions() {
 				SuggestedStartLocation = await ApplicationHelpers.MainWindow.StorageProvider.TryGetFolderFromPathAsync(CoreUtils.CurrentFolder),
 				FileTypeFilter = [new FilePickerFileType("Json File") { Patterns = ["*.json"] }]
@@ -914,7 +887,7 @@ namespace VDF.GUI.ViewModels {
 				await MessageBoxService.Show(App.Lang["Message.ImportDatabaseFailed"]);
 			else
 				ScanEngine.SaveDatabase();
-		});
+		}), CanStartScan);
 
 		public static ReactiveCommand<Unit, Unit> ExportDataBaseToJsonCommand => ReactiveCommand.Create(() => {
 			ExportDbToJson(new JsonSerializerOptions {
@@ -1084,16 +1057,15 @@ namespace VDF.GUI.ViewModels {
 			}
 		}
 
-		public ReactiveCommand<Unit, Unit> ImportScanResultsFromFileCommand => ReactiveCommand.CreateFromTask(async () => {
-			var result = await Utils.PickerDialogUtils.OpenFilePicker(new FilePickerOpenOptions {
-				SuggestedStartLocation = await ApplicationHelpers.MainWindow.StorageProvider.TryGetFolderFromPathAsync(CoreUtils.CurrentFolder),
-				FileTypeFilter = [new FilePickerFileType("Scan Results") { Patterns = ["*.zip"] }]
-			});
-			if (string.IsNullOrEmpty(result)) return;
-			ImportScanResultsIncludingThumbnails(result);
-		});
+		public ReactiveCommand<Unit, Unit> ImportScanResultsFromFileCommand => ReactiveCommand.CreateFromTask(
+			() => ImportScanResultsIncludingThumbnails(), CanStartScan);
 
-		async void ImportScanResultsIncludingThumbnails(string? path = null) {
+		internal async Task ImportScanResultsIncludingThumbnails(string? path = null, bool startup = false) {
+			if (IsScanning || HasActiveScanRun || IsAutomationWorking || (!startup && (IsBusy || IsStartupLoading))) return;
+			IsBusy = true;
+			IsBusyOverlayText = App.Lang["Busy.ImportScanResults"];
+			try {
+			if (!startup) await PrepareAutomationRescanAsync();
 			if (Duplicates.Count > 0) {
 				MessageBoxButtons? result = await MessageBoxService.Show(App.Lang["Message.ImportScanResultsClearConfirm"], MessageBoxButtons.Yes | MessageBoxButtons.No);
 				if (result != MessageBoxButtons.Yes) return;
@@ -1107,10 +1079,7 @@ namespace VDF.GUI.ViewModels {
 			}
 			if (string.IsNullOrEmpty(path)) return;
 
-			try {
 				using var stream = File.OpenRead(path);
-				IsBusy = true;
-				IsBusyOverlayText = App.Lang["Busy.ImportScanResults"];
 
 				using var zip = ZipFile.OpenRead(path);
 				var json = zip.GetEntry("scan.json") ?? throw new Exception("scan.json missing");
@@ -1155,23 +1124,22 @@ namespace VDF.GUI.ViewModels {
 
 				BuildActiveResultsView();
 				RefreshGroupStats();
-				IsBusy = false;
 				stream.Close();
 
-				await PromptLoadMissingThumbnails();
+				await InitialiseAutomationReviewAsync();
+				if (!startup || !SettingsFile.Instance.EnableScheduledScan) await PromptLoadMissingThumbnails();
 			}
 			catch (JsonException) {
-				IsBusy = false;
 				string error = App.Lang["Message.ImportScanResultsCorrupt"];
 				Logger.Instance.Error(error);
-				await MessageBoxService.Show(error);
+				if (!startup) await MessageBoxService.Show(error);
 			}
 			catch (Exception ex) {
-				IsBusy = false;
 				string error = string.Format(App.Lang["Message.ImportScanResultsFailed"], ex);
 				Logger.Instance.Error(error);
-				await MessageBoxService.Show(error);
+				if (!startup) await MessageBoxService.Show(error);
 			}
+			finally { IsBusy = false; }
 		}
 
 		/// <summary>
@@ -1610,117 +1578,154 @@ Non-Windows setup:
 			return string.Format(App.Lang["Message.NativeFfmpegLibrariesMissing"], versionPart, archPart, libNames);
 		}
 
-		public ReactiveCommand<string, Unit> StartScanCommand => ReactiveCommand.CreateFromTask(async (string command) => {
-			if (!string.IsNullOrEmpty(SettingsFile.Instance.CustomDatabaseFolder) && !Directory.Exists(SettingsFile.Instance.CustomDatabaseFolder)) {
-				await MessageBoxService.Show(App.Lang["Message.CustomDatabaseFolderMissing"]);
-				return;
-			}
-			if (Duplicates.Count > 0) {
-				if (await MessageBoxService.Show(App.Lang["Message.DiscardResultsPrompt"], MessageBoxButtons.Yes | MessageBoxButtons.No) != MessageBoxButtons.Yes) {
-					return;
-				}
-			}
+		public ReactiveCommand<string, Unit> StartScanCommand => ReactiveCommand.CreateFromTask((string command) => StartScanAsync(command), CanStartScan);
 
-			if ((SettingsFile.Instance.UseNativeFfmpegBinding && !ScanEngine.NativeFFmpegExists) ||
-				(!SettingsFile.Instance.UseNativeFfmpegBinding && !ScanEngine.FFmpegExists) ||
-				!ScanEngine.FFprobeExists) {
-				await DownloadSharedFfmpegAsync();
-			}
-			// Native binding on, shared libraries still missing, but the ffmpeg/ffprobe
-			// executables ARE present: don't claim "FFmpeg was not found" — point the user
-			// at the actual distinction (native needs shared libs) and the one-click way out
-			// (disable native binding to use the executable). See issue #788.
-			if (SettingsFile.Instance.UseNativeFfmpegBinding && !ScanEngine.NativeFFmpegExists &&
-				ScanEngine.FFmpegExists && ScanEngine.FFprobeExists) {
-				await MessageBoxService.Show(GetNativeLibrariesMissingMessage());
-				return;
-			}
-			if ((SettingsFile.Instance.UseNativeFfmpegBinding && !ScanEngine.NativeFFmpegExists) ||
-				(!SettingsFile.Instance.UseNativeFfmpegBinding && !ScanEngine.FFmpegExists)) {
-				await MessageBoxService.Show(GetRequiredFfmpegPackage(CoreUtils.CurrentFolder));
-				return;
-			}
-			if (!ScanEngine.FFprobeExists) {
-				if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows)) {
-					await MessageBoxService.Show(App.Lang["Message.FFprobeMissingWithHint"]);
+		async Task StartScanAsync(string command) {
+			bool automatic = command == "ScheduledFullScan";
+			// Reserve before the first await: dialogs and review saves must not allow a second start.
+			if (IsStartupLoading || IsBusy || IsScanning || IsAutomationWorking || ShowThumbnailRetrievalProgressBar || !scanRunGate.TryBegin()) return;
+			this.RaisePropertyChanged(nameof(HasActiveScanRun));
+			bool started = false;
+			try {
+				if (automatic) {
+					if (SettingsFile.Instance.ScheduledScanProfile != ScanProfile.Custom &&
+						Enum.IsDefined(SettingsFile.Instance.ScheduledScanProfile))
+						ScanProfileMapper.Apply(SettingsFile.Instance.ScheduledScanProfile, SettingsFile.Instance);
+					if (ValidateScheduledScanPrerequisites() is { } failure) {
+						SettingsFile.Instance.ScheduledLastStatus = failure;
+						Logger.Instance.Warn(failure);
+						return;
+					}
 				}
 				else {
-					await MessageBoxService.Show(App.Lang["Message.FFprobeMissing"]);
+					if (!string.IsNullOrEmpty(SettingsFile.Instance.CustomDatabaseFolder) && !Directory.Exists(SettingsFile.Instance.CustomDatabaseFolder)) {
+						await MessageBoxService.Show(App.Lang["Message.CustomDatabaseFolderMissing"]);
+						return;
+					}
+					if (Duplicates.Count > 0) {
+						if (await MessageBoxService.Show(App.Lang["Message.DiscardResultsPrompt"], MessageBoxButtons.Yes | MessageBoxButtons.No) != MessageBoxButtons.Yes) {
+							return;
+						}
+					}
+
+					if ((SettingsFile.Instance.UseNativeFfmpegBinding && !ScanEngine.NativeFFmpegExists) ||
+						(!SettingsFile.Instance.UseNativeFfmpegBinding && !ScanEngine.FFmpegExists) ||
+						!ScanEngine.FFprobeExists) {
+						await DownloadSharedFfmpegAsync();
+					}
+					// Native binding on, shared libraries still missing, but the ffmpeg/ffprobe
+					// executables ARE present: don't claim "FFmpeg was not found" — point the user
+					// at the actual distinction (native needs shared libs) and the one-click way out
+					// (disable native binding to use the executable). See issue #788.
+					if (SettingsFile.Instance.UseNativeFfmpegBinding && !ScanEngine.NativeFFmpegExists &&
+						ScanEngine.FFmpegExists && ScanEngine.FFprobeExists) {
+						await MessageBoxService.Show(GetNativeLibrariesMissingMessage());
+						return;
+					}
+					if ((SettingsFile.Instance.UseNativeFfmpegBinding && !ScanEngine.NativeFFmpegExists) ||
+						(!SettingsFile.Instance.UseNativeFfmpegBinding && !ScanEngine.FFmpegExists)) {
+						await MessageBoxService.Show(GetRequiredFfmpegPackage(CoreUtils.CurrentFolder));
+						return;
+					}
+					if (!ScanEngine.FFprobeExists) {
+						if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows)) {
+							await MessageBoxService.Show(App.Lang["Message.FFprobeMissingWithHint"]);
+						}
+						else {
+							await MessageBoxService.Show(App.Lang["Message.FFprobeMissing"]);
+						}
+						return;
+					}
+					if (SettingsFile.Instance.UseNativeFfmpegBinding && SettingsFile.Instance.HardwareAccelerationMode == Core.FFTools.FFHardwareAccelerationMode.auto) {
+						await MessageBoxService.Show(App.Lang["Message.NativeFfmpegAutoNotSupported"]);
+						return;
+					}
+					if (SettingsFile.Instance.NeedsAiComponents &&
+						!VDF.Core.AI.AiComponents.IsReady) {
+						if (await MessageBoxService.Show(App.Lang["Message.AiComponentsMissingPrompt"], MessageBoxButtons.Yes | MessageBoxButtons.No) != MessageBoxButtons.Yes)
+							return;
+						await DownloadAiComponentsAsync();
+						if (!VDF.Core.AI.AiComponents.IsReady)
+							return;
+					}
+					if (SettingsFile.Instance.Includes.Count == 0) {
+						await MessageBoxService.Show(App.Lang["Message.NoScanFolders"]);
+						return;
+					}
+					if (SettingsFile.Instance.MaxDegreeOfParallelism == 0) {
+						await MessageBoxService.Show(App.Lang["Message.MaxDegreeOfParallelismInvalid"]);
+						return;
+					}
+					if (SettingsFile.Instance.FilterByFileSize && SettingsFile.Instance.MaximumFileSize <= SettingsFile.Instance.MinimumFileSize) {
+						await MessageBoxService.Show(App.Lang["Message.FileSizeFilterInvalid"]);
+						return;
+					}
 				}
-				return;
-			}
-			if (SettingsFile.Instance.UseNativeFfmpegBinding && SettingsFile.Instance.HardwareAccelerationMode == Core.FFTools.FFHardwareAccelerationMode.auto) {
-				await MessageBoxService.Show(App.Lang["Message.NativeFfmpegAutoNotSupported"]);
-				return;
-			}
-			if (SettingsFile.Instance.NeedsAiComponents &&
-				!VDF.Core.AI.AiComponents.IsReady) {
-				if (await MessageBoxService.Show(App.Lang["Message.AiComponentsMissingPrompt"], MessageBoxButtons.Yes | MessageBoxButtons.No) != MessageBoxButtons.Yes)
+				bool isFreshScan = true;
+				switch (command) {
+				case "ScheduledFullScan":
+				case "FullScan":
+					isFreshScan = true;
+					break;
+				case "CompareOnly":
+					isFreshScan = false;
+					if (await MessageBoxService.Show(App.Lang["Message.RescanConfirm"], MessageBoxButtons.Yes | MessageBoxButtons.No) != MessageBoxButtons.Yes)
+						return;
+					break;
+				default:
+					await MessageBoxService.Show(App.Lang["Message.CommandNotImplemented"]);
 					return;
-				await DownloadAiComponentsAsync();
-				if (!VDF.Core.AI.AiComponents.IsReady)
-					return;
-			}
-			if (SettingsFile.Instance.Includes.Count == 0) {
-				await MessageBoxService.Show(App.Lang["Message.NoScanFolders"]);
-				return;
-			}
-			if (SettingsFile.Instance.MaxDegreeOfParallelism == 0) {
-				await MessageBoxService.Show(App.Lang["Message.MaxDegreeOfParallelismInvalid"]);
-				return;
-			}
-			if (SettingsFile.Instance.FilterByFileSize && SettingsFile.Instance.MaximumFileSize <= SettingsFile.Instance.MinimumFileSize) {
-				await MessageBoxService.Show(App.Lang["Message.FileSizeFilterInvalid"]);
-				return;
-			}
-			bool isFreshScan = true;
-			switch (command) {
-			case "FullScan":
-				isFreshScan = true;
-				break;
-			case "CompareOnly":
-				isFreshScan = false;
-				if (await MessageBoxService.Show(App.Lang["Message.RescanConfirm"], MessageBoxButtons.Yes | MessageBoxButtons.No) != MessageBoxButtons.Yes)
-					return;
-				break;
-			default:
-				await MessageBoxService.Show(App.Lang["Message.CommandNotImplemented"]);
-				break;
-			}
+				}
 
-			Duplicates.Clear();
-			ShowNoDuplicatesNotice = false;
+				// Folder counting is informational only — never let it compete with the scan for IO.
+				folderCounting.CancelAll();
 
-			// Folder counting is informational only — never let it compete with the scan for IO.
-			folderCounting.CancelAll();
+				// Persist review decisions and configuration before replacing the current results.
+				await PrepareAutomationRescanAsync();
+				if (automatic) SettingsFile.Instance.ScheduledLastStatus = "Running";
+				SettingsFile.SaveSettings();
+				SyncCoreSettings();
+				TempDirectory = TempExtractionManager.Register(new("VDF-"));
+				Utils.ThumbCacheHelpers.SetActiveProvider(Utils.ThumbPack.Open(TempDirectory.Path));
+				Duplicates.Clear();
+				ShowNoDuplicatesNotice = false;
 
-			TempDirectory = TempExtractionManager.Register(new("VDF-"));
-			Utils.ThumbCacheHelpers.SetActiveProvider(Utils.ThumbPack.Open(TempDirectory.Path));
+				IsScanning = true;
+				IsReadyToCompare = false;
+				IsGathered = false;
+				TotalDuplicateGroups = 0;
+				TotalDuplicates = 0;
+				TotalDuplicatesSize = string.Empty;
 
-			IsScanning = true;
-			IsReadyToCompare = false;
-			IsGathered = false;
-			TotalDuplicateGroups = 0;
-			TotalDuplicates = 0;
-			TotalDuplicatesSize = string.Empty;
+				ChangeIsBusyMessage();
+				IsBusy = true;
 
-			SettingsFile.SaveSettings();
-			SyncCoreSettings();
-
-			ChangeIsBusyMessage();
-			IsBusy = true;
-
-			if (isFreshScan) {
-				Scanner.StartSearch();
+				started = true;
+				if (automatic) automationScanLaunched = true;
+				if (isFreshScan) {
+					Scanner.StartSearch();
+				}
+				else {
+					Scanner.StartCompare();
+				}
 			}
-			else {
-				Scanner.StartCompare();
+			catch (Exception ex) {
+				IsScanning = false;
+				IsBusy = false;
+				started = false;
+				Logger.Instance.Error($"Scan could not start: {ex}");
+				if (automatic) SettingsFile.Instance.ScheduledLastStatus = "Failed to start (see scan log)";
+				else await MessageBoxService.Show("Scan could not start. See the scan log for details.");
 			}
-		}, CanStartScan);
+			finally {
+				if (!started) CompleteScheduledScan(automatic ? SettingsFile.Instance.ScheduledLastStatus : "Not started");
+			}
+		}
 
 		IObservable<bool> CanStartScan {
 			[System.Diagnostics.CodeAnalysis.UnconditionalSuppressMessage("Trimming", "IL2026", Justification = WhenAnyValueTrimJustification)]
-			get => this.WhenAnyValue(x => x.IsBusy, busy => !busy);
+			get => this.WhenAnyValue(x => x.IsBusy, x => x.IsScanning, x => x.HasActiveScanRun, x => x.ShowThumbnailRetrievalProgressBar, x => x.IsAutomationWorking, x => x.IsStartupLoading,
+				(busy, scanning, reserved, previews, selecting, loading) => !busy && !scanning && !reserved && !previews && !selecting && !loading);
 		}
 
 		/// <summary>
@@ -1937,6 +1942,7 @@ Non-Windows setup:
 				d => d.ItemInfo.IsImage);
 
 			using var _ = BeginSelectionUndoBatch();
+			if (!keep.Checked) TrackReviewChange(keep);
 			keep.Checked = false;
 			foreach (var item in groupItems)
 				if (item.ItemInfo.Path != keep.ItemInfo.Path)
@@ -1956,231 +1962,79 @@ Non-Windows setup:
 				item.Checked = true;
 		}
 
-		public ReactiveCommand<Unit, Unit> LoadThumbnailsForCheckedItemsCommand => ReactiveCommand.CreateFromTask(async () => {
-			var items = Duplicates.Where(d => d.Checked).Select(vm => vm.ItemInfo).ToList();
-			if (items.Count == 0) return;
-			SyncCoreSettings();
-			await Scanner.RetrieveThumbnailsForItems(items);
-		});
-
-		public ReactiveCommand<Unit, Unit> LoadThumbnailsForGroupCommand => ReactiveCommand.CreateFromTask(async () => {
-			if (GetSelectedDuplicateItem() is not DuplicateItemVM currentItem) return;
-			var items = Duplicates.Where(d => d.ItemInfo.GroupId == currentItem.ItemInfo.GroupId).Select(d => d.ItemInfo).ToList();
-			SyncCoreSettings();
-			await Scanner.RetrieveThumbnailsForItems(items);
-		});
-
 		List<DuplicateItemVM> CheckedItemsToDelete => ScopedDuplicates().Where(d => d.Checked && d.IsVisibleInFilter).ToList();
 
 		async void DeleteInternal(bool fromDisk,
-									List<DuplicateItemVM>? toDelete = null,
-									bool blackList = false,
-									bool createSymbolLinksInstead = false,
-									bool permanently = false,
-									bool createHardLinksInstead = false) {
-			if (Duplicates.Count == 0) return;
-			toDelete ??= CheckedItemsToDelete;
-			if (toDelete.Count == 0) return;
-			bool createLinks = createSymbolLinksInstead || createHardLinksInstead;
-
-			long totalSizeToDelete = 0;
-			foreach (var item in toDelete)
-				totalSizeToDelete += CheckedSizeOf(item);
-
-			string confirmMessage = createLinks
-					? App.Lang["Message.ReplaceWithLinksConfirm"]
-					: fromDisk
-					? (!permanently ? App.Lang["Message.DeleteToTrashConfirm"] : App.Lang["Message.DeletePermanentlyConfirm"])
-					: (blackList ? App.Lang["Message.DeleteFromListBlacklistConfirm"] : App.Lang["Message.DeleteFromListConfirm"]);
-			confirmMessage += Environment.NewLine + Environment.NewLine +
-				string.Format(App.Lang["Message.DeleteConfirmStats"], toDelete.Count, totalSizeToDelete.BytesToString());
-
-			MessageBoxButtons? dlgResult = await MessageBoxService.Show(confirmMessage,
-				MessageBoxButtons.Yes | MessageBoxButtons.No);
-			if (dlgResult != MessageBoxButtons.Yes) return;
-
-			var keepByGroup = Duplicates
-				   .GroupBy(d => d.ItemInfo.GroupId)
-				   .ToDictionary(
-					   g => g.Key,
-					   g => g.FirstOrDefault(x => !x.Checked)
-				   );
-
-			var actuallyDeleted = new HashSet<DuplicateItemVM>(toDelete.Count, ReferenceEqualityComparer<DuplicateItemVM>.Instance);
-			// With RememberDeletedContent on, a disk-delete that removes an ENTIRE group (no
-			// unchecked survivor) is a content rejection, not a duplicate cleanup: exactly one
-			// entry stays in the database as the tombstone so a re-download of this content is
-			// caught. This set records the groups that already kept theirs.
-			var tombstonedGroups = new HashSet<Guid>();
-			long freedBytes = 0;
-			int missingOnDisk = 0;
-			int total = toDelete.Count;
+			List<DuplicateItemVM>? toDelete = null, bool blackList = false,
+			bool createSymbolLinksInstead = false, bool permanently = false,
+			bool createHardLinksInstead = false) {
+			if (IsScanning || HasActiveScanRun || IsBusy || IsAutomationWorking || !await cleanupOperationGate.WaitAsync(0)) return;
 			IsBusy = true;
-			IsBusyOverlayText = string.Format(App.Lang["Busy.Deleting"], 0, total);
-
+			IsBusyOverlayText = "Validating cleanup protections and remaining copies...";
 			try {
-				// File I/O and database updates run off the UI thread; thousands of
-				// deletions previously froze the window for their full duration.
-				await Task.Run(() => {
-					var progressTimer = Stopwatch.StartNew();
+				toDelete ??= CheckedItemsToDelete;
+				if (toDelete.Count == 0) return;
+				bool createLinks = createSymbolLinksInstead || createHardLinksInstead;
+				var approved = new Dictionary<DuplicateItemVM, ApprovedRemoval>();
+				if (fromDisk || createLinks) {
+					approved = await PrepareCleanupGuardAsync(toDelete);
+					int blocked = toDelete.Count - approved.Count;
+					if (blocked > 0) await MessageBoxService.Show($"{blocked} cleanup action(s) were blocked: a file is protected, unavailable, changed since scanning, or has no verified remaining copy. Review the protection indicators or rescan. Intentional manual protection can be cleared through its Unprotect action.");
+					toDelete = toDelete.Where(approved.ContainsKey).ToList();
+					if (toDelete.Count == 0) return;
+				}
+				string message = createLinks ? App.Lang["Message.ReplaceWithLinksConfirm"] : fromDisk
+					? App.Lang[permanently ? "Message.DeletePermanentlyConfirm" : "Message.DeleteToTrashConfirm"]
+					: App.Lang[blackList ? "Message.DeleteFromListBlacklistConfirm" : "Message.DeleteFromListConfirm"];
+				message += Environment.NewLine + Environment.NewLine + string.Format(App.Lang["Message.DeleteConfirmStats"],
+					toDelete.Count, toDelete.Sum(CheckedSizeOf).BytesToString());
+				if (await MessageBoxService.Show(message, MessageBoxButtons.Yes | MessageBoxButtons.No) != MessageBoxButtons.Yes) return;
+
+				var deleted = new HashSet<DuplicateItemVM>(ReferenceEqualityComparer<DuplicateItemVM>.Instance);
+				long freed = 0;
+				int total = toDelete.Count;
+				var removal = new VDF.Core.Cleanup.LegacyRemovalService(LegacyCleanupJournal);
+				await Task.Run(async () => {
+					if (fromDisk || createLinks) await removal.RecoverAsync();
 					int done = 0;
-					void ReportProgress() {
-						if (progressTimer.ElapsedMilliseconds < 300) return;
-						progressTimer.Restart();
-						int current = done;
-						Dispatcher.UIThread.Post(() =>
-							IsBusyOverlayText = string.Format(App.Lang["Busy.Deleting"], current, total));
-					}
-
-					// Windows recycle-bin deletes go through batched shell operations —
-					// one SHFileOperation per file pays the full shell round-trip each
-					// time and is dramatically slower for big batches. Batches run per
-					// CHUNK, interleaved with the per-file accounting below: recycling
-					// the whole selection in one call kept the "Deleting files... 0/N"
-					// overlay frozen for the entire operation (#849 report), because the
-					// shell call IS the deletion and the counting only ran afterwards.
-					// Per-file success is determined by re-checking existence.
-					bool batchedRecycle = fromDisk && !permanently && !createLinks && CoreUtils.IsWindows;
-					DiskDeletion.RunChunked(toDelete, DiskDeletion.RecycleChunkSize, batchedRecycle,
-						d => d.ItemInfo.Path, File.Exists,
-						paths => {
-							var fs = new FileUtils.SHFILEOPSTRUCT {
-								wFunc = FileUtils.FileOperationType.FO_DELETE,
-								pFrom = string.Join('\0', paths) + "\0\0",
-								fFlags = FileUtils.FileOperationFlags.FOF_ALLOWUNDO |
-										 FileUtils.FileOperationFlags.FOF_NOCONFIRMATION |
-										 FileUtils.FileOperationFlags.FOF_NOERRORUI |
-										 FileUtils.FileOperationFlags.FOF_SILENT
-							};
-							int result = FileUtils.SHFileOperation(ref fs);
-							if (result != 0)
-								Logger.Instance.Warn($"SHFileOperation returned {result:X} for a batch of {paths.Count} file(s); checking which files were actually recycled.");
-						},
-						(dub, wasBatchRecycled) => {
+					foreach (var item in toDelete) {
 						try {
-							// Path-only entry for the database lookup; FileEntry(string)
-							// stats the file and throws once it's gone.
-							var fe = new FileEntry { Path = dub.ItemInfo.Path };
-
-							if (createLinks) {
-								if (!File.Exists(dub.ItemInfo.Path)) {
-									missingOnDisk++;
-									Logger.Instance.Warn($"'{dub.ItemInfo.Path}' no longer exists on disk; removing entry only.");
-								}
-								else {
-									var keeper = keepByGroup.TryGetValue(dub.ItemInfo.GroupId, out var k) ? k : null;
-									if (keeper == null)
-										throw new Exception($"Cannot create a link for '{dub.ItemInfo.Path}' because all items in this group are selected");
-									if (!File.Exists(keeper.ItemInfo.Path))
-										throw new Exception($"Cannot create a link for '{dub.ItemInfo.Path}' because the file to keep ('{keeper.ItemInfo.Path}') does not exist");
-									// The link target path must be free before the link can be created.
-									File.Delete(dub.ItemInfo.Path);
-									if (createHardLinksInstead)
-										HardLinkUtils.CreateHardLink(dub.ItemInfo.Path, keeper.ItemInfo.Path);
-									else
-										File.CreateSymbolicLink(dub.ItemInfo.Path, keeper.ItemInfo.Path);
-									freedBytes += CheckedSizeOf(dub);
-								}
+							if (fromDisk || createLinks) {
+								var action = approved[item];
+								bool protectedNow = IsLiveCleanupProtected(item);
+								await removal.RemoveAsync(action.Target, action.Keeper, claim => {
+									if (createLinks) CreateVerifiedReplacementLink(claim, action.Target.Path, action.Keeper.Path, createHardLinksInstead);
+									else if (permanently) File.Delete(claim);
+									else if (!MoveCleanupClaimToTrash(claim, action.Target.Path)) throw new IOException("Moving to trash failed; the original file was retained.");
+								}, protectedFile: protectedNow);
+								freed += CheckedSizeOf(item);
 							}
-							else if (fromDisk) {
-								switch (DiskDeletion.DeleteOne(dub.ItemInfo.Path, permanently, batchedRecycle,
-										wasBatchRecycled, File.Exists, File.Delete, FileUtils.MoveToTrash)) {
-									case DiskDeletion.Outcome.Deleted:
-									case DiskDeletion.Outcome.AlreadyRecycled:
-										freedBytes += CheckedSizeOf(dub);
-										break;
-									case DiskDeletion.Outcome.MissingEntryOnly:
-										// File was already gone; the entry is still removed from the
-										// list and database, but the user gets told afterwards.
-										missingOnDisk++;
-										Logger.Instance.Warn($"'{dub.ItemInfo.Path}' no longer exists on disk; removing entry only.");
-										break;
-								}
-							}
-
-							if (blackList)
-								ScanEngine.BlackListFileEntry(dub.ItemInfo.Path);
-							else {
-								// Only a disk-delete rejects content; remove-from-list/link modes leave
-								// the file (or a survivor) in place, so their entries are dropped as before.
-								bool keepAsTombstone = fromDisk &&
-									SettingsFile.Instance.RememberDeletedContent &&
-									(!keepByGroup.TryGetValue(dub.ItemInfo.GroupId, out var survivor) || survivor == null) &&
-									tombstonedGroups.Add(dub.ItemInfo.GroupId);
-								if (!keepAsTombstone)
-									ScanEngine.RemoveFromDatabase(fe);
-							}
-
-							actuallyDeleted.Add(dub);
+							if (blackList) ScanEngine.BlackListFileEntry(item.ItemInfo.Path);
+							else ScanEngine.RemoveFromDatabase(new FileEntry { Path = item.ItemInfo.Path });
+							deleted.Add(item);
 						}
-						catch (Exception ex) {
-							Logger.Instance.Error($"Failed to delete '{dub.ItemInfo.Path}': {ex.Message}\n{ex.StackTrace}");
-						}
+						catch (Exception ex) { Logger.Instance.Error($"Cleanup failed: {ex.Message}"); }
 						finally {
-							done++;
-							ReportProgress();
+							int current = ++done;
+							Dispatcher.UIThread.Post(() => IsBusyOverlayText = string.Format(App.Lang["Busy.Deleting"], current, total));
 						}
-					});
-
-					if (missingOnDisk > 0)
-						Logger.Instance.Warn($"{missingOnDisk} of {total} selected files were not found on disk; their entries were removed from the results, but no data was deleted for them.");
-
-					// Persist the database changes while still off the UI thread. This used
-					// to run last, after the results refresh, on the UI thread - where an
-					// exception in the refresh (dispatcher exceptions are swallowed to keep
-					// the app alive) could silently skip the save.
-					if (actuallyDeleted.Count > 0)
-						ScanEngine.SaveDatabase();
+					}
+					if (deleted.Count > 0) ScanEngine.SaveDatabase();
 				});
-			}
-			finally {
-				IsBusy = false;
-			}
-
-			if (freedBytes > 0)
-				TotalSizeRemovedInternal += freedBytes;
-
-			int failedCount = toDelete.Count - actuallyDeleted.Count;
-			if (failedCount > 0)
-				await MessageBoxService.Show(string.Format(App.Lang["Message.DeleteCompletedWithFailures"],
-					actuallyDeleted.Count, toDelete.Count, failedCount));
-
-			// "File not found" is treated as success above so stale entries clean up,
-			// but a batch full of them means an unavailable drive, not a deletion -
-			// without this notice 2000 entries once vanished while every file
-			// silently stayed on disk.
-			if (missingOnDisk > 0)
-				await MessageBoxService.Show(string.Format(App.Lang["Message.DeleteMissingFilesNotice"], missingOnDisk));
-
-			if (actuallyDeleted.Count == 0)
-				return;
-
-			try {
-				// Remove deleted items from flat list (single pass; searching the list
-				// per deleted item was O(deleted x list) and stalled on big batches)
-				for (int i = Duplicates.Count - 1; i >= 0; i--)
-					if (actuallyDeleted.Contains(Duplicates[i]))
-						Duplicates.RemoveAt(i);
-
-				// When ExcludeHardLinks is enabled, remove items within each group
-				// that are hardlinks of another remaining item in the same group.
-				if (SettingsFile.Instance.ExcludeHardLinks)
-					DropHardLinkDuplicates();
-
-				// Drop groups that have only one item left (no longer duplicates)
+				if (freed > 0) TotalSizeRemovedInternal += freed;
+				for (int i = Duplicates.Count - 1; i >= 0; i--) if (deleted.Contains(Duplicates[i])) Duplicates.RemoveAt(i);
+				if (SettingsFile.Instance.ExcludeHardLinks) DropHardLinkDuplicates();
 				DropSingletonGroups();
-
 				RefreshGroupStats();
 				RefreshResultsView();
+				if (deleted.Count < total) await MessageBoxService.Show(string.Format(App.Lang["Message.DeleteCompletedWithFailures"], deleted.Count, total, total - deleted.Count));
+				if (SettingsFile.Instance.BackupAfterListChanged) await ExportScanResults(BackupScanResultsFile);
 			}
 			catch (Exception ex) {
-				// Files and database are already handled; a view-refresh failure must
-				// not abort the rest of this method (the backup below).
-				Logger.Instance.Error($"Updating the results view after deletion failed: {ex}");
+				Logger.Instance.Error($"Cleanup could not complete: {ex.Message}");
+				await MessageBoxService.Show("Cleanup could not complete. Review the log and cleanup journal; retained files were not permanently removed as a fallback.");
 			}
-
-			if (SettingsFile.Instance.BackupAfterListChanged)
-				await ExportScanResults(BackupScanResultsFile);
+			finally { IsBusy = false; cleanupOperationGate.Release(); }
 		}
 
 		void DropSingletonGroups() {
@@ -2249,6 +2103,7 @@ Non-Windows setup:
 		public ReactiveCommand<Unit, Unit> KeepHighlightedAndAdvanceCommand => ReactiveCommand.Create(() => {
 			if (GetSelectedDuplicateItem() is DuplicateItemVM keeper) {
 				using var _ = BeginSelectionUndoBatch();
+				if (!keeper.Checked) TrackReviewChange(keeper);
 				keeper.Checked = false;
 				foreach (var item in Duplicates)
 					if (item.ItemInfo.GroupId == keeper.ItemInfo.GroupId && !ReferenceEquals(item, keeper))
@@ -2298,9 +2153,9 @@ Non-Windows setup:
 			}
 		});
 
-		public ReactiveCommand<Unit, Unit> RelocateDatabaseFilesCommand => ReactiveCommand.Create(() => {
+		public ReactiveCommand<Unit, Unit> RelocateDatabaseFilesCommand => ReactiveCommand.CreateFromTask(() => RunDatabaseChangeAsync(async () => {
 			var dlg = new RelocateFilesDialog();
-			dlg.ShowDialog(ApplicationHelpers.MainWindow);
-		});
+			await dlg.ShowDialog(ApplicationHelpers.MainWindow);
+		}), CanStartScan);
 	}
 }

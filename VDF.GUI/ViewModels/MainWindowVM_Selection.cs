@@ -137,47 +137,27 @@ namespace VDF.GUI.ViewModels {
 			return (partial, full);
 		}
 
-		public ReactiveCommand<Unit, Unit> CheckWhenIdenticalCommand => ReactiveCommand.Create(() => {
+		public ReactiveCommand<Unit, Unit> CheckWhenIdenticalCommand => ReactiveCommand.CreateFromTask(() => RunLegacySelectorAsync(() => {
 			using var undoBatch = BeginSelectionUndoBatch();
 			ForEachGroupCluster(ScopedDuplicates(), (d, first) => d.EqualsFull(first), (first, cluster) => {
-				foreach (var dup in cluster)
-					dup.Checked = true;
-				first.Checked = false;
+				foreach (var dup in cluster) SetLegacyAutomaticChoice(dup, true);
+				SetLegacyAutomaticChoice(first, false);
 			});
-		});
+		}));
 
-		public ReactiveCommand<Unit, Unit> CheckWhenIdenticalButSizeCommand => ReactiveCommand.Create(() => {
+		public ReactiveCommand<Unit, Unit> CheckWhenIdenticalButSizeCommand => ReactiveCommand.CreateFromTask(() => RunLegacySelectorAsync(() => {
 			using var undoBatch = BeginSelectionUndoBatch();
 			ForEachGroupCluster(ScopedDuplicates(), (d, first) => d.EqualsButQuality(first), (first, cluster) => {
 				cluster.Add(first);
-				cluster = cluster.OrderBy(s => s.ItemInfo.SizeLong).ToList();
-				cluster[0].Checked = false;
-				for (int i = 1; i < cluster.Count; i++)
-					cluster[i].Checked = true;
+				cluster = cluster.OrderBy(s => s.ItemInfo.SizeLong).ThenBy(s => s.ItemInfo.Path, StringComparer.Ordinal).ToList();
+				SetLegacyAutomaticChoice(cluster[0], false);
+				for (int i = 1; i < cluster.Count; i++) SetLegacyAutomaticChoice(cluster[i], true);
 			});
-		});
+		}));
 
-		public ReactiveCommand<Unit, Unit> CheckOldestCommand => ReactiveCommand.Create(() => {
-			using var undoBatch = BeginSelectionUndoBatch();
-			ForEachGroupCluster(ScopedDuplicates(), (d, first) => d.EqualsButQuality(first), (first, cluster) => {
-				cluster.Add(first);
-				cluster = cluster.OrderByDescending(s => s.ShownDate).ToList();
-				cluster[0].Checked = false;
-				for (int i = 1; i < cluster.Count; i++)
-					cluster[i].Checked = true;
-			});
-		});
+		public ReactiveCommand<Unit, Unit> CheckOldestCommand => ReactiveCommand.CreateFromTask(() => ApplyLegacyDateSelectionAsync(keepNewest: true));
 
-		public ReactiveCommand<Unit, Unit> CheckNewestCommand => ReactiveCommand.Create(() => {
-			using var undoBatch = BeginSelectionUndoBatch();
-			ForEachGroupCluster(ScopedDuplicates(), (d, first) => d.EqualsButQuality(first), (first, cluster) => {
-				cluster.Add(first);
-				cluster = cluster.OrderBy(s => s.ShownDate).ToList();
-				cluster[0].Checked = false;
-				for (int i = 1; i < cluster.Count; i++)
-					cluster[i].Checked = true;
-			});
-		});
+		public ReactiveCommand<Unit, Unit> CheckNewestCommand => ReactiveCommand.CreateFromTask(() => ApplyLegacyDateSelectionAsync(keepNewest: false));
 
 		public ReactiveCommand<Unit, Unit> CheckLowestQualityCommand => ReactiveCommand.CreateFromTask(async () => {
 			var dlg = new QualityOrderDialog();
@@ -185,23 +165,16 @@ namespace VDF.GUI.ViewModels {
 			if (result == null || result.Order.Count == 0) return;
 			QualityCriteriaOrder = result.Order;
 			SettingsFile.Instance.QualityCriteriaDisabled = result.Disabled;
-			// The BEST badges and the green size follow the new order at once.
 			RebuildResultsList();
-
-			using var undoBatch = BeginSelectionUndoBatch();
-			var criteria = ActiveQualityCriteria.ToList();
-			ForEachGroupCluster(ScopedDuplicates(), (d, first) => d.EqualsButQuality(first), (first, cluster) => {
-				cluster.Insert(0, first);
-
-				var keep = VDF.Core.Utils.QualityRanker.PickKeeper(
-					cluster,
-					criteria,
-					d => d.ItemInfo.IsImage);
-
-				keep.Checked = false;
-				for (int i = 0; i < cluster.Count; i++)
-					if (cluster[i].ItemInfo.Path != keep.ItemInfo.Path)
-						cluster[i].Checked = true;
+			await RunLegacySelectorAsync(() => {
+				using var undoBatch = BeginSelectionUndoBatch();
+				var criteria = ActiveQualityCriteria.ToList();
+				ForEachGroupCluster(ScopedDuplicates(), (d, first) => d.EqualsButQuality(first), (first, cluster) => {
+					cluster.Insert(0, first);
+					var keep = QualityRanker.PickKeeper(cluster, criteria, d => d.ItemInfo.IsImage);
+					SetLegacyAutomaticChoice(keep, false);
+					foreach (var item in cluster) if (!ReferenceEquals(item, keep)) SetLegacyAutomaticChoice(item, true);
+				});
 			});
 		});
 
@@ -427,9 +400,22 @@ namespace VDF.GUI.ViewModels {
 
 			using var undoBatch = BeginSelectionUndoBatch();
 			foreach (var keeper in plan.Keepers)
-				keeper.Checked = false;
+				SetLegacyAutomaticChoice(keeper, false);
 			foreach (var item in plan.ToCheck)
-				item.Checked = true;
+				SetLegacyAutomaticChoice(item, true);
+		}
+
+		void SetLegacyAutomaticChoice(DuplicateItemVM item, bool selected) {
+			if (item.ManualReviewChoice != VDF.Core.Selection.ReviewChoice.None) return;
+			automaticReviewMutation++;
+			try {
+			item.AutomaticallySelected = selected && item.CanMarkForRemoval;
+			item.Checked = item.AutomaticallySelected;
+			item.IsAutomationKeeper = !item.Checked;
+			item.SelectionReason = selected ? "Legacy selection recommendation; review before cleanup." : "Keeper recommended by the legacy selection rule.";
+			item.NotifyAutomationStateChanged();
+			}
+			finally { automaticReviewMutation--; }
 		}
 
 		/// <summary>

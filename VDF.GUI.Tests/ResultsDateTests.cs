@@ -72,8 +72,17 @@ namespace VDF.GUI.Tests {
 		[Fact]
 		public void DetailsLine_ShowsTheChosenDate() {
 			var item = Item(Guid.Empty, "a", Copied, Recorded).ItemInfo;
-			WithSetting(true, () => Assert.Contains(Recorded.ToString("g", CultureInfo.InvariantCulture),
+			WithSetting(true, () => Assert.Contains(ResultsDates.ForDisplay(Recorded).ToString("g", CultureInfo.InvariantCulture),
 				ResultsBadgeRules.BuildFileLine(item, CultureInfo.InvariantCulture)));
+		}
+
+		[Fact]
+		public void DisplayConvertsUtcAndLegacyUnspecifiedWithoutChangingStoredDate() {
+			var zone = TimeZoneInfo.CreateCustomTimeZone("TestMinusSix", TimeSpan.FromHours(-6), "TestMinusSix", "TestMinusSix");
+			var utc = new DateTime(2026, 10, 13, 16, 30, 0, DateTimeKind.Utc);
+			Assert.Equal(new DateTime(2026, 10, 13, 10, 30, 0), ResultsDates.ForDisplay(utc, zone));
+			Assert.Equal(ResultsDates.ForDisplay(utc, zone), ResultsDates.ForDisplay(DateTime.SpecifyKind(utc, DateTimeKind.Unspecified), zone));
+			Assert.Equal(16, utc.Hour);
 		}
 	}
 }

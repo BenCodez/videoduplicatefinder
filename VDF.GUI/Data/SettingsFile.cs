@@ -38,6 +38,11 @@ namespace VDF.GUI.Data {
 
 		public SettingsFile() { }
 
+		public VDF.Core.Selection.SelectionOptions AutomationSelection { get; set; } = new();
+		public List<VDF.Core.Selection.NamedSelectionProfile> SavedSelectionProfiles { get; set; } = new();
+		public VDF.Core.Nfo.NfoOptions NfoFavourites { get; set; } = new();
+		public string QuarantineFolder { get; set; } = string.Empty;
+
 
 		public static void SetSettingsPath(string? path) {
 			settingsPath = string.IsNullOrWhiteSpace(path) ? null : path;
@@ -407,9 +412,21 @@ namespace VDF.GUI.Data {
 			set => this.RaiseAndSetIfChanged(ref field, Math.Max(0, value));
 		} = 5;
 
+		static readonly object settingsWriteGate = new();
 		public static void SaveSettings(string? path = null) {
-			path = ResolveSettingsPath(path);
-			File.WriteAllText(path, JsonSerializer.Serialize(instance, GuiJsonContext.Default.SettingsFile));
+			lock (settingsWriteGate) {
+				path = Path.GetFullPath(ResolveSettingsPath(path));
+				Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+				string temp = path + "." + Guid.NewGuid().ToString("N") + ".tmp";
+				try {
+					using (var stream = new FileStream(temp, FileMode.CreateNew, FileAccess.Write, FileShare.None)) {
+						JsonSerializer.Serialize(stream, Instance, GuiJsonContext.Default.SettingsFile);
+						stream.Flush(flushToDisk: true);
+					}
+					VDF.Core.Review.DurableFileOperations.Move(temp, path, overwrite: true);
+				}
+				finally { if (File.Exists(temp)) File.Delete(temp); }
+			}
 		}
 
 		[JsonPropertyName("UseMica")]
@@ -681,6 +698,58 @@ namespace VDF.GUI.Data {
 			get;
 			set => this.RaiseAndSetIfChanged(ref field, value);
 		} = "02:00";
+		[JsonPropertyName("ScheduledScanKind")]
+		public VDF.Core.Scheduling.ScanScheduleKind ScheduledScanKind {
+			get;
+			set => this.RaiseAndSetIfChanged(ref field, value);
+		}
+		[JsonPropertyName("ScheduledScanWeekdays")]
+		public int ScheduledScanWeekdays {
+			get;
+			set => this.RaiseAndSetIfChanged(ref field, value & 127);
+		} = 2;
+		[JsonPropertyName("ScheduledScanIntervalMinutes")]
+		public int ScheduledScanIntervalMinutes {
+			get;
+			set => this.RaiseAndSetIfChanged(ref field, value);
+		} = 60;
+		[JsonPropertyName("ScheduledScanCatchUpHours")]
+		public int ScheduledScanCatchUpHours {
+			get;
+			set => this.RaiseAndSetIfChanged(ref field, value);
+		} = 24;
+		/// <summary>Custom means use the current scan settings; named profiles reuse the Setup bundles.</summary>
+		[JsonPropertyName("ScheduledScanProfile")]
+		public ScanProfile ScheduledScanProfile {
+			get;
+			set => this.RaiseAndSetIfChanged(ref field, value);
+		} = ScanProfile.Custom;
+		/// <summary>Durable UTC watermark claimed before starting; failures and restarts do not replay it.</summary>
+		[JsonPropertyName("ScheduledLastClaimedSlotUtc")]
+		public DateTimeOffset? ScheduledLastClaimedSlotUtc {
+			get;
+			set => this.RaiseAndSetIfChanged(ref field, value);
+		}
+		[JsonPropertyName("ScheduledLastStartedUtc")]
+		public DateTimeOffset? ScheduledLastStartedUtc {
+			get;
+			set => this.RaiseAndSetIfChanged(ref field, value);
+		}
+		[JsonPropertyName("ScheduledLastCompletedUtc")]
+		public DateTimeOffset? ScheduledLastCompletedUtc {
+			get;
+			set => this.RaiseAndSetIfChanged(ref field, value);
+		}
+		[JsonPropertyName("ScheduledLastDurationSeconds")]
+		public double ScheduledLastDurationSeconds {
+			get;
+			set => this.RaiseAndSetIfChanged(ref field, value);
+		}
+		[JsonPropertyName("ScheduledLastStatus")]
+		public string ScheduledLastStatus {
+			get;
+			set => this.RaiseAndSetIfChanged(ref field, value);
+		} = "Never run";
 		[JsonPropertyName("NotifyOnScheduledScanComplete")]
 		public bool NotifyOnScheduledScanComplete {
 			get;

@@ -1,0 +1,165 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:vm="clr-namespace:VDF.GUI.ViewModels"
+        xmlns:mvvm="clr-namespace:VDF.GUI.Mvvm"
+        xmlns:selection="clr-namespace:VDF.Core.Selection;assembly=VDF.Core"
+        xmlns:cleanup="clr-namespace:VDF.Core.Cleanup;assembly=VDF.Core"
+        x:Class="VDF.GUI.Views.AutomationSettingsView"
+        x:DataType="vm:AutomationSettingsVM"
+        Width="1020" Height="780" MinWidth="760" MinHeight="500"
+        WindowStartupLocation="CenterOwner" Title="Selection, favourites and recovery">
+  <Window.Resources><mvvm:AutomationEnumDisplayConverter x:Key="AutomationEnumLabel" /></Window.Resources>
+  <Window.Styles>
+    <Style Selector="TextBlock.heading"><Setter Property="FontWeight" Value="SemiBold" /><Setter Property="FontSize" Value="16" /><Setter Property="Margin" Value="0,10,0,3" /></Style>
+    <Style Selector="TextBlock.help"><Setter Property="TextWrapping" Value="Wrap" /><Setter Property="Margin" Value="0,0,0,8" /></Style>
+    <Style Selector="TextBox"><Setter Property="MinHeight" Value="32" /></Style>
+  </Window.Styles>
+  <Grid RowDefinitions="*,Auto" Margin="18">
+    <TabControl x:Name="AutomationTabs" AutomationProperties.Name="Selection and recovery settings" IsEnabled="{Binding !IsWorking}">
+      <TabItem Header="Selection">
+        <ScrollViewer>
+          <StackPanel Spacing="8" Margin="4,10,4,12">
+            <TextBlock Classes="help" Text="Choose which files to keep. Checked files are removal candidates; cleanup always needs a separate review and action." />
+            <TextBlock Classes="heading" Text="Saved selection profiles" />
+            <Grid ColumnDefinitions="*,Auto,Auto" ColumnSpacing="8">
+              <ComboBox x:Name="SavedProfilesCombo" AutomationProperties.Name="Saved selection profile" ItemsSource="{Binding SavedProfiles}" SelectedItem="{Binding SelectedSavedProfile, Mode=TwoWay}" PlaceholderText="Choose a saved profile">
+                <ComboBox.ItemTemplate><DataTemplate x:DataType="selection:NamedSelectionProfile"><TextBlock Text="{Binding Name}" /></DataTemplate></ComboBox.ItemTemplate>
+              </ComboBox>
+              <Button Grid.Column="1" Content="Load profile" Command="{Binding LoadNamedProfileCommand}" />
+              <Button Grid.Column="2" Content="Delete profile" Command="{Binding DeleteNamedProfileCommand}" />
+            </Grid>
+            <Grid ColumnDefinitions="*,Auto" ColumnSpacing="8">
+              <TextBox x:Name="SavedProfileNameBox" AutomationProperties.Name="New selection profile name" Text="{Binding SavedProfileName, Mode=TwoWay}" PlaceholderText="Name for the current selection settings" />
+              <Button Grid.Column="1" Content="Save current as profile" Command="{Binding SaveNamedProfileCommand}" />
+            </Grid>
+            <CheckBox x:Name="AutoAfterScanCheck" Content="Apply this selection after a successful scan" IsChecked="{Binding Selection.AutoAfterScan, Mode=TwoWay}" />
+            <CheckBox Content="Limit manual selection commands to highlighted groups" IsChecked="{Binding Selection.HighlightedGroupsOnly, Mode=TwoWay}" />
+            <TextBlock Classes="help" Text="All groups are considered by default, including groups hidden by a results filter. Highlight a group to use the optional group scope." />
+            <Grid ColumnDefinitions="170,*" RowDefinitions="Auto,Auto,Auto,Auto" ColumnSpacing="12" RowSpacing="8">
+              <TextBlock Grid.Row="0" Text="Keeper profile" VerticalAlignment="Center" />
+              <ComboBox Grid.Row="0" Grid.Column="1" x:Name="ProfileCombo" AutomationProperties.Name="Keeper profile" ItemsSource="{Binding Profiles}" SelectedItem="{Binding Selection.Profile, Mode=TwoWay}">
+                <ComboBox.ItemTemplate><DataTemplate x:DataType="selection:SelectionProfile"><TextBlock Text="{Binding ., Converter={StaticResource AutomationEnumLabel}}" /></DataTemplate></ComboBox.ItemTemplate>
+              </ComboBox>
+              <TextBlock Grid.Row="1" Text="Priority mode" VerticalAlignment="Center" />
+              <ComboBox Grid.Row="1" Grid.Column="1" AutomationProperties.Name="Priority mode" ItemsSource="{Binding Modes}" SelectedItem="{Binding Selection.Mode, Mode=TwoWay}">
+                <ComboBox.ItemTemplate><DataTemplate x:DataType="selection:SelectionMode"><TextBlock Text="{Binding ., Converter={StaticResource AutomationEnumLabel}}" /></DataTemplate></ComboBox.ItemTemplate>
+              </ComboBox>
+              <TextBlock Grid.Row="2" Text="Date used for selection" VerticalAlignment="Center" />
+              <ComboBox Grid.Row="2" Grid.Column="1" x:Name="DateSourceCombo" AutomationProperties.Name="Date used for selection" ItemsSource="{Binding DateSources}" SelectedItem="{Binding Selection.DateSource, Mode=TwoWay}">
+                <ComboBox.ItemTemplate><DataTemplate x:DataType="selection:SelectionDateSource"><TextBlock Text="{Binding ., Converter={StaticResource AutomationEnumLabel}}" /></DataTemplate></ComboBox.ItemTemplate>
+              </ComboBox>
+              <TextBlock Grid.Row="3" Text="Overlapping folder rules" VerticalAlignment="Center" />
+              <ComboBox Grid.Row="3" Grid.Column="1" AutomationProperties.Name="Overlapping folder rules" ItemsSource="{Binding OverlapPolicies}" SelectedItem="{Binding Selection.OverlapPolicy, Mode=TwoWay}">
+                <ComboBox.ItemTemplate><DataTemplate x:DataType="selection:FolderOverlapPolicy"><TextBlock Text="{Binding ., Converter={StaticResource AutomationEnumLabel}}" /></DataTemplate></ComboBox.ItemTemplate>
+              </ComboBox>
+            </Grid>
+            <TextBlock Classes="help" Text="Strict folder priority keeps a file in the highest priority folder before comparing quality. Weighted mode combines normalized quality values and the folder weight. Missing date metadata is reported for review." />
+            <TextBlock Classes="heading" Text="Folder rules" />
+            <TextBlock Classes="help" Text="Higher numbers are preferred. Protect all prevents removal of every matching file. Patterns match the path relative to the folder (for example *.mkv)." />
+            <ItemsControl x:Name="FolderRulesList" AutomationProperties.Name="Folder priority rules" ItemsSource="{Binding FolderRules}">
+              <ItemsControl.ItemTemplate>
+                <DataTemplate x:DataType="selection:FolderPriorityRule">
+                  <Border BorderBrush="{DynamicResource SystemControlBackgroundChromeMediumBrush}" BorderThickness="1" Padding="10" Margin="0,0,0,8">
+                    <StackPanel Spacing="8">
+                      <Grid ColumnDefinitions="*,Auto,Auto" ColumnSpacing="8">
+                        <TextBox AutomationProperties.Name="Priority folder path" Text="{Binding Directory, Mode=TwoWay}" PlaceholderText="Absolute folder path" />
+                        <Button Grid.Column="1" Content="Browse…" Command="{Binding $parent[Window].((vm:AutomationSettingsVM)DataContext).BrowseFolderRuleCommand}" CommandParameter="{Binding}" />
+                        <Button Grid.Column="2" Content="Remove rule" Command="{Binding $parent[Window].((vm:AutomationSettingsVM)DataContext).RemoveFolderRuleCommand}" CommandParameter="{Binding}" />
+                      </Grid>
+                      <WrapPanel>
+                        <CheckBox Content="Enabled" Margin="0,0,16,0" IsChecked="{Binding Enabled, Mode=TwoWay}" />
+                        <CheckBox Content="Include subfolders" Margin="0,0,16,0" IsChecked="{Binding Recursive, Mode=TwoWay}" />
+                        <CheckBox Content="Protect all" Margin="0,0,16,0" IsChecked="{Binding ProtectAll, Mode=TwoWay}" />
+                        <TextBlock Text="Priority" VerticalAlignment="Center" Margin="0,0,6,0" />
+                        <NumericUpDown Width="130" AutomationProperties.Name="Numeric folder priority" Minimum="-1000000" Maximum="1000000" Increment="1" Value="{Binding Priority, Mode=TwoWay}" />
+                        <TextBox Width="210" Margin="12,0,0,0" AutomationProperties.Name="Folder rule pattern" PlaceholderText="Optional pattern" Text="{Binding Pattern, Mode=TwoWay}" />
+                      </WrapPanel>
+                    </StackPanel>
+                  </Border>
+                </DataTemplate>
+              </ItemsControl.ItemTemplate>
+            </ItemsControl>
+            <Button Content="Add folder rule" HorizontalAlignment="Left" Command="{Binding AddFolderRuleCommand}" />
+            <TextBlock Classes="heading" Text="Quality and custom criteria" />
+            <TextBlock Classes="help" Text="Criteria are compared in order for strict custom selection. Weighted mode uses their weights. Size only participates when explicitly added. Codec, language and container preferences are listed from most preferred to least." />
+            <StackPanel Orientation="Horizontal" Spacing="12">
+              <TextBlock Text="Folder weight" VerticalAlignment="Center" />
+              <NumericUpDown Width="120" AutomationProperties.Name="Folder weight" Minimum="0" Maximum="1000000" Increment="0.5" Value="{Binding Selection.FolderWeight, Mode=TwoWay}" />
+            </StackPanel>
+            <ItemsControl x:Name="CriteriaList" AutomationProperties.Name="Selection quality criteria" ItemsSource="{Binding Criteria}">
+              <ItemsControl.ItemTemplate>
+                <DataTemplate x:DataType="selection:SelectionCriterion">
+                  <Grid ColumnDefinitions="*,120,Auto,Auto,Auto,Auto" ColumnSpacing="8" Margin="0,0,0,6">
+                    <ComboBox AutomationProperties.Name="Selection criterion" ItemsSource="{Binding $parent[Window].((vm:AutomationSettingsVM)DataContext).CriterionNames}" SelectedItem="{Binding Name, Mode=TwoWay}" />
+                    <NumericUpDown Grid.Column="1" AutomationProperties.Name="Criterion weight" Minimum="0" Maximum="1000000" Increment="0.5" Value="{Binding Weight, Mode=TwoWay}" />
+                    <CheckBox Grid.Column="2" Content="Prefer lower" IsChecked="{Binding PreferLower, Mode=TwoWay}" />
+                    <Button Grid.Column="3" Content="↑" AutomationProperties.Name="Move criterion up" Command="{Binding $parent[Window].((vm:AutomationSettingsVM)DataContext).MoveCriterionUpCommand}" CommandParameter="{Binding}" />
+                    <Button Grid.Column="4" Content="↓" AutomationProperties.Name="Move criterion down" Command="{Binding $parent[Window].((vm:AutomationSettingsVM)DataContext).MoveCriterionDownCommand}" CommandParameter="{Binding}" />
+                    <Button Grid.Column="5" Content="Remove" AutomationProperties.Name="Remove criterion" Command="{Binding $parent[Window].((vm:AutomationSettingsVM)DataContext).RemoveCriterionCommand}" CommandParameter="{Binding}" />
+                  </Grid>
+                </DataTemplate>
+              </ItemsControl.ItemTemplate>
+            </ItemsControl>
+            <Button Content="Add criterion" HorizontalAlignment="Left" Command="{Binding AddCriterionCommand}" />
+            <Grid ColumnDefinitions="170,*" RowDefinitions="Auto,Auto,Auto" ColumnSpacing="12" RowSpacing="8">
+              <TextBlock Text="Preferred codecs" VerticalAlignment="Center" /><TextBox Grid.Column="1" AutomationProperties.Name="Preferred codecs" Text="{Binding PreferredCodecsText, Mode=TwoWay}" PlaceholderText="hevc, h264, av1" />
+              <TextBlock Grid.Row="1" Text="Audio languages" VerticalAlignment="Center" /><TextBox Grid.Row="1" Grid.Column="1" AutomationProperties.Name="Preferred audio languages" Text="{Binding PreferredAudioLanguagesText, Mode=TwoWay}" PlaceholderText="ENG, GER" />
+              <TextBlock Grid.Row="2" Text="Containers" VerticalAlignment="Center" /><TextBox Grid.Row="2" Grid.Column="1" AutomationProperties.Name="Preferred containers" Text="{Binding PreferredContainersText, Mode=TwoWay}" PlaceholderText="mkv, mp4" />
+            </Grid>
+          </StackPanel>
+        </ScrollViewer>
+      </TabItem>
+      <TabItem Header="NFO favourites">
+        <ScrollViewer>
+          <StackPanel Spacing="8" Margin="4,10,4,12">
+            <CheckBox x:Name="EnableNfoCheck" Content="Protect favourites marked in local NFO files" IsChecked="{Binding Nfo.Enabled, Mode=TwoWay}" />
+            <TextBlock Classes="help" Text="The matching episode/movie sidecar takes precedence over movie.nfo or tvshow.nfo. Unreadable or malformed metadata is held for review. Favourite protection applies to selection and cleanup." />
+            <CheckBox Content="Inherit season favourites" IsChecked="{Binding Nfo.InheritSeason, Mode=TwoWay}" />
+            <CheckBox Content="Inherit series favourites" IsChecked="{Binding Nfo.InheritSeries, Mode=TwoWay}" />
+            <TextBlock Classes="help" Text="Inheritance is optional and searches at most eight parent folders. Enter one XML element or tag value per line; matching ignores letter case." />
+            <Grid ColumnDefinitions="*,*,*" ColumnSpacing="14">
+              <StackPanel><TextBlock Text="Boolean XML elements" /><TextBox MinHeight="130" AcceptsReturn="True" AutomationProperties.Name="Favourite boolean XML elements" Text="{Binding BooleanElementsText, Mode=TwoWay}" /></StackPanel>
+              <StackPanel Grid.Column="1"><TextBlock Text="Tag XML elements" /><TextBox MinHeight="130" AcceptsReturn="True" AutomationProperties.Name="Favourite tag XML elements" Text="{Binding TagElementsText, Mode=TwoWay}" /></StackPanel>
+              <StackPanel Grid.Column="2"><TextBlock Text="Positive tag values" /><TextBox MinHeight="130" AcceptsReturn="True" AutomationProperties.Name="Favourite tag values" Text="{Binding TagValuesText, Mode=TwoWay}" /></StackPanel>
+            </Grid>
+            <TextBlock Classes="heading" Text="Test a media path" />
+            <TextBlock Classes="help" Text="This reads local NFO files using the draft marker settings. It does not change the media file or the results." />
+            <Grid ColumnDefinitions="*,Auto" ColumnSpacing="10">
+              <TextBox x:Name="NfoTestPathBox" AutomationProperties.Name="NFO test media path" Text="{Binding NfoTestPath, Mode=TwoWay}" PlaceholderText="Absolute path to a media file" />
+              <Button Grid.Column="1" Content="Test NFO" Command="{Binding TestNfoCommand}" />
+            </Grid>
+            <TextBlock x:Name="NfoTestOutput" Text="{Binding NfoTestResult}" TextWrapping="Wrap" />
+          </StackPanel>
+        </ScrollViewer>
+      </TabItem>
+      <TabItem Header="Quarantine history">
+        <Grid RowDefinitions="Auto,Auto,Auto,*" Margin="4,10,4,12">
+          <TextBlock Classes="help" Text="Quarantine moves files into a recoverable folder after a preview. It keeps NFO/artwork sidecars in place. Restore checks the quarantined file and refuses to overwrite an existing original path." />
+          <TextBox Grid.Row="1" AutomationProperties.Name="Quarantine folder" Text="{Binding QuarantineFolder, Mode=TwoWay}" PlaceholderText="Absolute quarantine folder (blank uses the database folder)" />
+          <Button Grid.Row="2" Content="Refresh history" Command="{Binding ReloadHistoryCommand}" HorizontalAlignment="Left" Margin="0,10" />
+          <ListBox Grid.Row="3" x:Name="QuarantineHistoryList" AutomationProperties.Name="Quarantine operations" ItemsSource="{Binding QuarantineHistory}">
+            <ListBox.Styles><Style Selector="ListBoxItem"><Setter Property="AutomationProperties.Name" Value="{Binding OriginalPath, x:DataType=cleanup:QuarantineRecord}" /></Style></ListBox.Styles>
+            <ListBox.ItemTemplate>
+              <DataTemplate x:DataType="cleanup:QuarantineRecord">
+                <Grid ColumnDefinitions="*,Auto" ColumnSpacing="12" Margin="4">
+                  <StackPanel Spacing="3">
+                    <TextBlock Text="{Binding OriginalPath}" TextWrapping="Wrap" />
+                    <TextBlock Text="{Binding State}" FontWeight="SemiBold" />
+                    <TextBlock Text="{Binding QuarantinePath}" TextWrapping="Wrap" />
+                    <TextBlock Text="{Binding Error}" TextWrapping="Wrap" />
+                  </StackPanel>
+                  <Button Grid.Column="1" Content="Restore" VerticalAlignment="Center" Command="{Binding $parent[Window].((vm:AutomationSettingsVM)DataContext).RestoreQuarantineCommand}" CommandParameter="{Binding}" />
+                </Grid>
+              </DataTemplate>
+            </ListBox.ItemTemplate>
+          </ListBox>
+        </Grid>
+      </TabItem>
+    </TabControl>
+    <Grid Grid.Row="1" ColumnDefinitions="*,Auto,Auto" ColumnSpacing="10" Margin="0,12,0,0">
+      <TextBlock x:Name="AutomationSettingsStatus" Text="{Binding Status}" TextWrapping="Wrap" VerticalAlignment="Center" />
+      <Button Grid.Column="1" Content="Cancel" Click="Cancel_Click" IsEnabled="{Binding !IsWorking}" />
+      <Button Grid.Column="2" x:Name="SaveAutomationSettingsButton" Content="Save settings" Click="Save_Click" IsEnabled="{Binding !IsWorking}" />
+    </Grid>
+  </Grid>
+</Window>

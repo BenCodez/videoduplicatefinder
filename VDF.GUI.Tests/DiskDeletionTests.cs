@@ -85,13 +85,11 @@ namespace VDF.GUI.Tests {
 		}
 
 		[Fact]
-		public void TrashUnavailable_FallsBackToPermanentDelete() {
-			bool exists = true;
-			var outcome = DiskDeletion.DeleteOne(P, permanently: false, batchedRecycle: false, batchRecycled: false,
-				fileExists: _ => exists, deleteFile: _ => exists = false, moveToTrash: _ => false);
-
-			Assert.Equal(DiskDeletion.Outcome.Deleted, outcome);
-			Assert.False(exists);
+		public void TrashUnavailable_RetainsFileAndReportsFailure() {
+			bool deleteCalled = false;
+			Assert.Throws<IOException>(() => DiskDeletion.DeleteOne(P, permanently: false, batchedRecycle: false, batchRecycled: false,
+				fileExists: _ => true, deleteFile: _ => deleteCalled = true, moveToTrash: _ => false));
+			Assert.False(deleteCalled);
 		}
 
 		[Fact]

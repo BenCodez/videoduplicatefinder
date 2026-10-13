@@ -31,13 +31,13 @@ namespace VDF.GUI.Mvvm {
 	}
 	static class ExtraShortDateTimeFormater {
 		static readonly string FormatString;
-		public static string DateToString(DateTime value) => String.Format(FormatString, value);
+		public static string DateToString(DateTime value) => String.Format(FormatString, ResultsDates.ForDisplay(value));
 		static ExtraShortDateTimeFormater() {
 			// "g" would be something like "4/10/2008 6:30 AM"
 			// If not using AM/PM notation the format would be: "d  hh:mm"
 			// And to keep it as short as possible, the year is shortened to two digits but the date keeps the culture specific order:
 			FormatString = CultureInfo.CurrentCulture.DateTimeFormat.ShortDatePattern;
-			FormatString = FormatString.Replace("yyyy", "yy") + " hh:mm";
+			FormatString = FormatString.Replace("yyyy", "yy") + " " + CultureInfo.CurrentCulture.DateTimeFormat.ShortTimePattern;
 			FormatString = $"{{0:{FormatString}}}";
 		}
 	}

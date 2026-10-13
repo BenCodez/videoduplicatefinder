@@ -79,9 +79,8 @@ namespace VDF.GUI.ViewModels {
 		});
 
 		[JsonIgnore]
-		public ReactiveCommand<Unit, Unit> SelectCommand => ReactiveCommand.Create(() => {
-			ApplicationHelpers.MainWindowDataContext.RunCustomSelection(Data);
-		});
+		public ReactiveCommand<Unit, Unit> SelectCommand => ReactiveCommand.CreateFromTask(() =>
+			ApplicationHelpers.MainWindowDataContext.ApplyLegacyCustomSelectionAsync(Data));
 		[JsonIgnore]
 		public ReactiveCommand<Unit, Unit> CancelCommand => ReactiveCommand.Create(() => {
 			host?.Close(MessageBoxButtons.Cancel);
