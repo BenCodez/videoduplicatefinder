@@ -22,7 +22,6 @@ public partial class MainWindowVM {
 	readonly Dictionary<string, (long Length, DateTime Modified, DateTime Created, DateTime? Embedded)> embeddedDateCache = new(AutomationPathComparer);
 	ReviewStore? automationReviewStore;
 	string? automationReviewStorePath;
-	Task automationReviewLoadTask = Task.CompletedTask;
 	CancellationTokenSource? reviewSaveDebounce;
 	Task reviewSaveTask = Task.CompletedTask;
 	int automaticReviewMutation;
@@ -62,15 +61,16 @@ public partial class MainWindowVM {
 	}
 
 	async Task<ReviewStore> GetAutomationReviewStoreAsync() {
+		await SettingsFile.ExportCleanupProtectionPolicyAsync();
 		string path = AutomationReviewFile;
 		if (automationReviewStore == null || !AutomationPathComparer.Equals(path, automationReviewStorePath)) {
 			automationReviewStorePath = path;
 			automationReviewStore = new ReviewStore(path);
-			automationReviewLoadTask = automationReviewStore.LoadAsync();
 		}
 		var store = automationReviewStore;
-		var loading = automationReviewLoadTask;
-		await loading;
+		// Never repair a missing or corrupt current ledger from cached decisions
+		// before a cleanup or automatic review save can use those decisions.
+		await store.LoadForCleanupAsync();
 		return store;
 	}
 

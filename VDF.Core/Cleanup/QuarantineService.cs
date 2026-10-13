@@ -13,6 +13,7 @@ namespace VDF.Core.Cleanup;
 public sealed class QuarantineService {
     private readonly string _historyPath;
     internal Func<QuarantineCheckpoint, CancellationToken, Task>? CheckpointAsync { get; set; }
+	internal Func<string?, CancellationToken, Task>? ValidateProtectionAsync { get; set; }
 
     public QuarantineService(string historyPath) => _historyPath = SafePaths.Normalize(historyPath);
 
@@ -49,6 +50,7 @@ public sealed class QuarantineService {
             // coincide with a media file supplied by the caller.
             var preview = await Task.Run(() => ValidateRequest(target, keeper, destination, protectedFile,
                 requireIdentical, true, ct), ct).ConfigureAwait(false);
+			if (ValidateProtectionAsync is not null) await ValidateProtectionAsync(null, ct).ConfigureAwait(false);
             using var lease = AcquireHistoryLease();
             var records = await LoadAsync().ConfigureAwait(false);
             if (await RecoverPendingAsync(records).ConfigureAwait(false))
@@ -95,6 +97,7 @@ public sealed class QuarantineService {
                 var verifiedClaim = await FreshAsync(record.SourceStagingPath, ct).ConfigureAwait(false);
                 if (!record.Target.MatchesRelocated(verifiedClaim))
                     throw new IOException("The source claim changed; deletion was cancelled.");
+				if (ValidateProtectionAsync is not null) await ValidateProtectionAsync(record.SourceStagingPath, ct).ConfigureAwait(false);
                 if (!IdentityReader.MatchesCurrentSnapshot(record.Keeper))
                     throw new IOException("The remaining keeper changed or lacks a reliable current filesystem snapshot.");
                 if (!IdentityReader.MatchesCurrentSnapshot(verifiedClaim!))

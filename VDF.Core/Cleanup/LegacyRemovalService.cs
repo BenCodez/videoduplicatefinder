@@ -22,6 +22,7 @@ public sealed class LegacyRemovalService {
 	static readonly ConcurrentDictionary<string, SemaphoreSlim> JournalGates = new(PathComparer.ForCurrentPlatform);
 	readonly string _journalPath;
 	readonly SemaphoreSlim _journalGate;
+	internal Func<string?, CancellationToken, Task>? ValidateProtectionAsync { get; set; }
 
 	public LegacyRemovalService(string journalPath) {
 		_journalPath = SafePaths.Normalize(journalPath, rejectTraversal: true);
@@ -74,6 +75,7 @@ public sealed class LegacyRemovalService {
 					SafePaths.Same(record.ClaimPath, target.Path) || SafePaths.Same(record.ClaimPath, keeper.Path))))
 					throw new IOException("An earlier removal of this media requires recovery first.");
 				await Task.Run(() => ValidateBeforeClaim(target, keeper, ct), ct).ConfigureAwait(false);
+				if (ValidateProtectionAsync is not null) await ValidateProtectionAsync(null, ct).ConfigureAwait(false);
 				MakeRoom(journal);
 				string id = Guid.NewGuid().ToString("N");
 				var record = new LegacyRemovalRecord {
@@ -102,6 +104,7 @@ public sealed class LegacyRemovalService {
 					await SaveAsync(journal, ct).ConfigureAwait(false);
 					// Hash after the rename and journal flush. A swap at the public source
 					// path cannot cause the callback to remove an unrelated replacement.
+					FileIdentity? verifiedClaim = null;
 					await Task.Run(() => {
 						// Verify the potentially large keeper first. A source writer must
 						// not get an entire keeper-hash interval after source validation.
@@ -109,7 +112,7 @@ public sealed class LegacyRemovalService {
 						if (!keeper.Matches(IdentityReader.Capture(keeper.Path, true, ct)))
 							throw new IOException("The remaining keeper is unavailable or has changed.");
 						SafePaths.RequireRegularFile(record.ClaimPath);
-						FileIdentity? verifiedClaim = IdentityReader.Capture(record.ClaimPath, true, ct);
+						verifiedClaim = IdentityReader.Capture(record.ClaimPath, true, ct);
 						if (!target.MatchesRelocated(verifiedClaim))
 							throw new IOException("The claimed media no longer matches the reviewed file.");
 						// Full hashing the claim can itself take time. Recheck both native
@@ -119,6 +122,9 @@ public sealed class LegacyRemovalService {
 						if (!IdentityReader.MatchesCurrentSnapshot(verifiedClaim!))
 							throw new IOException("The claimed media changed or lacks a reliable current filesystem snapshot.");
 					}, ct).ConfigureAwait(false);
+					if (ValidateProtectionAsync is not null) await ValidateProtectionAsync(record.ClaimPath, ct).ConfigureAwait(false);
+					if (!IdentityReader.MatchesCurrentSnapshot(keeper) || verifiedClaim is null || !IdentityReader.MatchesCurrentSnapshot(verifiedClaim))
+						throw new IOException("The source or remaining keeper changed during live protection checks.");
 					ct.ThrowIfCancellationRequested();
 					removeClaim(record.ClaimPath);
 					if (SafePaths.Exists(record.ClaimPath))

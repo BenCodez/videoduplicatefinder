@@ -6,6 +6,13 @@ namespace VDF.Core.Review;
 
 /// <summary>Versioned source-generated JSON with two flushed copies of the current generation.</summary>
 internal static class DurableJsonFile {
+	// Backups support explicit recovery, but stale fallback data must not authorize
+	// a destructive operation when its current protection journal is unreadable.
+	internal static async Task<T?> ReadPrimaryAsync<T>(string path, JsonTypeInfo<T> type,
+		Func<T, bool> validate, CancellationToken ct = default) where T : class {
+		SafePaths.RequireNoLinks(path, true);
+		return SafePaths.Exists(path) ? await ReadOneAsync(path, type, validate, ct).ConfigureAwait(false) : null;
+	}
     private const long MaximumJournalBytes = 32L * 1024 * 1024;
     private static readonly ConcurrentDictionary<string, SemaphoreSlim> Gates = new(PathComparer.ForCurrentPlatform);
 

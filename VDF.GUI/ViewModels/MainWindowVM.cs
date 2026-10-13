@@ -1993,7 +1993,7 @@ Non-Windows setup:
 				var deleted = new HashSet<DuplicateItemVM>(ReferenceEqualityComparer<DuplicateItemVM>.Instance);
 				long freed = 0;
 				int total = toDelete.Count;
-				var removal = new VDF.Core.Cleanup.LegacyRemovalService(LegacyCleanupJournal);
+				var removal = new VDF.Core.Cleanup.CleanupProtectionGuard(CoreUtils.ResolveDatabaseFolder(Data.SettingsFile.Instance.CustomDatabaseFolder));
 				await Task.Run(async () => {
 					if (fromDisk || createLinks) await removal.RecoverAsync();
 					int done = 0;
@@ -2002,11 +2002,14 @@ Non-Windows setup:
 							if (fromDisk || createLinks) {
 								var action = approved[item];
 								bool protectedNow = IsLiveCleanupProtected(item);
+								if (protectedNow) throw new IOException("The file is protected; cleanup was cancelled.");
+								var group = Duplicates.Where(row => row.ItemInfo.GroupId == item.ItemInfo.GroupId)
+									.Select(row => row.AutomationIdentity).Where(identity => identity is not null).Cast<VDF.Core.Review.FileIdentity>().ToArray();
 								await removal.RemoveAsync(action.Target, action.Keeper, claim => {
 									if (createLinks) CreateVerifiedReplacementLink(claim, action.Target.Path, action.Keeper.Path, createHardLinksInstead);
 									else if (permanently) File.Delete(claim);
 									else if (!MoveCleanupClaimToTrash(claim, action.Target.Path)) throw new IOException("Moving to trash failed; the original file was retained.");
-								}, protectedFile: protectedNow);
+								}, groupMembers: group);
 								freed += CheckedSizeOf(item);
 							}
 							if (blackList) ScanEngine.BlackListFileEntry(item.ItemInfo.Path);

@@ -8,6 +8,7 @@ using System.Security.Cryptography;
 using System.Text;
 using System.Threading;
 using System.Xml;
+using VDF.Core.Review;
 using VDF.Core.Utils;
 
 namespace VDF.Core.Nfo;
@@ -43,8 +44,16 @@ public sealed class NfoFavouriteService {
 			_parsed.Clear();
 		}
 	}
+	internal void RefreshDirectoryCache() {
+		lock (_cacheGate) _directories.Clear();
+	}
 
-	public NfoResult Inspect(string videoPath, NfoOptions options) {
+	public NfoResult Inspect(string videoPath, NfoOptions options) => InspectCore(videoPath, options, null);
+
+	internal NfoResult InspectClaimedVideo(string videoPath, string claimPath, NfoOptions options) =>
+		InspectCore(videoPath, options, claimPath);
+
+	NfoResult InspectCore(string videoPath, NfoOptions options, string? claimPath) {
 		ArgumentNullException.ThrowIfNull(options);
 		if (!options.Enabled)
 			return new(false, false, "NFO favourite protection is disabled.", Array.Empty<string>());
@@ -90,13 +99,30 @@ public sealed class NfoFavouriteService {
 			diagnostics.Add(local.Reason);
 		}
 		else {
+			int videoCount = local.VideoCount;
+			string? soleVideo = local.SoleVideo;
+			if (claimPath is not null) {
+				try {
+					SafePaths.RequireRegularFile(claimPath);
+					if (!PathComparer.ForCurrentPlatform.Equals(Path.GetDirectoryName(claimPath), directory) || SafePaths.Exists(fullVideoPath))
+						throw new IOException("The claimed video association is unavailable.");
+					if (FileUtils.IsVideoExtension(Path.GetExtension(fullVideoPath))) {
+						videoCount = Math.Min(2, videoCount + 1);
+						soleVideo = videoCount == 1 ? fullVideoPath : null;
+					}
+				}
+				catch (Exception ex) when (IsFileError(ex)) {
+					uncertain = true;
+					diagnostics.Add("The original video path changed during its private claim; favourite status is uncertain.");
+				}
+			}
 			string baseName = Path.GetFileNameWithoutExtension(fullVideoPath);
 			if (local.ByBaseName.TryGetValue(baseName, out string[]? sidecars))
 				foreach (string path in sidecars) InspectSource(path);
 
 			foreach (string path in NamedNfos(local, "movie")) {
 				if (inspected.Contains(path)) continue;
-				if (local.VideoCount == 1 && PathComparer.ForCurrentPlatform.Equals(local.SoleVideo, fullVideoPath))
+				if (videoCount == 1 && PathComparer.ForCurrentPlatform.Equals(soleVideo, fullVideoPath))
 					InspectSource(path);
 				else
 					diagnostics.Add("movie.nfo: ignored because it is not associated with one unambiguous video.");

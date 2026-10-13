@@ -6,8 +6,11 @@ using VDF.Core.Utils;
 namespace VDF.Core.Review;
 
 public sealed class ReviewRecord {
+	[JsonRequired]
     public FileIdentity Identity { get; set; } = new();
+	[JsonRequired]
     public ReviewChoice Choice { get; set; }
+	[JsonRequired]
     public bool ManuallyProtected { get; set; }
     public bool AutomaticallySelected { get; set; }
     public bool IsKeeper { get; set; }
@@ -47,6 +50,16 @@ public sealed class ReviewStore {
         return Volatile.Read(ref _byPath).TryGetValue(full, out var record) && record.Identity.MatchesCurrent()
             ? record : null;
     }
+
+	internal async Task LoadForCleanupAsync() {
+		await _gate.WaitAsync().ConfigureAwait(false);
+		try {
+			var envelope = await DurableJsonFile.ReadPrimaryAsync(_path, ReviewJsonContext.Default.ReviewEnvelope,
+				ValidateEnvelope).ConfigureAwait(false) ?? throw new InvalidDataException("The current review journal is missing; restore it before cleanup.");
+			ReplaceRecords(envelope.Records);
+		}
+		finally { _gate.Release(); }
+	}
 
     public async Task SaveAsync(IEnumerable<ReviewRecord> records, CancellationToken cancellationToken = default) {
         ArgumentNullException.ThrowIfNull(records);

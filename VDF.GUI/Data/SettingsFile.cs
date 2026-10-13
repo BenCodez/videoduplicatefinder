@@ -18,6 +18,7 @@ using System.Collections.ObjectModel;
 using System.Globalization;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using System.Threading.Tasks;
 using System.Xml;
 using System.Xml.Linq;
 using ReactiveUI;
@@ -414,7 +415,10 @@ namespace VDF.GUI.Data {
 
 		static readonly object settingsWriteGate = new();
 		public static void SaveSettings(string? path = null) {
+			if (StartupLoadError is not null) throw new InvalidDataException("Settings are unreadable. Restore a valid settings file and reload or restart before saving cleanup protection settings.");
 			lock (settingsWriteGate) {
+				VDF.Core.Cleanup.CleanupProtectionPolicyStore.ValidateSettingsWriteAsync(
+					CoreUtils.ResolveDatabaseFolder(Instance.CustomDatabaseFolder)).GetAwaiter().GetResult();
 				path = Path.GetFullPath(ResolveSettingsPath(path));
 				Directory.CreateDirectory(Path.GetDirectoryName(path)!);
 				string temp = path + "." + Guid.NewGuid().ToString("N") + ".tmp";
@@ -424,9 +428,22 @@ namespace VDF.GUI.Data {
 						stream.Flush(flushToDisk: true);
 					}
 					VDF.Core.Review.DurableFileOperations.Move(temp, path, overwrite: true);
+					ExportCleanupProtectionPolicyAsync(path).GetAwaiter().GetResult();
 				}
 				finally { if (File.Exists(temp)) File.Delete(temp); }
 			}
+		}
+
+		public static Task ExportCleanupProtectionPolicyAsync(string? sourceSettingsPath = null) {
+			if (StartupLoadError is not null) throw new InvalidDataException("Settings are unreadable; existing cleanup protections were preserved. Restore valid settings and reload or restart before cleanup.");
+			var settings = Instance;
+			string path = Path.GetFullPath(sourceSettingsPath ?? ResolveSettingsPath(null));
+			return VDF.Core.Cleanup.CleanupProtectionPolicyStore.SaveAsync(
+				CoreUtils.ResolveDatabaseFolder(settings.CustomDatabaseFolder), new VDF.Core.Cleanup.CleanupProtectionPolicy {
+					NfoOptions = settings.NfoFavourites,
+					FolderRules = settings.AutomationSelection.FolderRules,
+					OverlapPolicy = settings.AutomationSelection.OverlapPolicy
+				}, File.Exists(path) ? path : null);
 		}
 
 		[JsonPropertyName("UseMica")]
@@ -777,6 +794,7 @@ namespace VDF.GUI.Data {
 			instance = JsonSerializer.Deserialize(File.ReadAllBytes(path), GuiJsonContext.Default.SettingsFile)
 				?? throw new JsonException($"'{path}' does not contain a settings object.");
 			instance.MigrateLegacyValues();
+			StartupLoadError = null;
 		}
 
 		/// <summary>

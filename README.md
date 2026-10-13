@@ -187,18 +187,26 @@ vdf-cli scan-and-compare \
 | `--format json\|text\|csv` | Output format | text |
 | `--output <file>` | Write results to file instead of stdout | stdout |
 | `--settings <file>` | Load full settings from a JSON file | — |
+| `--state <path>` / `--db <path>` | Shared database and protection state folder; explicit context required for cleanup | — |
 
 #### Auto-mark and delete duplicates
 ```bash
 # Dry run — shows what would be deleted, no changes made (default)
-vdf-cli scan-and-compare --include /mnt/media --action lowest-quality --dry-run
+vdf-cli scan-and-compare --include /mnt/media --action lowest-quality --state /config/vdf --dry-run
 
 # Move duplicates to trash (safer)
-vdf-cli scan-and-compare --include /mnt/media --action lowest-quality --delete
+vdf-cli scan-and-compare --include /mnt/media --action lowest-quality --state /config/vdf --delete
 
 # Permanently delete (use with care)
-vdf-cli scan-and-compare --include /mnt/media --action lowest-quality --delete-permanent
+vdf-cli scan-and-compare --include /mnt/media --action lowest-quality --state /config/vdf --delete-permanent
 ```
+
+Initialize this shared state folder in the GUI first. Cleanup requires its current
+protection settings and review ledger, and retains favourites, protected folders,
+and files with validated manual protection. Automatic CLI removal also requires a
+byte-identical, independent keeper outside the selected batch. Trash failure
+retains the original file. See [shared cleanup protection](docs/shared-cleanup-protection.md)
+for state recovery and `mark` examples.
 
 Available `--action` strategies:
 

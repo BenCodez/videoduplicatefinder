@@ -85,7 +85,7 @@ public partial class MainWindowVM {
 			var candidates = await BuildAutomationCandidatesAsync();
 			var rows = Duplicates.ToDictionary(d => d.ItemInfo.Path, AutomationPathComparer);
 			var rejectedGroups = Duplicates.Where(d => d.ManualReviewChoice is ReviewChoice.Ignore or ReviewChoice.RejectGroup).Select(d => d.ItemInfo.GroupId).ToHashSet();
-			var service = new QuarantineService(QuarantineHistoryFile);
+			var service = new CleanupProtectionGuard(CoreUtils.ResolveDatabaseFolder(SettingsFile.Instance.CustomDatabaseFolder));
 			foreach (var item in preview.Where(i => i.CanQuarantine)) {
 				if (cancellationToken.IsCancellationRequested) { warning = "Cancelled; completed moves are retained."; break; }
 				if (item.TargetIdentity == null || item.KeeperIdentity == null || !rows.TryGetValue(item.Path, out var row) || !row.Checked ||
@@ -96,8 +96,11 @@ public partial class MainWindowVM {
 					IsBusyOverlayText = $"Quarantining {Path.GetFileName(item.Path)}…";
 					bool liveProtected = await Task.Run(() => { automationNfo.ClearCache(); return IsLiveCleanupProtected(row); }, cancellationToken);
 					if (liveProtected || !row.Checked || keeper.Checked) { skipped++; continue; }
+					if (row.IsProtected || candidate.ManuallyProtected || candidate.NfoProtected || candidate.ProtectionUncertain) { skipped++; continue; }
+					var group = Duplicates.Where(member => member.ItemInfo.GroupId == row.ItemInfo.GroupId)
+						.Select(member => member.AutomationIdentity).Where(identity => identity is not null).Cast<FileIdentity>().ToArray();
 					var result = await service.QuarantineAsync(item.TargetIdentity, item.KeeperIdentity, destination,
-						protectedFile: liveProtected || row.IsProtected || candidate.ManuallyProtected || candidate.NfoProtected || candidate.ProtectionUncertain, ct: cancellationToken);
+						groupMembers: group, ct: cancellationToken);
 					if (result.State == QuarantineState.Quarantined) { Duplicates.Remove(row); moved++; }
 					else { skipped++; Logger.Instance.Warn($"Quarantine {item.Path}: {result.State} {result.Error}"); }
 				}

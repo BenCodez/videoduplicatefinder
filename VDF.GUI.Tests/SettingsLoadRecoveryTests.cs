@@ -25,10 +25,17 @@ namespace VDF.GUI.Tests;
 // the user found and deleted Settings.json by hand (issue #830, reported as "cannot
 // launch after switching language": the language switch is simply what rewrote the file).
 // Startup must survive any settings-file content.
+[Collection("Automation settings singleton")]
 public class SettingsLoadRecoveryTests : IDisposable {
 	readonly string dir = Directory.CreateTempSubdirectory("vdf-settings-tests-").FullName;
+	readonly string originalSettings = JsonSerializer.Serialize(SettingsFile.Instance, GuiJsonContext.Default.SettingsFile);
+	public SettingsLoadRecoveryTests() {
+		string baseline = WriteSettingsFile("baseline.json", JsonSerializer.Serialize(new SettingsFile { CustomDatabaseFolder = dir }, GuiJsonContext.Default.SettingsFile));
+		SettingsFile.LoadSettings(baseline);
+	}
 
 	public void Dispose() {
+		SettingsFile.LoadSettings(WriteSettingsFile("original.json", originalSettings));
 		SettingsFile.SetSettingsPath(null);
 		try { Directory.Delete(dir, recursive: true); }
 		catch { }
@@ -129,7 +136,9 @@ public class SettingsLoadRecoveryTests : IDisposable {
 
 	[Fact]
 	public void OlderSettings_DarkModeSwitch_IsNotWrittenBack() {
-		string path = WriteSettingsFile("Settings.json", "{ \"DarkMode\": false }");
+		string path = WriteSettingsFile("Settings.json", JsonSerializer.Serialize(new Dictionary<string, object> {
+			["DarkMode"] = false, ["CustomDatabaseFolder"] = dir
+		}));
 		SettingsFile.LoadSettings(path);
 
 		SettingsFile.SaveSettings(path);
