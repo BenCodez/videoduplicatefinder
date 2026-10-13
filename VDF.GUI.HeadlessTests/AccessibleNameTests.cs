@@ -71,8 +71,8 @@ public class AccessibleNameTests {
 	[Fact]
 	public Task SetupView_ControlsAnnounceProperly() => HeadlessUi.Run(() => {
 		var vm = new MainWindowVM();
-		vm.SetupFolders.Add(new SetupFolderVM(@"D:\Videos\Holiday", isExcluded: false) { MetaText = "1,204 files" });
-		vm.SetupFolders.Add(new SetupFolderVM(@"E:\Archive\Old", isExcluded: true) { MetaText = "Excluded" });
+		vm.SetupFolders.Add(new SetupFolderVM(ResultsFixture.HolidayFolder, isExcluded: false) { MetaText = "1,204 files" });
+		vm.SetupFolders.Add(new SetupFolderVM(ResultsFixture.ArchiveFolder, isExcluded: true) { MetaText = "Excluded" });
 		vm.ShowNoDuplicatesNotice = true;
 		var window = HeadlessUi.Show(new SetupView { DataContext = vm });
 
@@ -150,7 +150,7 @@ public class AccessibleNameTests {
 		Assert.StartsWith("Group 1, 2 files", rows[0].Name);
 		Assert.StartsWith("beach_2019_final.mp4, ", rows[1].Name);
 		Assert.Contains("1920x1080", rows[1].Name);
-		Assert.Contains(@"D:\Videos\Holiday", rows[1].Name);
+		Assert.Contains(ResultsFixture.HolidayFolder, rows[1].Name);
 		window.Close();
 	});
 
@@ -179,7 +179,7 @@ public class AccessibleNameTests {
 		// whole path, and used to get none of it.
 		var folders = PeerTree.Walk(window).Where(n => n.Owner is Controls.MiddleEllipsisTextBlock).Select(n => n.Name).ToList();
 
-		Assert.Contains(@"D:\Videos\Holiday\copy", folders);
+		Assert.Contains(ResultsFixture.CopyFolder, folders);
 		window.Close();
 	});
 
