@@ -57,7 +57,7 @@ public class ComparerKeyboardTests {
 		// No thumbnail timestamps: loading yields nothing without ever starting FFmpeg.
 		var items = new[] { "left.mp4", "right.mp4" }
 			.Select(name => new LargeThumbnailDuplicateItem(new DuplicateItemVM(new DuplicateItem {
-				Path = $@"Z:\does\not\exist\{name}", GroupId = group, Similarity = 98.4f,
+				Path = Path.Combine(ResultsFixture.RootFolder, "comparer", name), GroupId = group, Similarity = 98.4f,
 			})))
 			.ToList();
 		var comparer = new ThumbnailComparer(items);

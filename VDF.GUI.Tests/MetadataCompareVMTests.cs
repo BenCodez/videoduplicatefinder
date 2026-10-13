@@ -21,7 +21,8 @@ using VDF.GUI.ViewModels;
 
 namespace VDF.GUI.Tests {
 	public class MetadataCompareVMTests {
-		static DuplicateItemVM Item(string name) => new() { ItemInfo = new DuplicateItem { Path = @"D:\clips\" + name } };
+		static readonly string ClipFolder = Path.GetFullPath(Path.Combine(Path.GetTempPath(), "vdf-metadata-clips"));
+		static DuplicateItemVM Item(string name) => new() { ItemInfo = new DuplicateItem { Path = Path.Combine(ClipFolder, name) } };
 
 		static MetadataField C(string name, string value) => new(new(MetadataSectionKind.Container), name, value);
 		static MetadataField A(string name, string value) => new(new(MetadataSectionKind.Stream, 1, "audio"), name, value);
