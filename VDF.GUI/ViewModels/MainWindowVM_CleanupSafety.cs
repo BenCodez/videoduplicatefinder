@@ -74,6 +74,7 @@ public partial class MainWindowVM {
                     throw new IOException("Hardlink replacement would change a deliberately protected keeper's identity. Use quarantine or choose a keeper without a deliberate protection decision.");
             });
             await removal.RemoveAsync(action.Target, action.Keeper, claim => {
+                if (hardLink) removal.ValidateHardLinkKeeperAsync(action.Keeper).GetAwaiter().GetResult();
                 hardLinkAttempted = hardLink;
                 CreateVerifiedReplacementLink(claim, action.Target.Path, action.Keeper.Path, hardLink);
             }, groupMembers: group);

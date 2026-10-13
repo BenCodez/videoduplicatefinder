@@ -78,6 +78,43 @@ public sealed class CleanupSafetyTests : IAsyncLifetime {
 	}
 
 	[Fact]
+	public async Task HardlinkReplacementRejectsAProtectedKeeperWithoutChangingEitherIdentity() {
+		var (target, keeper) = SeedPair();
+		var targetIdentity = FileIdentity.Capture(target.Path)!;
+		var keeperIdentity = FileIdentity.Capture(keeper.Path)!;
+		var store = new ReviewStore(Path.Combine(folder, "ReviewedFiles.json"));
+		await store.SaveAsync([new() { Identity = keeperIdentity, ManuallyProtected = true }]);
+
+		AssertRetained(await Remove(target, links: true), target, keeper);
+
+		Assert.True(targetIdentity.MatchesCurrent(forceHash: true));
+		Assert.True(keeperIdentity.MatchesCurrent(forceHash: true));
+		await store.LoadAsync();
+		Assert.True(store.Find(keeper.Path)!.ManuallyProtected);
+		Assert.False(File.Exists(Path.Combine(folder, "LegacyCleanupHistory.json")));
+	}
+
+	[Fact]
+	public async Task HardlinkReplacementRechecksAKeeperProtectedDuringClaimValidation() {
+		var (target, keeper) = SeedPair();
+		var keeperIdentity = FileIdentity.Capture(keeper.Path)!;
+		bool added = false;
+		IdentityReader.HashStartedObserver.Value = path => {
+			if (added || !path.EndsWith(".holding", StringComparison.Ordinal)) return;
+			added = true;
+			new ReviewStore(Path.Combine(folder, "ReviewedFiles.json")).SaveAsync([
+				new() { Identity = keeperIdentity, Choice = ReviewChoice.Keep }
+			]).GetAwaiter().GetResult();
+		};
+		try {
+			AssertRetained(await Remove(target, links: true), target, keeper);
+			Assert.True(added);
+			Assert.True(keeperIdentity.MatchesCurrent(forceHash: true));
+		}
+		finally { IdentityReader.HashStartedObserver.Value = null; }
+	}
+
+	[Fact]
 	public async Task PermanentRemovalUsesAClaimAndLeavesAnIndependentKeeper() {
 		var (target, keeper) = SeedPair();
 

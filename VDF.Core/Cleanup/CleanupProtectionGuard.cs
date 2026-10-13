@@ -32,6 +32,16 @@ public sealed class CleanupProtectionGuard {
 	public Task<CleanupProtectionCheck> InspectAsync(FileIdentity target, CancellationToken ct = default) =>
 		InspectCoreAsync(target, null, ct);
 
+	/// <summary>A hardlink changes keeper metadata; deliberate retention cannot cross that unjournaled change.</summary>
+	public async Task ValidateHardLinkKeeperAsync(FileIdentity keeper, CancellationToken ct = default) {
+		ArgumentNullException.ThrowIfNull(keeper);
+		if (!keeper.IsWellFormed()) throw new IOException("A valid keeper identity is required.");
+		var reviews = await GetReviewsAsync(ct).ConfigureAwait(false);
+		if (reviews.TryGetValue(keeper.Path, out var review) && review.Identity.Matches(keeper) &&
+			(review.ManuallyProtected || review.Choice is ReviewChoice.Keep or ReviewChoice.Ignore or ReviewChoice.RejectGroup))
+			throw new IOException("Hardlink replacement would change a deliberately protected keeper's identity. Use quarantine or choose a keeper without a deliberate protection decision.");
+	}
+
 	async Task<CleanupProtectionCheck> InspectCoreAsync(FileIdentity target, string? claimPath, CancellationToken ct) {
 		ArgumentNullException.ThrowIfNull(target);
 		if (!target.IsWellFormed()) throw new IOException("A valid reviewed media identity is required.");

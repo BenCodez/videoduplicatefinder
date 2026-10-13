@@ -96,8 +96,12 @@ public sealed partial class ScanService {
 						}
 						if (keeper is null)
 							throw new IOException("This group has no unselected, independent remaining file with a current scan identity.");
+						if (createLinks && hardLinks) await guard.ValidateHardLinkKeeperAsync(keeper);
 						var groupMembers = group.Select(CaptureReviewedIdentity).OfType<FileIdentity>().ToList();
 						await guard.RemoveAsync(target, keeper, claim => {
+							// Recheck at the mutation boundary in case another frontend
+							// protected the keeper while its identities were validated.
+							if (createLinks && hardLinks) guard.ValidateHardLinkKeeperAsync(keeper).GetAwaiter().GetResult();
 							if (createLinks) CreateVerifiedReplacementLink(claim, target.Path, keeper.Path, hardLinks);
 							else if (permanent) File.Delete(claim);
 							else if (!TrashMover(claim, target.Path))
