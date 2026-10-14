@@ -23,6 +23,7 @@ namespace VDF.Core.Tests.AI;
 /// FileEntry — these tests pin the database-schema consequences of that decision.
 /// </summary>
 public partial class FileEntryEmbeddingsTests {
+	static readonly string MediaFolder = Path.GetFullPath(Path.Combine(Path.GetTempPath(), "vdf-embeddings-test-media"));
 
 	/// <summary>
 	/// Wire-compatible mirror of the interim FileEntry schema that carried embeddings as
@@ -50,8 +51,8 @@ public partial class FileEntryEmbeddingsTests {
 		// keep loading after the member's removal: version-tolerant deserialization skips
 		// the extra trailing member and every remaining field survives.
 		var legacy = new FileEntryWithEmbeddingsMember {
-			_Path = @"D:\media\clip.mp4",
-			Folder = @"D:\media",
+			_Path = Path.Combine(MediaFolder, "clip.mp4"),
+			Folder = MediaFolder,
 			FileSize = 1234,
 			OsHash = "abc123",
 			AudioFingerprint = new uint[] { 1, 2, 3 },
@@ -65,7 +66,8 @@ public partial class FileEntryEmbeddingsTests {
 		FileEntry? restored = MemoryPackSerializer.Deserialize<FileEntry>(payload);
 
 		Assert.NotNull(restored);
-		Assert.Equal(@"D:\media\clip.mp4", restored!.Path);
+		Assert.Equal(legacy._Path, restored!.Path);
+		Assert.Equal(MediaFolder, restored.Folder);
 		Assert.Equal(new byte[] { 1, 2, 3 }, restored.grayBytes[12.5]);
 		Assert.Equal(42UL, restored.PHashes[12.5]);
 		Assert.Equal(1234, restored.FileSize);
@@ -78,19 +80,22 @@ public partial class FileEntryEmbeddingsTests {
 		// The reverse direction: a database written by the current schema is a valid
 		// prefix of the interim embeddings schema (its Embeddings member is simply
 		// missing), and of course round-trips through itself.
-		var entry = new FileEntry { Folder = @"D:\media" };
-		entry.Path = @"D:\media\old.mp4";
+		var entry = new FileEntry { Folder = MediaFolder };
+		entry.Path = Path.Combine(MediaFolder, "old.mp4");
 		entry.grayBytes[12.5] = new byte[] { 1, 2, 3 };
 
 		byte[] payload = MemoryPackSerializer.Serialize(entry);
 
 		FileEntry? roundTripped = MemoryPackSerializer.Deserialize<FileEntry>(payload);
 		Assert.NotNull(roundTripped);
+		Assert.Equal(entry.Path, roundTripped!.Path);
+		Assert.Equal(MediaFolder, roundTripped.Folder);
 		Assert.Equal(new byte[] { 1, 2, 3 }, roundTripped!.grayBytes[12.5]);
 
 		FileEntryWithEmbeddingsMember? asEmbeddingsBuild =
 			MemoryPackSerializer.Deserialize<FileEntryWithEmbeddingsMember>(payload);
 		Assert.NotNull(asEmbeddingsBuild);
-		Assert.Equal(@"D:\media\old.mp4", asEmbeddingsBuild!._Path);
+		Assert.Equal(entry.Path, asEmbeddingsBuild!._Path);
+		Assert.Equal(MediaFolder, asEmbeddingsBuild.Folder);
 	}
 }

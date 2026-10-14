@@ -37,7 +37,7 @@ namespace VDF.GUI.Mvvm {
 			// If not using AM/PM notation the format would be: "d  hh:mm"
 			// And to keep it as short as possible, the year is shortened to two digits but the date keeps the culture specific order:
 			FormatString = CultureInfo.CurrentCulture.DateTimeFormat.ShortDatePattern;
-			FormatString = FormatString.Replace("yyyy", "yy") + " hh:mm";
+			FormatString = FormatString.Replace("yyyy", "yy") + " " + CultureInfo.CurrentCulture.DateTimeFormat.ShortTimePattern;
 			FormatString = $"{{0:{FormatString}}}";
 		}
 	}

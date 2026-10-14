@@ -105,15 +105,24 @@ namespace VDF.GUI.ViewModels {
 		/// is left untouched.
 		/// </summary>
 		public ReactiveCommand<Unit, Unit> NewScanCommand => ReactiveCommand.CreateFromTask(async () => {
-			if (Duplicates.Count > 0 &&
-				await MessageBoxService.Show(App.Lang["Message.NewScanDiscardPrompt"],
-					MessageBoxButtons.Yes | MessageBoxButtons.No) != MessageBoxButtons.Yes)
-				return;
-			DiscardResultsToSetup();
-		});
+			if (ScanOrDataWorkActive) return;
+			IsBusy = true;
+			IsBusyOverlayText = "Preparing a new scan…";
+			try {
+				if (Duplicates.Count > 0 &&
+					await MessageBoxService.Show(App.Lang["Message.NewScanDiscardPrompt"],
+						MessageBoxButtons.Yes | MessageBoxButtons.No) != MessageBoxButtons.Yes)
+					return;
+				await PrepareAutomationRescanAsync();
+				DiscardResultsToSetup();
+			}
+			catch (Exception ex) { await MessageBoxService.Show($"Review decisions could not be saved; the current results were retained: {ex.Message}"); }
+			finally { IsBusy = false; }
+		}, CanStartScan);
 
 		internal void DiscardResultsToSetup() {
 			Duplicates.Clear(); // Reset event → checked counters/undo stack clear + state raise
+			ResetResultsState();
 			ShowNoDuplicatesNotice = false;
 			BuildActiveResultsView();
 			RefreshGroupStats();

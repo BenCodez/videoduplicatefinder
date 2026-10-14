@@ -1,0 +1,33 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:vm="clr-namespace:VDF.GUI.ViewModels"
+        x:Class="VDF.GUI.Views.QuarantinePreviewView"
+        x:DataType="vm:QuarantinePreviewVM"
+        Width="960" Height="650" MinWidth="720" MinHeight="450"
+        WindowStartupLocation="CenterOwner" Title="Review quarantine">
+  <Grid RowDefinitions="Auto,Auto,Auto,*,Auto" RowSpacing="12" Margin="20">
+    <TextBlock Text="{Binding Summary}" FontSize="18" FontWeight="SemiBold" />
+    <TextBlock Grid.Row="1" Text="Different bytes require your manual review. Each listed file keeps an available survivor. Protected files and groups you ignored or rejected are blocked. NFO and artwork sidecars remain in place." TextWrapping="Wrap" />
+    <StackPanel Grid.Row="2"><TextBlock Text="Destination" FontWeight="SemiBold" /><TextBlock Text="{Binding Destination}" TextWrapping="Wrap" /></StackPanel>
+    <ListBox Grid.Row="3" x:Name="QuarantinePreviewList" AutomationProperties.Name="Files in quarantine preview" ItemsSource="{Binding Items}">
+      <ListBox.Styles><Style Selector="ListBoxItem"><Setter Property="AutomationProperties.Name" Value="{Binding Path, x:DataType=vm:QuarantinePreviewItem}" /></Style></ListBox.Styles>
+      <ListBox.ItemTemplate>
+        <DataTemplate x:DataType="vm:QuarantinePreviewItem">
+          <Border Padding="8" Margin="0,0,0,5">
+            <StackPanel Spacing="4">
+              <DockPanel><TextBlock DockPanel.Dock="Right" Text="{Binding Size}" Margin="12,0,0,0" /><TextBlock Text="{Binding Status}" FontWeight="SemiBold" /></DockPanel>
+              <TextBlock Text="{Binding Path}" TextWrapping="Wrap" />
+              <TextBlock Text="{Binding KeeperPath, StringFormat='Keeper: {0}'}" TextWrapping="Wrap" />
+              <TextBlock Text="{Binding Reason}" TextWrapping="Wrap" />
+            </StackPanel>
+          </Border>
+        </DataTemplate>
+      </ListBox.ItemTemplate>
+    </ListBox>
+    <Grid Grid.Row="4" ColumnDefinitions="*,Auto,Auto" ColumnSpacing="10">
+      <TextBlock Text="{Binding Status}" TextWrapping="Wrap" VerticalAlignment="Center" />
+      <Button Grid.Column="1" Content="Close" Click="Close_Click" IsEnabled="{Binding !IsWorking}" />
+      <Button Grid.Column="2" x:Name="ConfirmQuarantineButton" Content="Quarantine listed files" Command="{Binding ExecuteCommand}" IsEnabled="{Binding CanExecute}" />
+    </Grid>
+  </Grid>
+</Window>

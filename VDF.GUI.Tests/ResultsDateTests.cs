@@ -17,11 +17,14 @@
 // results can show and use the modified date instead.
 
 using System.Globalization;
+using System.Text.Json;
+using VDF.Core;
 using VDF.Core.ViewModels;
 using VDF.GUI.Data;
 using VDF.GUI.ViewModels;
 
 namespace VDF.GUI.Tests {
+	[Collection("Automation settings singleton")]
 	public class ResultsDateTests {
 		static readonly DateTime Copied = new(2026, 9, 1, 12, 0, 0);
 		static readonly DateTime Recorded = new(2014, 6, 15, 18, 30, 0);
@@ -72,8 +75,82 @@ namespace VDF.GUI.Tests {
 		[Fact]
 		public void DetailsLine_ShowsTheChosenDate() {
 			var item = Item(Guid.Empty, "a", Copied, Recorded).ItemInfo;
-			WithSetting(true, () => Assert.Contains(Recorded.ToString("g", CultureInfo.InvariantCulture),
+			WithSetting(true, () => Assert.Contains(ResultsDates.ForDisplay(Recorded).ToString("g", CultureInfo.InvariantCulture),
 				ResultsBadgeRules.BuildFileLine(item, CultureInfo.InvariantCulture)));
+		}
+
+		[Fact]
+		public void DisplayConvertsUtcAndLegacyUnspecifiedWithoutChangingStoredDate() {
+			var zone = TimeZoneInfo.CreateCustomTimeZone("TestMinusSix", TimeSpan.FromHours(-6), "TestMinusSix", "TestMinusSix");
+			var utc = new DateTime(2026, 10, 13, 16, 30, 0, DateTimeKind.Utc);
+			Assert.Equal(new DateTime(2026, 10, 13, 10, 30, 0), ResultsDates.ForDisplay(utc, zone));
+			Assert.Equal(ResultsDates.ForDisplay(utc, zone), ResultsDates.ForDisplay(DateTime.SpecifyKind(utc, DateTimeKind.Unspecified), zone));
+			Assert.Equal(16, utc.Hour);
+		}
+
+		[Theory]
+		[InlineData(-6)]
+		[InlineData(9)]
+		public void ExifCaptureTimeKeepsItsWallClockWhileModifiedDatesUseLocalTime(int offset) {
+			var zone = TimeZoneInfo.CreateCustomTimeZone("TestOffset", TimeSpan.FromHours(offset), "TestOffset", "TestOffset");
+			var capture = new DateTime(2014, 6, 15, 18, 30, 45, DateTimeKind.Utc);
+			var modified = new DateTime(2026, 10, 13, 16, 30, 0, DateTimeKind.Utc).AddTicks(1234);
+			var item = Item(Guid.Empty, "capture.jpg", capture, modified).ItemInfo;
+			item.Flags = DuplicateFlags.ExifCreationDate;
+			Assert.Equal(DateTime.SpecifyKind(capture, DateTimeKind.Unspecified), ResultsDates.ForDisplay(item, false, zone));
+			Assert.Equal(ResultsDates.ForDisplay(modified, zone), ResultsDates.ForDisplay(item, true, zone));
+			item.DateModified = default;
+			Assert.Equal(capture.Ticks, ResultsDates.ForDisplay(item, true, zone).Ticks);
+			Assert.Equal(capture, item.DateCreated);
+			Assert.Equal(DateTimeKind.Utc, item.DateCreated.Kind);
+		}
+
+		[Fact]
+		public void CaptureProvenanceSurvivesResultBackupAndFeedsBothDisplayPaths() {
+			var capture = new DateTime(2014, 6, 15, 18, 30, 45, DateTimeKind.Utc);
+			var row = Item(Guid.NewGuid(), "capture.jpg", capture, default);
+			row.ItemInfo.Flags = DuplicateFlags.ExifCreationDate;
+			var envelope = new ScanResultsEnvelope { Items = [row] };
+			string json = JsonSerializer.Serialize(envelope, GuiJsonFieldsContext.Default.ScanResultsEnvelope);
+			var restored = Assert.Single(JsonSerializer.Deserialize(json, GuiJsonFieldsContext.Default.ScanResultsEnvelope)!.Items);
+			WithSetting(true, () => {
+				Assert.Equal(capture, restored.ShownDate);
+				Assert.Equal(capture.Ticks, restored.ShownDisplayDate.Ticks);
+				Assert.Equal(DateTimeKind.Unspecified, restored.ShownDisplayDate.Kind);
+				Assert.Contains(capture.ToString("g", CultureInfo.InvariantCulture), ResultsBadgeRules.BuildFileLine(restored.ItemInfo, CultureInfo.InvariantCulture));
+			});
+		}
+
+		[Fact]
+		public void CopiedSettingsDoNotReinterpretLegacyResultsWithoutProvenance() {
+			var copiedSettings = JsonSerializer.Deserialize("{\"UseExifCreationDate\":true}", GuiJsonContext.Default.SettingsFile)!;
+			bool previousExif = SettingsFile.Instance.UseExifCreationDate;
+			var zone = TimeZoneInfo.CreateCustomTimeZone("TestMinusSix", TimeSpan.FromHours(-6), "TestMinusSix", "TestMinusSix");
+			var utc = new DateTime(2026, 10, 13, 16, 30, 0, DateTimeKind.Utc).AddTicks(7654);
+			string json = JsonSerializer.Serialize(new List<DuplicateItemVM> { Item(Guid.Empty, "legacy.jpg", utc, default) },
+				GuiJsonFieldsContext.Default.ListDuplicateItemVM);
+			var legacy = Assert.Single(JsonSerializer.Deserialize(json, GuiJsonFieldsContext.Default.ListDuplicateItemVM)!);
+			try {
+				SettingsFile.Instance.UseExifCreationDate = copiedSettings.UseExifCreationDate;
+				Assert.True(SettingsFile.Instance.UseExifCreationDate);
+				Assert.Equal(0, (int)(legacy.ItemInfo.Flags & DuplicateFlags.ExifCreationDate));
+				Assert.Equal(ResultsDates.ForDisplay(utc, zone), ResultsDates.ForDisplay(legacy.ItemInfo, false, zone));
+				Assert.Equal(utc.Ticks, legacy.ShownDate.Ticks);
+			}
+			finally { SettingsFile.Instance.UseExifCreationDate = previousExif; }
+		}
+
+		[Fact]
+		public void DatabaseViewerCaptureDateKeepsItsCalendarDayWhileFilesystemDatesConvert() {
+			var capture = new DateTime(2014, 6, 15, 0, 30, 45, DateTimeKind.Utc);
+			var modified = new DateTime(2026, 10, 13, 0, 30, 0, DateTimeKind.Utc);
+			var entry = new FileEntry { DateCreated = capture, DateModified = modified, Flags = EntryFlags.IsImage | EntryFlags.ExifCreationDate };
+			var row = new DatabaseEntryVM(entry);
+			Assert.Equal(capture.ToString("d", CultureInfo.CurrentCulture), row.DateCreatedText);
+			Assert.Equal(modified.ToLocalTime().ToString("d", CultureInfo.CurrentCulture), row.DateModifiedText);
+			entry.Flags &= ~EntryFlags.ExifCreationDate;
+			Assert.Equal(capture.ToLocalTime().ToString("d", CultureInfo.CurrentCulture), row.DateCreatedText);
+			Assert.Equal(capture, entry.DateCreated);
 		}
 	}
 }

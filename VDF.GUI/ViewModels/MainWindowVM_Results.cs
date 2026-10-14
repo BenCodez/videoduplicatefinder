@@ -241,13 +241,9 @@ namespace VDF.GUI.ViewModels {
 			if (header != null) await MarkGroupAsNotAMatch(header.GroupId);
 		});
 
-		public ReactiveCommand<ResultsGroupHeader, Unit> LoadThumbnailsForGroupHeaderCommand => ReactiveCommand.CreateFromTask<ResultsGroupHeader>(async header => {
-			if (header == null) return;
-			var items = Duplicates.Where(d => d.ItemInfo.GroupId == header.GroupId).Select(d => d.ItemInfo).ToList();
-			if (items.Count == 0) return;
-			SyncCoreSettings();
-			await Scanner.RetrieveThumbnailsForItems(items);
-		});
+		public ReactiveCommand<ResultsGroupHeader, Unit> LoadThumbnailsForGroupHeaderCommand => ReactiveCommand.CreateFromTask<ResultsGroupHeader>(header =>
+			header == null ? Task.CompletedTask : ReloadManualThumbnailsAsync(Duplicates
+				.Where(row => row.ItemInfo.GroupId == header.GroupId).Select(row => row.ItemInfo)), CanStartScan);
 
 		public ReactiveCommand<Unit, Unit> ToggleResultsDensityCommand => ReactiveCommand.Create(() => {
 			SettingsFile.Instance.ResultsCompactRows = !SettingsFile.Instance.ResultsCompactRows;

@@ -35,6 +35,10 @@ public class DriveScanPlannerTests {
 
 	static readonly Dictionary<string, string> NoOverrides = new();
 	static readonly Func<string, bool> NoNetwork = _ => false;
+	static readonly string FirstRoot = OperatingSystem.IsWindows() ? @"C:\" : "/mnt/first";
+	static readonly string SecondRoot = OperatingSystem.IsWindows() ? @"D:\" : "/mnt/second";
+	static FileEntry EntryUnder(string root, string folder, string file) =>
+		Entry(Path.Combine(root, folder, file), Path.Combine(root, folder));
 
 	// ── AssignParallelism ───────────────────────────────────────────────────
 
@@ -118,14 +122,12 @@ public class DriveScanPlannerTests {
 		Assert.Equal("/", DriveScanPlanner.GetRootKey("/mnt/usb2/a.mp4", mounts));
 	}
 
-	[Fact]
+	[WindowsFact]
 	public void UncPath_FallsBackToShareRoot() {
-		if (!OperatingSystem.IsWindows())
-			return; // UNC root semantics; PR CI runs Windows only
 		Assert.Equal(@"\\server\share", DriveScanPlanner.GetRootKey(@"\\server\share\videos\a.mp4", Array.Empty<string>()));
 	}
 
-	[Fact]
+	[WindowsFact]
 	public void PartitionByDrive_GroupsCaseInsensitivelyAndKeepsStableOrder() {
 		var entries = new[] {
 			Entry(@"D:\videos\a.mp4", @"D:\videos"),
@@ -141,14 +143,41 @@ public class DriveScanPlannerTests {
 		Assert.Equal(2, groups[1].Entries.Count);
 	}
 
+	[UnixFact]
+	public void PartitionByDrive_UnixRoots_RespectNestedMountsAndKeepStableOrder() {
+		string temp = Directory.CreateTempSubdirectory("vdf-drive-roots-").FullName;
+		try {
+			string firstMount = Directory.CreateDirectory(Path.Combine(temp, "mount-a")).FullName;
+			string secondMount = Directory.CreateDirectory(Path.Combine(temp, "mount-b")).FullName;
+			string systemRoot = Path.GetPathRoot(temp)!;
+			Assert.Equal("/", systemRoot);
+			Assert.Equal(systemRoot, DriveScanPlanner.GetRootKey(Path.Combine(temp, "root.mp4"), Array.Empty<string>()));
+			var entries = new[] {
+				EntryUnder(secondMount, "videos", "a.mp4"),
+				EntryUnder(firstMount, "clips", "b.mp4"),
+				EntryUnder(secondMount, "videos", "c.mp4"),
+				// A sibling with the same prefix belongs to the actual filesystem root.
+				EntryUnder(secondMount + "2", "videos", "d.mp4"),
+			};
+			var groups = DriveScanPlanner.PartitionByDrive(entries, new[] { firstMount, secondMount, systemRoot });
+			Assert.Equal(new[] { systemRoot, firstMount, secondMount }, groups.Select(g => g.Root).ToArray());
+			Assert.Same(entries[3], Assert.Single(groups[0].Entries));
+			Assert.Same(entries[1], Assert.Single(groups[1].Entries));
+			Assert.Equal(new[] { entries[0], entries[2] }, groups[2].Entries);
+			Assert.Equal(entries.Length, groups.Sum(g => g.Entries.Count));
+		}
+		finally { Directory.Delete(temp, recursive: true); }
+	}
+
 	[Fact]
 	public void PartitionByDrive_LosesNoEntry() {
 		var entries = new[] {
-			Entry(@"C:\a\1.mp4", @"C:\a"),
-			Entry(@"C:\a\2.mp4", @"C:\a"),
-			Entry(@"E:\b\3.mp4", @"E:\b"),
+			EntryUnder(FirstRoot, "a", "1.mp4"),
+			EntryUnder(FirstRoot, "a", "2.mp4"),
+			EntryUnder(SecondRoot, "b", "3.mp4"),
 		};
-		var groups = DriveScanPlanner.PartitionByDrive(entries, new[] { @"C:\", @"E:\" });
+		var groups = DriveScanPlanner.PartitionByDrive(entries, new[] { FirstRoot, SecondRoot });
+		Assert.Equal(2, groups.Count);
 		Assert.Equal(entries.Length, groups.Sum(g => g.Entries.Count));
 	}
 
@@ -160,14 +189,15 @@ public class DriveScanPlannerTests {
 	[Fact]
 	public void MapEntryIndexes_MapsEveryEntryToItsOriginalIndex_ExactlyOnce() {
 		var entries = new List<FileEntry> {
-			Entry(@"D:\videos\long.mp4", @"D:\videos"),   // 0
-			Entry(@"C:\clips\mid.mp4", @"C:\clips"),      // 1
-			Entry(@"D:\videos\short.mp4", @"D:\videos"),  // 2
-			Entry(@"C:\other\tiny.mp4", @"C:\other"),     // 3
+			EntryUnder(SecondRoot, "videos", "long.mp4"),  // 0
+			EntryUnder(FirstRoot, "clips", "mid.mp4"),     // 1
+			EntryUnder(SecondRoot, "videos", "short.mp4"), // 2
+			EntryUnder(FirstRoot, "other", "tiny.mp4"),    // 3
 		};
-		var groups = DriveScanPlanner.PartitionByDrive(entries, new[] { @"C:\", @"D:\" });
+		var groups = DriveScanPlanner.PartitionByDrive(entries, new[] { FirstRoot, SecondRoot });
 		int[][] indexes = DriveScanPlanner.MapEntryIndexes(entries, groups);
 
+		Assert.Equal(2, groups.Count);
 		Assert.Equal(groups.Count, indexes.Length);
 		for (int g = 0; g < groups.Count; g++)
 			for (int k = 0; k < indexes[g].Length; k++)
@@ -179,11 +209,11 @@ public class DriveScanPlannerTests {
 	[Fact]
 	public void MapEntryIndexes_PreservesInputOrderWithinAGroup() {
 		var entries = new List<FileEntry> {
-			Entry(@"C:\a\3.mp4", @"C:\a"),
-			Entry(@"C:\a\1.mp4", @"C:\a"),
-			Entry(@"C:\a\2.mp4", @"C:\a"),
+			EntryUnder(FirstRoot, "a", "3.mp4"),
+			EntryUnder(FirstRoot, "a", "1.mp4"),
+			EntryUnder(FirstRoot, "a", "2.mp4"),
 		};
-		var groups = DriveScanPlanner.PartitionByDrive(entries, new[] { @"C:\" });
+		var groups = DriveScanPlanner.PartitionByDrive(entries, new[] { FirstRoot });
 		int[][] indexes = DriveScanPlanner.MapEntryIndexes(entries, groups);
 
 		// The AI pass sorts videos longest-first before partitioning; that order must
@@ -193,13 +223,24 @@ public class DriveScanPlannerTests {
 
 	// ── ClassifyGroups ──────────────────────────────────────────────────────
 
-	[Fact]
+	[WindowsFact]
 	public void Override_WinsAndSkipsTheProbe_KeyAndValueCaseInsensitive() {
 		var groups = new List<DriveScanGroup> { Group(@"D:\", DriveSpeedClass.Slow) };
 		bool probed = false;
 		DriveScanPlanner.ClassifyGroups(groups,
 			new Dictionary<string, string> { ["d:"] = "ssd" },
 			NoNetwork,
+			_ => { probed = true; return 20.0; });
+		Assert.Equal(DriveSpeedClass.Fast, groups[0].SpeedClass);
+		Assert.False(probed);
+	}
+
+	[UnixFact]
+	public void Override_UnixMountRoot_NormalizesTrailingSeparatorAndAcceptsLowercaseValue() {
+		var groups = new List<DriveScanGroup> { Group("/mnt/media/", DriveSpeedClass.Slow) };
+		bool probed = false;
+		DriveScanPlanner.ClassifyGroups(groups,
+			new Dictionary<string, string> { ["/mnt/media"] = "ssd" }, NoNetwork,
 			_ => { probed = true; return 20.0; });
 		Assert.Equal(DriveSpeedClass.Fast, groups[0].SpeedClass);
 		Assert.False(probed);
@@ -311,9 +352,8 @@ public class DriveScanPlannerTests {
 		Assert.Null(DriveScanPlanner.QueryHasSeekPenalty("?"));
 	}
 
-	[Fact]
+	[WindowsFact]
 	public void QueryHasSeekPenalty_RealSystemDrive_DoesNotThrow() {
-		if (!OperatingSystem.IsWindows()) return;
 		// The answer depends on hardware (VMs/USB controllers may not implement the
 		// property, which must surface as null, never as an exception).
 		_ = DriveScanPlanner.QueryHasSeekPenalty(@"C:\");

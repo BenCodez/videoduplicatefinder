@@ -18,6 +18,7 @@ using System.Collections.ObjectModel;
 using System.Globalization;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using System.Threading.Tasks;
 using System.Xml;
 using System.Xml.Linq;
 using ReactiveUI;
@@ -32,11 +33,17 @@ namespace VDF.GUI.Data {
 	public class SettingsFile : ReactiveObject {
 		static SettingsFile? instance;
 		static string? settingsPath;
+		readonly Dictionary<string, VDF.Core.Review.FileIdentity?> knownSettingsIdentities = new(VDF.Core.Utils.PathComparer.ForCurrentPlatform);
 
 		[JsonIgnore]
 		public static SettingsFile Instance => instance ??= new SettingsFile();
 
 		public SettingsFile() { }
+
+		public VDF.Core.Selection.SelectionOptions AutomationSelection { get; set; } = new();
+		public List<VDF.Core.Selection.NamedSelectionProfile> SavedSelectionProfiles { get; set; } = new();
+		public VDF.Core.Nfo.NfoOptions NfoFavourites { get; set; } = new();
+		public string QuarantineFolder { get; set; } = string.Empty;
 
 
 		public static void SetSettingsPath(string? path) {
@@ -407,9 +414,74 @@ namespace VDF.GUI.Data {
 			set => this.RaiseAndSetIfChanged(ref field, Math.Max(0, value));
 		} = 5;
 
+		static readonly object settingsWriteGate = new();
 		public static void SaveSettings(string? path = null) {
-			path = ResolveSettingsPath(path);
-			File.WriteAllText(path, JsonSerializer.Serialize(instance, GuiJsonContext.Default.SettingsFile));
+			if (StartupLoadError is not null) throw new InvalidDataException("Settings are unreadable. Restore a valid settings file and reload or restart before saving cleanup protection settings.");
+			lock (settingsWriteGate) {
+				path = Path.GetFullPath(ResolveSettingsPath(path));
+				bool activeSettings = VDF.Core.Review.SafePaths.Same(path, Path.GetFullPath(ResolveSettingsPath(null)));
+				using var lease = VDF.Core.Review.JournalWriteLease.Acquire(path);
+				if (Instance.knownSettingsIdentities.TryGetValue(path, out var loaded) &&
+					(loaded is null ? VDF.Core.Review.SafePaths.Exists(path) : !loaded.MatchesCurrent(forceHash: true)))
+					throw new InvalidDataException("Settings changed outside this GUI. Reload or restart before saving; the newer settings were preserved.");
+				if (activeSettings)
+					VDF.Core.Cleanup.CleanupProtectionPolicyStore.ValidateSettingsWriteAsync(
+						CoreUtils.ResolveDatabaseFolder(Instance.CustomDatabaseFolder)).GetAwaiter().GetResult();
+				Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+				string temp = path + "." + Guid.NewGuid().ToString("N") + ".tmp";
+				try {
+					using (var stream = new FileStream(temp, FileMode.CreateNew, FileAccess.Write, FileShare.None)) {
+						JsonSerializer.Serialize(stream, Instance, GuiJsonContext.Default.SettingsFile);
+						stream.Flush(flushToDisk: true);
+					}
+					VDF.Core.Review.DurableFileOperations.Move(temp, path, overwrite: true);
+					Instance.knownSettingsIdentities[path] = VDF.Core.Review.FileIdentity.Capture(path)
+						?? throw new IOException("The saved settings file could not be validated.");
+					// Named profiles are exports. Only the active settings file can
+					// authorize or anchor the protection policy used by live cleanup.
+					if (activeSettings) ExportCleanupProtectionPolicyAsync(path).GetAwaiter().GetResult();
+				}
+				finally { if (File.Exists(temp)) File.Delete(temp); }
+			}
+		}
+
+		public static Task ExportCleanupProtectionPolicyAsync(string? sourceSettingsPath = null) {
+			if (StartupLoadError is not null) throw new InvalidDataException("Settings are unreadable; existing cleanup protections were preserved. Restore valid settings and reload or restart before cleanup.");
+			string path = Path.GetFullPath(ResolveSettingsPath(null));
+			if (!string.IsNullOrWhiteSpace(sourceSettingsPath) &&
+				!VDF.Core.Review.SafePaths.Same(path, Path.GetFullPath(sourceSettingsPath)))
+				throw new InvalidOperationException("A named settings profile cannot be the source of live cleanup protections. Save it as the active settings before exporting its protection policy.");
+			var settings = Instance;
+			string stateFolder = CoreUtils.ResolveDatabaseFolder(settings.CustomDatabaseFolder);
+			VDF.Core.Review.FileIdentity? source = null;
+			if (VDF.Core.Review.SafePaths.Exists(path)) {
+				// A second GUI or an external edit may have changed protections since this
+				// instance loaded. Project saved bytes, not the stale in-memory instance.
+				settings = ReadSavedSettings(path, out var readSource);
+				source = readSource;
+			}
+			return VDF.Core.Cleanup.CleanupProtectionPolicyStore.SaveAsync(
+				stateFolder, new VDF.Core.Cleanup.CleanupProtectionPolicy {
+					NfoOptions = settings.NfoFavourites,
+					FolderRules = settings.AutomationSelection.FolderRules,
+					OverlapPolicy = settings.AutomationSelection.OverlapPolicy
+				}, source);
+		}
+
+		static SettingsFile ReadSavedSettings(string path, out VDF.Core.Review.FileIdentity source,
+			Action<VDF.Core.Review.FileIdentity>? observedSource = null) {
+			VDF.Core.Review.SafePaths.RequireRegularFile(path);
+			if (new FileInfo(path).Length > 32L * 1024 * 1024) throw new InvalidDataException("The settings file exceeds the supported size limit.");
+			byte[] bytes = File.ReadAllBytes(path);
+			source = VDF.Core.Review.FileIdentity.Capture(path) ?? throw new IOException("The settings file is unavailable or changed during projection.");
+			if (source.Length != bytes.Length || source.Sha256 != Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(bytes)))
+				throw new InvalidDataException("GUI settings changed while they were read. Reload or refresh them before cleanup.");
+			observedSource?.Invoke(source);
+			var settings = JsonSerializer.Deserialize(bytes, GuiJsonContext.Default.SettingsFile)
+				?? throw new JsonException($"'{path}' does not contain a settings object.");
+			settings.MigrateLegacyValues();
+			settings.knownSettingsIdentities[source.Path] = source;
+			return settings;
 		}
 
 		[JsonPropertyName("UseMica")]
@@ -681,6 +753,58 @@ namespace VDF.GUI.Data {
 			get;
 			set => this.RaiseAndSetIfChanged(ref field, value);
 		} = "02:00";
+		[JsonPropertyName("ScheduledScanKind")]
+		public VDF.Core.Scheduling.ScanScheduleKind ScheduledScanKind {
+			get;
+			set => this.RaiseAndSetIfChanged(ref field, value);
+		}
+		[JsonPropertyName("ScheduledScanWeekdays")]
+		public int ScheduledScanWeekdays {
+			get;
+			set => this.RaiseAndSetIfChanged(ref field, value & 127);
+		} = 2;
+		[JsonPropertyName("ScheduledScanIntervalMinutes")]
+		public int ScheduledScanIntervalMinutes {
+			get;
+			set => this.RaiseAndSetIfChanged(ref field, value);
+		} = 60;
+		[JsonPropertyName("ScheduledScanCatchUpHours")]
+		public int ScheduledScanCatchUpHours {
+			get;
+			set => this.RaiseAndSetIfChanged(ref field, value);
+		} = 24;
+		/// <summary>Custom means use the current scan settings; named profiles reuse the Setup bundles.</summary>
+		[JsonPropertyName("ScheduledScanProfile")]
+		public ScanProfile ScheduledScanProfile {
+			get;
+			set => this.RaiseAndSetIfChanged(ref field, value);
+		} = ScanProfile.Custom;
+		/// <summary>Durable UTC watermark claimed before starting; failures and restarts do not replay it.</summary>
+		[JsonPropertyName("ScheduledLastClaimedSlotUtc")]
+		public DateTimeOffset? ScheduledLastClaimedSlotUtc {
+			get;
+			set => this.RaiseAndSetIfChanged(ref field, value);
+		}
+		[JsonPropertyName("ScheduledLastStartedUtc")]
+		public DateTimeOffset? ScheduledLastStartedUtc {
+			get;
+			set => this.RaiseAndSetIfChanged(ref field, value);
+		}
+		[JsonPropertyName("ScheduledLastCompletedUtc")]
+		public DateTimeOffset? ScheduledLastCompletedUtc {
+			get;
+			set => this.RaiseAndSetIfChanged(ref field, value);
+		}
+		[JsonPropertyName("ScheduledLastDurationSeconds")]
+		public double ScheduledLastDurationSeconds {
+			get;
+			set => this.RaiseAndSetIfChanged(ref field, value);
+		}
+		[JsonPropertyName("ScheduledLastStatus")]
+		public string ScheduledLastStatus {
+			get;
+			set => this.RaiseAndSetIfChanged(ref field, value);
+		} = "Never run";
 		[JsonPropertyName("NotifyOnScheduledScanComplete")]
 		public bool NotifyOnScheduledScanComplete {
 			get;
@@ -698,16 +822,26 @@ namespace VDF.GUI.Data {
 			set => this.RaiseAndSetIfChanged(ref field, value);
 		} = new();
 
-		public static void LoadSettings(string? path = null) {
+		public static void LoadSettings(string? path = null) => LoadSettingsCore(path, null);
+
+		static void LoadSettingsCore(string? path, Action<VDF.Core.Review.FileIdentity>? observedSource) {
 			path ??= settingsPath;
 			if ((path == null || path.EndsWith(".xml", StringComparison.OrdinalIgnoreCase)) && LoadOldSettings(path))
 				return;
 
 			path = ResolveSettingsPath(path);
-			if (!File.Exists(path)) return;
-			instance = JsonSerializer.Deserialize(File.ReadAllBytes(path), GuiJsonContext.Default.SettingsFile)
-				?? throw new JsonException($"'{path}' does not contain a settings object.");
-			instance.MigrateLegacyValues();
+			if (!File.Exists(path)) {
+				if (VDF.Core.Review.SafePaths.Exists(path)) throw new IOException("The settings path is not an available regular file.");
+				Instance.knownSettingsIdentities[Path.GetFullPath(path)] = null;
+				return;
+			}
+			var loaded = ReadSavedSettings(path, out _, observedSource);
+			// Importing/saving another profile must not forget the baseline of the
+			// active settings file and permit a later autosave to replace external edits.
+			if (instance is not null)
+				foreach (var entry in instance.knownSettingsIdentities) loaded.knownSettingsIdentities.TryAdd(entry.Key, entry.Value);
+			instance = loaded;
+			StartupLoadError = null;
 		}
 
 		/// <summary>
@@ -725,13 +859,23 @@ namespace VDF.GUI.Data {
 		/// diagnosis and start with default settings instead.
 		/// </summary>
 		public static void LoadSettingsAtStartup() {
+			VDF.Core.Review.FileIdentity? observedSource = null;
 			try {
-				LoadSettings();
+				LoadSettingsCore(null, source => observedSource = source);
 				StartupLoadError = null;
 			}
 			catch (Exception ex) {
 				string message = $"Settings could not be loaded: {ex.Message}";
 				string jsonPath = ResolveSettingsPath(null);
+				// Authorize a later explicit import against only the bytes whose
+				// parsing failed, never a newer file written before this catch ran.
+				try {
+					string fullPath = Path.GetFullPath(jsonPath);
+					Instance.knownSettingsIdentities[fullPath] =
+						observedSource is not null && VDF.Core.Review.SafePaths.Same(fullPath, observedSource.Path)
+							? observedSource : null;
+				}
+				catch { /* An unavailable baseline cannot authorize replacing an existing file. */ }
 				if (File.Exists(jsonPath)) {
 					try {
 						File.Copy(jsonPath, jsonPath + ".corrupt", overwrite: true);
@@ -748,8 +892,11 @@ namespace VDF.GUI.Data {
 			path ??= FileUtils.SafePathCombine(CoreUtils.CurrentFolder, "Settings.xml");
 			if (!File.Exists(path)) return false;
 			var xmlSettings = new XmlReaderSettings { DtdProcessing = DtdProcessing.Prohibit };
-			using var reader = XmlReader.Create(path, xmlSettings);
-			var xDoc = XDocument.Load(reader);
+			XDocument xDoc;
+			// Parsing no longer needs the file when migration removes it. Windows
+			// refuses that deletion while XmlReader still owns its read handle.
+			using (var reader = XmlReader.Create(path, xmlSettings))
+				xDoc = XDocument.Load(reader);
 			foreach (var n in xDoc.Descendants("Include"))
 				Instance.Includes.Add(n.Value);
 			foreach (var n in xDoc.Descendants("Exclude"))
@@ -810,8 +957,19 @@ namespace VDF.GUI.Data {
 			foreach (var n in xDoc.Descendants("CompareHorizontallyFlipped"))
 				if (bool.TryParse(n.Value, out var value))
 					Instance.CompareHorizontallyFlipped = value;
-			SaveSettings(Path.ChangeExtension(path, "json"));
-			File.Delete(path);
+			// Parsing has succeeded. Migration itself saves the imported profile,
+			// so release the startup guard for that explicit recovery and restore
+			// it if saving or preserving the legacy file cannot complete.
+			string? startupError = StartupLoadError;
+			StartupLoadError = null;
+			try {
+				SaveSettings(Path.ChangeExtension(path, "json"));
+				File.Delete(path);
+			}
+			catch {
+				StartupLoadError = startupError;
+				throw;
+			}
 			return true;
 		}
 

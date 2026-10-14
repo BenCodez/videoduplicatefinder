@@ -20,6 +20,8 @@ using VDF.GUI.Data;
 
 namespace VDF.GUI.Tests {
 	public class DatabaseEditorRulesTests {
+		static readonly string MediaFolder = Path.GetFullPath(Path.Combine(Path.GetTempPath(), "vdf-db-editor-media"));
+		static string MediaPath(params string[] segments) => Path.Combine(MediaFolder, Path.Combine(segments));
 
 		static FileEntry Entry(string path, EntryFlags flags = 0, long size = 100,
 			DateTime? created = null, TimeSpan? duration = null, long videoBitRate = 0) {
@@ -42,10 +44,10 @@ namespace VDF.GUI.Tests {
 
 		[Fact]
 		public void Matches_TypeErrorFlagAndSearchAndTogether() {
-			var video = Entry(@"D:\a\clip.mp4");
-			var image = Entry(@"D:\a\photo.jpg", EntryFlags.IsImage);
-			var broken = Entry(@"D:\a\broken.mp4", EntryFlags.ThumbnailError);
-			var excluded = Entry(@"D:\b\old.mp4", EntryFlags.ManuallyExcluded);
+			var video = Entry(MediaPath("a", "clip.mp4"));
+			var image = Entry(MediaPath("a", "photo.jpg"), EntryFlags.IsImage);
+			var broken = Entry(MediaPath("a", "broken.mp4"), EntryFlags.ThumbnailError);
+			var excluded = Entry(MediaPath("b", "old.mp4"), EntryFlags.ManuallyExcluded);
 
 			Assert.True(DatabaseEditorRules.Matches(video, new DbFilterState()));
 			Assert.False(DatabaseEditorRules.Matches(image, new DbFilterState { Type = DbTypeFilter.Videos }));
@@ -55,60 +57,60 @@ namespace VDF.GUI.Tests {
 			Assert.True(DatabaseEditorRules.Matches(excluded, new DbFilterState { Flag = EntryFlags.ManuallyExcluded }));
 			Assert.False(DatabaseEditorRules.Matches(video, new DbFilterState { Flag = EntryFlags.ManuallyExcluded }));
 			Assert.True(DatabaseEditorRules.Matches(video, new DbFilterState { Search = "CLIP" })); // case-insensitive
-			Assert.False(DatabaseEditorRules.Matches(video, new DbFilterState { Search = @"D:\b" }));
+			Assert.False(DatabaseEditorRules.Matches(video, new DbFilterState { Search = MediaPath("b") }));
 			// combined: errors-only AND search must both hold
 			Assert.False(DatabaseEditorRules.Matches(broken, new DbFilterState { ErrorsOnly = true, Search = "photo" }));
 		}
 
 		[Fact]
 		public void ManualExclusionIsNotAnError() {
-			var excluded = Entry(@"D:\x.mp4", EntryFlags.ManuallyExcluded);
+			var excluded = Entry(MediaPath("x.mp4"), EntryFlags.ManuallyExcluded);
 			Assert.False(DatabaseEditorRules.Matches(excluded, new DbFilterState { ErrorsOnly = true }));
 		}
 
 		[Fact]
 		public void Sort_SizeLargestFirst_PathTiebreak() {
 			var entries = new List<FileEntry> {
-				Entry(@"D:\b.mp4", size: 100),
-				Entry(@"D:\a.mp4", size: 100),
-				Entry(@"D:\c.mp4", size: 900),
+				Entry(MediaPath("b.mp4"), size: 100),
+				Entry(MediaPath("a.mp4"), size: 100),
+				Entry(MediaPath("c.mp4"), size: 900),
 			};
 			entries.Sort(DatabaseEditorRules.BuildComparison(DbSortMode.Size, null));
-			Assert.Equal(new[] { @"D:\c.mp4", @"D:\a.mp4", @"D:\b.mp4" }, entries.Select(e => e.Path));
+			Assert.Equal(new[] { MediaPath("c.mp4"), MediaPath("a.mp4"), MediaPath("b.mp4") }, entries.Select(e => e.Path));
 		}
 
 		[Fact]
 		public void Sort_FlagFirstPutsFlaggedEntriesOnTop_ThenBaseMode() {
 			var entries = new List<FileEntry> {
-				Entry(@"D:\big.mp4", size: 900),
-				Entry(@"D:\flagged_small.mp4", EntryFlags.TooDark, size: 10),
-				Entry(@"D:\flagged_big.mp4", EntryFlags.TooDark, size: 500),
+				Entry(MediaPath("big.mp4"), size: 900),
+				Entry(MediaPath("flagged_small.mp4"), EntryFlags.TooDark, size: 10),
+				Entry(MediaPath("flagged_big.mp4"), EntryFlags.TooDark, size: 500),
 			};
 			entries.Sort(DatabaseEditorRules.BuildComparison(DbSortMode.Size, EntryFlags.TooDark));
-			Assert.Equal(new[] { @"D:\flagged_big.mp4", @"D:\flagged_small.mp4", @"D:\big.mp4" },
+			Assert.Equal(new[] { MediaPath("flagged_big.mp4"), MediaPath("flagged_small.mp4"), MediaPath("big.mp4") },
 				entries.Select(e => e.Path));
 		}
 
 		[Fact]
 		public void Sort_BitrateReadsTheVideoStream() {
 			var entries = new List<FileEntry> {
-				Entry(@"D:\low.mp4", videoBitRate: 1_000_000),
-				Entry(@"D:\high.mp4", videoBitRate: 9_000_000),
-				Entry(@"D:\unknown.mp4"),
+				Entry(MediaPath("low.mp4"), videoBitRate: 1_000_000),
+				Entry(MediaPath("high.mp4"), videoBitRate: 9_000_000),
+				Entry(MediaPath("unknown.mp4")),
 			};
 			entries.Sort(DatabaseEditorRules.BuildComparison(DbSortMode.Bitrate, null));
-			Assert.Equal(@"D:\high.mp4", entries[0].Path);
-			Assert.Equal(@"D:\unknown.mp4", entries[2].Path);
+			Assert.Equal(MediaPath("high.mp4"), entries[0].Path);
+			Assert.Equal(MediaPath("unknown.mp4"), entries[2].Path);
 			Assert.Equal(9000m, DatabaseEditorRules.GetBitRate(entries[0]));
 		}
 
 		[Fact]
 		public void CountFlags_PerFlagAndAnyErrorTotal() {
 			var entries = new[] {
-				Entry(@"D:\1.mp4", EntryFlags.ThumbnailError | EntryFlags.TooDark),
-				Entry(@"D:\2.mp4", EntryFlags.MetadataError),
-				Entry(@"D:\3.mp4", EntryFlags.ManuallyExcluded),
-				Entry(@"D:\4.mp4"),
+				Entry(MediaPath("1.mp4"), EntryFlags.ThumbnailError | EntryFlags.TooDark),
+				Entry(MediaPath("2.mp4"), EntryFlags.MetadataError),
+				Entry(MediaPath("3.mp4"), EntryFlags.ManuallyExcluded),
+				Entry(MediaPath("4.mp4")),
 			};
 			var (perFlag, errors) = DatabaseEditorRules.CountFlags(entries);
 			Assert.Equal(1, perFlag[EntryFlags.ThumbnailError]);

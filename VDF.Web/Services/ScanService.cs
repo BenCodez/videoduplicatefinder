@@ -44,10 +44,22 @@ namespace VDF.Web.Services {
 	/// Singleton service that owns the ScanEngine instance and exposes
 	/// scan lifecycle operations to Blazor components via events and state.
 	/// </summary>
-	public sealed class ScanService : IDisposable {
+	public sealed partial class ScanService : IDisposable {
 		readonly ScanEngine _engine = new();
 		readonly WebSettingsService _settingsService;
 		CancellationTokenSource _cts = new();
+		readonly object _operationSync = new();
+		bool _scanStarting;
+		bool _scanRunActive;
+		bool _dataWorkActive;
+		bool _disposed;
+
+		bool WorkActiveLocked => FileOpRunning || _scanStarting || _scanRunActive || _dataWorkActive ||
+			State is ScanState.Scanning or ScanState.Comparing;
+
+		/// <summary>Includes startup and terminal scan processing, even when an error is displayed.</summary>
+		public bool IsBusy { get { lock (_operationSync) return WorkActiveLocked; } }
+
 
 		public ScanState State { get; private set; } = ScanState.Idle;
 		public string? ErrorMessage { get; private set; }
@@ -58,6 +70,7 @@ namespace VDF.Web.Services {
 		public Settings Settings => _engine.Settings;
 		/// <summary>Test seam: lets tests seed results without driving a real scan.</summary>
 		internal ScanEngine Engine => _engine;
+		internal Func<Settings, CancellationToken, Task> PrepareScanAsync { get; set; } = DownloadRequiredAiComponentsAsync;
 
 		/// <summary>Caches for the thumbnail endpoints — cleared whenever the results change wholesale.</summary>
 		public System.Collections.Concurrent.ConcurrentDictionary<string, byte[]> HqThumbCache { get; } = new();
@@ -97,52 +110,79 @@ namespace VDF.Web.Services {
 			_engine.ScanDone += (_, _) => {
 				// Skip low-res thumbnail retrieval — WebUI loads HQ thumbnails on demand
 				// via the /thumbnail/hq endpoint. This makes results available immediately.
-				State = ScanState.Done;
-				LastProgress = null;
+				CaptureCleanupSnapshots(DatabaseUtils.GetDatabaseFolderPath());
+				lock (_operationSync) {
+					_scanRunActive = false;
+					State = ScanState.Done;
+					LastProgress = null;
+				}
 				Notify();
 			};
 			_engine.ScanAborted += (_, _) => {
-				State = ScanState.Aborted;
-				LastProgress = null;
+				lock (_operationSync) {
+					_scanRunActive = false;
+					State = ScanState.Aborted;
+					LastProgress = null;
+				}
 				Notify();
 			};
 		}
 
 		public async Task StartScanAndCompare() {
-			if (State == ScanState.Scanning || State == ScanState.Comparing) return;
-			_cts = new CancellationTokenSource();
-			State = ScanState.Scanning;
-			ErrorMessage = null;
-			LastProgress = null;
-			FilesHashed = 0;
-			_engine.Duplicates.Clear();
-			ClearThumbnailCaches();
+			lock (_operationSync) {
+				if (_disposed || WorkActiveLocked) return;
+				_scanStarting = true;
+				_scanRunActive = true;
+				_cts.Dispose();
+				_cts = new CancellationTokenSource();
+				State = ScanState.Scanning;
+				ErrorMessage = null;
+				LastProgress = null;
+				FilesHashed = 0;
+				_engine.Duplicates.Clear();
+				ClearCleanupSnapshots();
+				ClearThumbnailCaches();
+			}
 			Notify();
 			try {
-				// Headless first-use AI component download, like the CLI — PrepareSearch
-				// fails fast on missing components otherwise. Must be awaited, never
-				// blocked on: this runs on the Blazor circuit's synchronization context,
-				// and a sync-over-async wait deadlocks the whole circuit (the download's
-				// continuations queue behind the blocked handler forever).
-				if (_engine.Settings.NeedsAiComponents &&
-					!VDF.Core.AI.AiComponents.IsReady) {
-					VDF.Core.Utils.Logger.Instance.Info("Downloading AI components (ONNX Runtime + model, ~100 MB)...");
-					await VDF.Core.AI.AiComponents.DownloadAsync(null, _cts.Token);
-				}
+				// Reserve the lifecycle before awaiting a first-use AI download.
+				await PrepareScanAsync(_engine.Settings, _cts.Token);
+				_cts.Token.ThrowIfCancellationRequested();
 				_engine.StartSearch();
 			}
-			catch (Exception ex) {
-				SetError(ex);
-				return;
+			catch (OperationCanceledException) {
+				lock (_operationSync) {
+					_scanRunActive = false;
+					State = ScanState.Aborted;
+					LastProgress = null;
+				}
 			}
-			Notify();
+			catch (Exception ex) {
+				lock (_operationSync) _scanRunActive = false;
+				SetError(ex);
+			}
+			finally {
+				lock (_operationSync) {
+					_scanStarting = false;
+					if (_disposed) _cts.Dispose();
+				}
+				Notify();
+			}
+		}
+
+		static async Task DownloadRequiredAiComponentsAsync(Settings settings, CancellationToken ct) {
+			if (!settings.NeedsAiComponents || VDF.Core.AI.AiComponents.IsReady) return;
+			Logger.Instance.Info("Downloading AI components (ONNX Runtime + model, ~100 MB)...");
+			await VDF.Core.AI.AiComponents.DownloadAsync(null, ct);
 		}
 
 		/// <summary>Called from global exception handlers to surface post-await async void exceptions.</summary>
 		public void SetError(Exception ex) {
-			State = ScanState.Error;
-			ErrorMessage = ex.Message;
-			LastProgress = null;
+			lock (_operationSync) {
+				State = ScanState.Error;
+				ErrorMessage = ex.Message;
+				LastProgress = null;
+			}
 			Notify();
 		}
 
@@ -150,30 +190,40 @@ namespace VDF.Web.Services {
 		public void Resume() => _engine.Resume();
 
 		public void Stop() {
+			lock (_operationSync) {
+				if (_disposed || (!_scanStarting && !_scanRunActive)) return;
+				_cts.Cancel();
+			}
 			_engine.Stop();
-			_cts.Cancel();
 		}
 
 		public bool SaveSettings() => _settingsService.Save(_engine.Settings);
 
 		public void Reset() {
-			if (State == ScanState.Scanning || State == ScanState.Comparing) return;
-			State = ScanState.Idle;
-			ErrorMessage = null;
-			LastProgress = null;
-			FilesHashed = 0;
-			_engine.Duplicates.Clear();
-			ClearThumbnailCaches();
-			// Keep IncludeList/BlackList — resetting scan results should not
-			// throw away the paths the user configured.
+			lock (_operationSync) {
+				if (_disposed || WorkActiveLocked) return;
+				State = ScanState.Idle;
+				ErrorMessage = null;
+				LastProgress = null;
+				FilesHashed = 0;
+				_engine.Duplicates.Clear();
+				ClearCleanupSnapshots();
+				ClearThumbnailCaches();
+			}
+			// Keep the configured scan paths when resetting results.
 			Notify();
 		}
 
 		/// <summary>Removes items from the results list without touching the files on disk.</summary>
 		public void RemoveFromResults(IEnumerable<DuplicateItem> items) {
-			foreach (var item in items.ToList())
-				_engine.Duplicates.Remove(item);
-			DropSingletonGroups();
+			lock (_operationSync) {
+				if (_disposed || WorkActiveLocked) return;
+				foreach (var item in items.ToList()) {
+					_engine.Duplicates.Remove(item);
+					_resultSnapshots.Remove(item);
+				}
+				DropSingletonGroups();
+			}
 			Notify();
 		}
 
@@ -185,8 +235,10 @@ namespace VDF.Web.Services {
 				.Select(g => g.Key)
 				.ToHashSet();
 			foreach (var d in _engine.Duplicates.ToList())
-				if (!keep.Contains(d.GroupId))
+				if (!keep.Contains(d.GroupId)) {
 					_engine.Duplicates.Remove(d);
+					_resultSnapshots.Remove(d);
+				}
 		}
 
 		// === Batch file operations (delete / move / link) ===
@@ -197,115 +249,73 @@ namespace VDF.Web.Services {
 		public int FileOpCurrent { get; private set; }
 		public int FileOpMax { get; private set; }
 
-		bool TryBeginFileOp(string verb, int max) {
-			if (FileOpRunning || max == 0) return false;
-			FileOpRunning = true;
-			FileOpVerb = verb;
-			FileOpCurrent = 0;
-			FileOpMax = max;
+		bool TryBeginFileOp(string verb, int max, FileOpResult result) {
+			if (max == 0) return false;
+			lock (_operationSync) {
+				if (_disposed || WorkActiveLocked) {
+					result.Failed = max;
+					result.Errors.Add("A scan or another file/database operation is running. Wait for it to finish.");
+					return false;
+				}
+				FileOpRunning = true;
+				FileOpVerb = verb;
+				FileOpCurrent = 0;
+				FileOpMax = max;
+			}
 			Notify();
 			return true;
 		}
 
 		void EndFileOp() {
-			FileOpRunning = false;
-			FileOpVerb = string.Empty;
+			lock (_operationSync) {
+				FileOpRunning = false;
+				FileOpVerb = string.Empty;
+			}
+			Notify();
+		}
+
+		bool TryBeginDataWork() {
+			lock (_operationSync) {
+				if (_disposed || WorkActiveLocked) return false;
+				_dataWorkActive = true;
+			}
+			Notify();
+			return true;
+		}
+
+		void EndDataWork() {
+			lock (_operationSync) _dataWorkActive = false;
 			Notify();
 		}
 
 		/// <summary>Deletes files from disk and removes them from results and the scan database.</summary>
-		public async Task<FileOpResult> DeleteItemsAsync(IEnumerable<DuplicateItem> items, bool permanent) {
-			var list = items.ToList();
-			var result = new FileOpResult();
-			if (!TryBeginFileOp(permanent ? "Deleting" : "Moving to trash", list.Count))
-				return result;
-			try {
-				await Task.Run(() => {
-					// Windows: recycle the whole batch in one shell call — one
-					// SHFileOperation per file pays the full shell round-trip each time.
-					var batchRecycled = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-					if (!permanent && OperatingSystem.IsWindows()) {
-						var existing = list.Where(d => File.Exists(d.Path)).Select(d => d.Path).ToList();
-						if (existing.Count > 0) {
-							var fs = new FileUtils.SHFILEOPSTRUCT {
-								wFunc = FileUtils.FileOperationType.FO_DELETE,
-								pFrom = string.Join('\0', existing) + "\0\0",
-								fFlags = FileUtils.FileOperationFlags.FOF_ALLOWUNDO |
-										 FileUtils.FileOperationFlags.FOF_NOCONFIRMATION |
-										 FileUtils.FileOperationFlags.FOF_NOERRORUI |
-										 FileUtils.FileOperationFlags.FOF_SILENT
-							};
-							int shResult = FileUtils.SHFileOperation(ref fs);
-							if (shResult != 0)
-								Logger.Instance.Warn($"SHFileOperation returned {shResult:X} for a batch of {existing.Count} file(s); checking which files were actually recycled.");
-							foreach (var p in existing)
-								batchRecycled.Add(p);
-						}
-					}
-
-					var sw = System.Diagnostics.Stopwatch.StartNew();
-					foreach (var item in list) {
-						try {
-							bool exists = File.Exists(item.Path);
-							if (!exists) {
-								if (batchRecycled.Contains(item.Path))
-									result.FreedBytes += Math.Max(0, item.SizeLong);
-								// Already gone — still remove the entry and database record.
-							}
-							else if (permanent) {
-								File.Delete(item.Path);
-								result.FreedBytes += Math.Max(0, item.SizeLong);
-							}
-							else if (OperatingSystem.IsWindows()) {
-								// The batch ran but this file is still there.
-								throw new IOException("the shell did not move the file to the recycle bin");
-							}
-							else {
-								// System trash, falling back to permanent delete (e.g.
-								// cross-filesystem files where trashing means a full copy).
-								if (!FileUtils.MoveToTrash(item.Path))
-									File.Delete(item.Path);
-								result.FreedBytes += Math.Max(0, item.SizeLong);
-							}
-							_engine.Duplicates.Remove(item);
-							// Path-only entry — FileEntry(string) stats the file and throws once it's gone.
-							ScanEngine.RemoveFromDatabase(new FileEntry { Path = item.Path });
-							result.Done++;
-						}
-						catch (Exception ex) {
-							result.Errors.Add($"{Path.GetFileName(item.Path)}: {ex.Message}");
-							result.Failed++;
-						}
-						finally {
-							FileOpCurrent++;
-							if (sw.ElapsedMilliseconds >= 100) { sw.Restart(); Notify(); }
-						}
-					}
-					if (result.Done > 0)
-						ScanEngine.SaveDatabase();
-					DropSingletonGroups();
-				});
-			}
-			finally { EndFileOp(); }
-			return result;
-		}
+		public Task<FileOpResult> DeleteItemsAsync(IEnumerable<DuplicateItem> items, bool permanent) =>
+			RemoveOrReplaceItemsAsync(items, permanent, createLinks: false, hardLinks: false);
 
 		/// <summary>Moves files to a destination folder and updates the scan database paths.</summary>
 		public async Task<FileOpResult> MoveItemsAsync(IEnumerable<DuplicateItem> items, string destinationFolder) {
-			var list = items.ToList();
+			var list = items.Distinct().ToList();
 			var result = new FileOpResult();
-			try { Directory.CreateDirectory(destinationFolder); }
-			catch (Exception ex) {
-				result.Errors.Add($"Cannot create destination folder: {ex.Message}");
-				return result;
-			}
-			if (!TryBeginFileOp("Moving", list.Count))
-				return result;
+			if (!TryBeginFileOp("Moving", list.Count, result)) return result;
 			try {
-				await Task.Run(() => {
+				await Task.Run(async () => {
+					if (_resultStateFolder is null)
+						throw new IOException("These results have no verified file snapshots. Rescan before moving files.");
+					if (!PathComparer.ForCurrentPlatform.Equals(Path.GetFullPath(DatabaseUtils.GetDatabaseFolderPath()),
+						Path.GetFullPath(_resultStateFolder)) && !await LoadDatabaseWithResultsAuthorityAsync(_resultStateFolder)) {
+						ClearCleanupSnapshots();
+						throw new IOException("The results database could not be loaded; files were retained.");
+					}
 					var sw = System.Diagnostics.Stopwatch.StartNew();
 					foreach (var item in list) {
 						try {
+							if (!_engine.Duplicates.Contains(item))
+								throw new IOException("This file is no longer part of the current results.");
+							var identity = CaptureReviewedIdentity(item)
+								?? throw new IOException("The file is unavailable or has changed since scanning. Rescan before moving it.");
+							using (await AcquireMoveRetentionLeaseAsync())
+								await ValidateMoveRetentionAsync(identity);
+							Directory.CreateDirectory(destinationFolder);
 							string dest = Path.Combine(destinationFolder, Path.GetFileName(item.Path));
 							// Avoid overwriting existing files at destination
 							int n = 1;
@@ -313,10 +323,22 @@ namespace VDF.Web.Services {
 							string nameNoExt = Path.GetFileNameWithoutExtension(dest);
 							while (File.Exists(dest))
 								dest = Path.Combine(destinationFolder, $"{nameNoExt}_{n++}{ext}");
-							File.Move(item.Path, dest);
-							if (ScanEngine.GetFromDatabase(item.Path, out var dbEntry) && dbEntry != null)
+							if (!identity.MatchesCurrent(forceHash: true))
+								throw new IOException("The file changed before moving; it was retained.");
+							// Lookup requires the source path to exist; capture the entry before renaming.
+							ScanEngine.GetFromDatabase(item.Path, out var dbEntry);
+							var aliases = CaptureKeeperAliases(identity);
+							using var reviewLease = await AcquireMoveRetentionLeaseAsync();
+							await ValidateMoveRetentionAsync(identity);
+							try { FileMover(item.Path, dest); }
+							finally {
+								// Renaming also changes native stamps on existing source aliases.
+								RefreshKeeperAliasesAfterLink(aliases);
+							}
+							if (dbEntry is not null)
 								ScanEngine.UpdateFilePathInDatabase(dest, dbEntry);
 							_engine.Duplicates.Remove(item);
+							_resultSnapshots.Remove(item);
 							result.Done++;
 						}
 						catch (Exception ex) {
@@ -328,10 +350,16 @@ namespace VDF.Web.Services {
 							if (sw.ElapsedMilliseconds >= 100) { sw.Restart(); Notify(); }
 						}
 					}
-					if (result.Done > 0)
-						ScanEngine.SaveDatabase();
-					DropSingletonGroups();
+					if (result.Done > 0) {
+						try { ScanEngine.SaveDatabase(); }
+						catch (Exception ex) { result.Errors.Add($"Files were moved, but saving the scan database failed: {ex.Message}"); }
+						DropSingletonGroups();
+					}
 				});
+			}
+			catch (Exception ex) {
+				result.Failed = list.Count - result.Done;
+				result.Errors.Add($"Move could not complete; remaining files were retained: {ex.Message}");
 			}
 			finally { EndFileOp(); }
 			return result;
@@ -341,74 +369,37 @@ namespace VDF.Web.Services {
 		/// Replaces each selected file with a hardlink or symlink to the kept file of its
 		/// group (the highest-similarity unselected member that still exists on disk).
 		/// </summary>
-		public async Task<FileOpResult> CreateLinksAsync(IEnumerable<DuplicateItem> items, bool hardLinks) {
-			var list = items.ToList();
-			var result = new FileOpResult();
-			if (!TryBeginFileOp(hardLinks ? "Creating hardlinks" : "Creating symlinks", list.Count))
-				return result;
-			try {
-				await Task.Run(() => {
-					var selected = list.ToHashSet();
-					var keeperByGroup = _engine.Duplicates
-						.Where(d => !selected.Contains(d))
-						.GroupBy(d => d.GroupId)
-						.ToDictionary(g => g.Key, g => g.OrderByDescending(d => d.Similarity).FirstOrDefault(d => File.Exists(d.Path)));
-
-					var sw = System.Diagnostics.Stopwatch.StartNew();
-					foreach (var item in list) {
-						try {
-							if (!File.Exists(item.Path)) {
-								// Already gone — still remove the entry and database record.
-							}
-							else {
-								keeperByGroup.TryGetValue(item.GroupId, out var keeper);
-								if (keeper == null)
-									throw new IOException("no unselected file is left in this group to link to");
-								long size = Math.Max(0, item.SizeLong);
-								// The link target path must be free before the link can be created.
-								File.Delete(item.Path);
-								if (hardLinks)
-									HardLinkUtils.CreateHardLink(item.Path, keeper.Path);
-								else
-									File.CreateSymbolicLink(item.Path, keeper.Path);
-								result.FreedBytes += size;
-							}
-							_engine.Duplicates.Remove(item);
-							ScanEngine.RemoveFromDatabase(new FileEntry { Path = item.Path });
-							result.Done++;
-						}
-						catch (Exception ex) {
-							result.Errors.Add($"{Path.GetFileName(item.Path)}: {ex.Message}");
-							result.Failed++;
-						}
-						finally {
-							FileOpCurrent++;
-							if (sw.ElapsedMilliseconds >= 100) { sw.Restart(); Notify(); }
-						}
-					}
-					if (result.Done > 0)
-						ScanEngine.SaveDatabase();
-					DropSingletonGroups();
-				});
-			}
-			finally { EndFileOp(); }
-			return result;
-		}
+		public Task<FileOpResult> CreateLinksAsync(IEnumerable<DuplicateItem> items, bool hardLinks) =>
+			RemoveOrReplaceItemsAsync(items, permanent: true, createLinks: true, hardLinks);
 
 		/// <summary>Removes database entries for files that no longer exist or have errors.</summary>
 		public async Task<int> CleanDatabaseAsync() {
-			await ScanEngine.LoadDatabase();
-			int before = DatabaseEntryCount;
-			await Task.Run(() => _engine.CleanupDatabase());
-			return before - DatabaseEntryCount;
+			if (!TryBeginDataWork())
+				throw new InvalidOperationException("A scan or another file/database operation is running. Wait for it to finish.");
+			try {
+				if (!await LoadDatabaseWithResultsAuthorityAsync(Settings.CustomDatabaseFolder)) {
+					throw new IOException("The configured database could not be loaded; cleanup was not performed.");
+				}
+				int before = DatabaseEntryCount;
+				await Task.Run(() => DatabaseUtils.CleanupDatabase(preserveDeletedContentMemory: Settings.RememberDeletedContent));
+				return before - DatabaseEntryCount;
+			}
+			finally { EndDataWork(); }
 		}
 
 		/// <summary>Wipes all entries from the scan database.</summary>
 		public async Task ClearDatabaseAsync() {
-			await ScanEngine.LoadDatabase();
-			ScanEngine.ClearDatabase();
-			_engine.Duplicates.Clear();
-			Notify();
+			if (!TryBeginDataWork())
+				throw new InvalidOperationException("A scan or another file/database operation is running. Wait for it to finish.");
+			try {
+				if (!await LoadDatabaseWithResultsAuthorityAsync(Settings.CustomDatabaseFolder)) {
+					throw new IOException("The configured database could not be loaded; it was not cleared.");
+				}
+				ScanEngine.ClearDatabase();
+				_engine.Duplicates.Clear();
+				ClearCleanupSnapshots();
+			}
+			finally { EndDataWork(); }
 		}
 
 		/// <summary>Number of file entries currently stored in the scan database.</summary>
@@ -418,14 +409,23 @@ namespace VDF.Web.Services {
 		/// Runs the single-pair detection diagnostic with the current settings and
 		/// returns the step-by-step report. See <see cref="ScanEngine.TestFilePairAsync"/>.
 		/// </summary>
-		public Task<string> TestFilePairAsync(string fileA, string fileB) {
-			if (State == ScanState.Scanning || State == ScanState.Comparing)
-				return Task.FromResult("A scan is currently running. Wait for it to finish before running the file pair test.");
-			return _engine.TestFilePairAsync(fileA, fileB);
+		public async Task<string> TestFilePairAsync(string fileA, string fileB) {
+			if (!TryBeginDataWork())
+				return "A scan or another operation is running. Wait for it to finish before running the file pair test.";
+			try { return await _engine.TestFilePairAsync(fileA, fileB); }
+			finally { EndDataWork(); }
 		}
 
 		void Notify() => StateChanged?.Invoke();
 
-		public void Dispose() => _cts.Dispose();
+		public void Dispose() {
+			lock (_operationSync) {
+				if (_disposed) return;
+				_disposed = true;
+				_cts.Cancel();
+				if (!_scanStarting) _cts.Dispose();
+			}
+			_engine.Stop();
+		}
 	}
 }

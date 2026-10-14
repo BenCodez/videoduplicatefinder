@@ -24,7 +24,7 @@ namespace VDF.Core.Tests;
 // HashSet itself is not thread-safe, so serialize with the other DB-touching classes.
 [Collection("DatabaseUtils")]
 public class DatabaseCountTests : IDisposable {
-	readonly string root = @"C:\vdf-count-" + Guid.NewGuid().ToString("N");
+	readonly string root = Path.GetFullPath(Path.Combine(Path.GetTempPath(), "vdf-count-" + Guid.NewGuid().ToString("N")));
 	readonly List<FileEntry> added = new();
 
 	public void Dispose() {
@@ -46,10 +46,10 @@ public class DatabaseCountTests : IDisposable {
 	[Fact]
 	public void CountsOnlyEntriesUnderTheFolder() {
 		Add("a.mp4");
-		Add(@"sub\b.mp4");
+		Add(Path.Combine("sub", "b.mp4"));
 		var sibling = new FileEntry {
 			// Sibling folder that merely starts with the same text must not match.
-			_Path = root + @"X\d.mp4",
+			_Path = Path.Combine(root + "X", "d.mp4"),
 			Folder = root + "X",
 			FileSize = 1,
 		};
@@ -57,7 +57,7 @@ public class DatabaseCountTests : IDisposable {
 		added.Add(sibling);
 
 		Assert.Equal(2, ScanEngine.CountDatabaseEntriesUnder(root));
-		Assert.Equal(2, ScanEngine.CountDatabaseEntriesUnder(root + @"\"));
+		Assert.Equal(2, ScanEngine.CountDatabaseEntriesUnder(root + Path.DirectorySeparatorChar));
 		Assert.Equal(1, ScanEngine.CountDatabaseEntriesUnder(root + "X"));
 	}
 
@@ -65,7 +65,7 @@ public class DatabaseCountTests : IDisposable {
 	public void EmptyOrUnknownFolder_CountsZero() {
 		Add("a.mp4");
 
-		Assert.Equal(0, ScanEngine.CountDatabaseEntriesUnder(@"D:\vdf-count-elsewhere-" + Guid.NewGuid().ToString("N")));
+		Assert.Equal(0, ScanEngine.CountDatabaseEntriesUnder(Path.Combine(Path.GetTempPath(), "vdf-count-elsewhere-" + Guid.NewGuid().ToString("N"))));
 		Assert.Equal(0, ScanEngine.CountDatabaseEntriesUnder(""));
 	}
 }

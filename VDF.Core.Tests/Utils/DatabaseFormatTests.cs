@@ -247,8 +247,10 @@ public class DatabaseFormatTests {
 		}
 	}
 
-	[Fact]
-	public void TornTempFile_FallsBackToMainDatabase_NeverLoadsEmpty() {
+	[Theory]
+	[InlineData(false)]
+	[InlineData(true)]
+	public void TornTempFile_FallsBackToMainDatabase_NeverLoadsEmpty(bool emptyTemp) {
 		string dir = Path.Combine(Path.GetTempPath(), $"vdf-dbtorn-{Guid.NewGuid():N}");
 		Directory.CreateDirectory(dir);
 		try {
@@ -263,7 +265,7 @@ public class DatabaseFormatTests {
 			// … and a torn temp from a crash mid-save: valid magic, but the stream ends
 			// before any entry (let alone the terminator). LoadDatabase tries the temp
 			// first; it must discard it and recover the 3 real entries, not load empty.
-			File.WriteAllBytes(Path.Combine(dir, "ScannedFiles_new.db"), "VDFDB002"u8.ToArray());
+			File.WriteAllBytes(Path.Combine(dir, "ScannedFiles_new.db"), emptyTemp ? [] : "VDFDB002"u8.ToArray());
 
 			Assert.True(DatabaseUtils.LoadDatabase());
 			Assert.Equal(3, DatabaseUtils.Database.Count);

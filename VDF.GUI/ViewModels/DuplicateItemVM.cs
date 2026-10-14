@@ -15,6 +15,7 @@
 //
 
 using System.Diagnostics;
+using System.Linq;
 using System.Text.Json.Serialization;
 using System.Threading;
 using Avalonia;
@@ -33,6 +34,8 @@ namespace VDF.GUI.ViewModels {
 		/// <summary>The date the results show for this file, created or modified per the setting (#907).</summary>
 		[JsonIgnore]
 		public DateTime ShownDate => ResultsDates.Of(ItemInfo);
+		[JsonIgnore]
+		public DateTime ShownDisplayDate => ResultsDates.ForDisplay(ItemInfo);
 		readonly TimeProvider timeProvider;
 
 		//For JSON deserialization only
@@ -45,6 +48,7 @@ namespace VDF.GUI.ViewModels {
 
 		public DuplicateItemVM(DuplicateItem item) : this() {
 			ItemInfo = item;
+			AutomationFileSnapshot = VDF.Core.Review.FileIdentity.CaptureSnapshot(item.Path);
 			WireThumbnailUpdates();
 		}
 
@@ -53,7 +57,12 @@ namespace VDF.GUI.ViewModels {
 		// never be attached. Without it an explicit "load thumbnails" pass fills ItemInfo.ImageList
 		// but never writes the thumbnail pack, sets ThumbnailKey, or raises the UI, leaving restored
 		// rows blank forever (issue #775). Re-wire it once deserialization has populated ItemInfo.
-		public void OnDeserialized() => WireThumbnailUpdates();
+		public void OnDeserialized() {
+			// A results backup contains display metadata, not proof that the same file
+			// still occupies this path. Only the validated review journal restores checks.
+			Checked = false;
+			WireThumbnailUpdates();
+		}
 
 		void WireThumbnailUpdates() {
 			if (ItemInfo == null) return;
@@ -196,7 +205,92 @@ namespace VDF.GUI.ViewModels {
 
 		public bool Checked {
 			get;
-			set => this.RaiseAndSetIfChanged(ref field, value);
+			set {
+				if (value && !CanMarkForRemoval) return;
+				this.RaiseAndSetIfChanged(ref field, value);
+			}
+		}
+
+		[JsonIgnore]
+		internal int ExplicitSelectionVersion { get; private set; }
+
+		/// <summary>Record a deliberate comparer choice even when its checkbox already has that value.</summary>
+		internal bool ApplyManualSelection(bool remove) {
+			if (IsAutomationGroupIgnored || (remove && !CanMarkForRemoval)) return false;
+			bool unchanged = Checked == remove;
+			Checked = remove;
+			if (unchanged) {
+				ExplicitSelectionVersion++;
+				this.RaisePropertyChanged(nameof(ExplicitSelectionVersion));
+			}
+			return Checked == remove;
+		}
+
+		[JsonIgnore]
+		public bool ManuallyProtected { get; set; }
+		[JsonIgnore]
+		public VDF.Core.Selection.ReviewChoice ManualReviewChoice { get; set; }
+		[JsonIgnore]
+		public bool AutomaticallySelected { get; set; }
+		[JsonIgnore]
+		public string SelectionProfileApplied { get; set; } = string.Empty;
+		[JsonIgnore]
+		public bool IsProtected { get; internal set; }
+		[JsonIgnore]
+		public bool IsNfoFavourite { get; internal set; }
+		[JsonIgnore]
+		public bool ProtectionUncertain { get; internal set; }
+		[JsonIgnore]
+		public bool IsAutomationKeeper { get; internal set; }
+		[JsonIgnore]
+		public bool IsAutomationGroupIgnored { get; internal set; }
+		[JsonIgnore]
+		public bool RequiresAutomationReview { get; internal set; }
+		[JsonIgnore]
+		public string ProtectionReason { get; internal set; } = string.Empty;
+		[JsonIgnore]
+		public string SelectionReason { get; internal set; } = string.Empty;
+		[JsonIgnore]
+		public bool CanMarkForRemoval => !IsProtected && !ManuallyProtected && !IsAutomationGroupIgnored &&
+			ManualReviewChoice is not (VDF.Core.Selection.ReviewChoice.Ignore or VDF.Core.Selection.ReviewChoice.RejectGroup);
+		[JsonIgnore]
+		public string ReviewStatus => ProtectionUncertain ? "Protection needs review" : IsAutomationGroupIgnored && ManualReviewChoice is not (VDF.Core.Selection.ReviewChoice.Ignore or VDF.Core.Selection.ReviewChoice.RejectGroup) ? "Group ignored" :
+			ManualReviewChoice switch {
+				VDF.Core.Selection.ReviewChoice.Keep => "Manually kept",
+				VDF.Core.Selection.ReviewChoice.Remove => "Manually selected",
+				VDF.Core.Selection.ReviewChoice.Ignore => "Ignored",
+				VDF.Core.Selection.ReviewChoice.RejectGroup => "Group rejected",
+				_ => AutomaticallySelected ? "Automatically selected" : string.Empty
+			};
+		[JsonIgnore]
+		public bool HasReviewStatus => ReviewStatus.Length > 0;
+		[JsonIgnore]
+		public string AutomationTooltip => string.Join(Environment.NewLine,
+			new[] { ProtectionReason, SelectionReason, ReviewStatus }.Where(s => !string.IsNullOrWhiteSpace(s)).Distinct());
+		[JsonIgnore]
+		internal bool AutomationReviewRestored { get; set; }
+		[JsonIgnore]
+		internal int AutomationReviewVersion { get; set; }
+		[JsonIgnore]
+		internal int AutomationProtectionVersion { get; set; }
+		[JsonIgnore]
+		internal AutomationReviewBaseline? ObservedReview { get; set; }
+
+		[JsonIgnore]
+		internal bool AutomationSnapshotInvalid { get; set; }
+		[JsonIgnore]
+		internal VDF.Core.Review.FileIdentity? AutomationIdentity { get; set; }
+		[JsonIgnore]
+		internal VDF.Core.Review.FileSnapshot? AutomationFileSnapshot { get; set; }
+
+		internal void NotifyAutomationStateChanged() {
+			foreach (string name in new[] { nameof(ManuallyProtected), nameof(ManualReviewChoice),
+				nameof(AutomaticallySelected), nameof(IsProtected), nameof(IsNfoFavourite),
+				nameof(ProtectionUncertain), nameof(IsAutomationKeeper), nameof(RequiresAutomationReview),
+				nameof(IsAutomationGroupIgnored),
+				nameof(ProtectionReason), nameof(SelectionReason), nameof(CanMarkForRemoval),
+				nameof(ReviewStatus), nameof(HasReviewStatus), nameof(AutomationTooltip) })
+				this.RaisePropertyChanged(name);
 		}
 
 		/// <summary>Transient "Copied" badge next to the path after a deliberate copy click (#849).</summary>

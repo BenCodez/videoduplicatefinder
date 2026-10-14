@@ -68,24 +68,32 @@ namespace VDF.GUI.Tests {
 
 			using var encodeStarted = new ManualResetEventSlim();
 			using var releaseEncode = new ManualResetEventSlim();
-			var writer = Task.Run(() => pack.AppendIfMissing("slow", s => {
+			using var readerStarted = new ManualResetEventSlim();
+			// Blocking test gates need dedicated workers: a queued thread-pool reader
+			// can be delayed by unrelated tests even when the pack lock is available.
+			var writer = Task.Factory.StartNew(() => pack.AppendIfMissing("slow", s => {
 				encodeStarted.Set();
-				releaseEncode.Wait(TimeSpan.FromSeconds(10));
+				releaseEncode.Wait();
 				s.WriteByte(42);
-			}));
-			Assert.True(encodeStarted.Wait(TimeSpan.FromSeconds(5)));
-
-			var reader = Task.Run(() => pack.TryGetEntry("seed", out _, out _));
+			}), CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default);
+			Task<bool>? reader = null;
 			try {
+				Assert.True(encodeStarted.Wait(TimeSpan.FromSeconds(5)));
+				reader = Task.Factory.StartNew(() => {
+					readerStarted.Set();
+					return pack.TryGetEntry("seed", out _, out _);
+				}, CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default);
+				Assert.True(readerStarted.Wait(TimeSpan.FromSeconds(5)));
 				Assert.True(await reader.WaitAsync(TimeSpan.FromSeconds(2)));
 			}
 			catch (TimeoutException) {
-				releaseEncode.Set();
 				Assert.Fail("TryGetEntry blocked behind an in-progress encode — the encode is running inside the pack lock again");
 			}
-
-			releaseEncode.Set();
-			await writer.WaitAsync(TimeSpan.FromSeconds(5));
+			finally {
+				releaseEncode.Set();
+				await writer.WaitAsync(TimeSpan.FromSeconds(5));
+				if (reader != null) await reader.WaitAsync(TimeSpan.FromSeconds(5));
+			}
 			Assert.Equal(new byte[] { 42 }, ReadKey(pack, "slow"));
 		}
 

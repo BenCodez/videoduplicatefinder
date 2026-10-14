@@ -20,6 +20,7 @@ using System.IO;
 using System.Reflection.Metadata.Ecma335;
 using System.Runtime.InteropServices;
 using Microsoft.Win32.SafeHandles;
+using VDF.Core.Review;
 
 namespace VDF.Core.Utils {
 	/// <summary>
@@ -72,6 +73,10 @@ namespace VDF.Core.Utils {
 					throw new IOException($"Failed to create hard link '{linkPath}' -> '{existingFilePath}' (Win32 error {Marshal.GetLastPInvokeError()}). Note: hard links require both paths to be on the same volume.");
 				return;
 			}
+			if (OperatingSystem.IsLinux()) {
+				LinuxFileSystem.CreateHardLink(linkPath, existingFilePath);
+				return;
+			}
 			if (Mono.Unix.Native.Syscall.link(existingFilePath, linkPath) != 0)
 				throw new IOException($"Failed to create hard link '{linkPath}' -> '{existingFilePath}' (errno {Mono.Unix.Native.Stdlib.GetLastError()}). Note: hard links require both paths to be on the same filesystem.");
 		}
@@ -107,6 +112,9 @@ namespace VDF.Core.Utils {
 		}
 
 		static bool AreSameFilePosix(string filepath, string otherFilepath) {
+			if (OperatingSystem.IsLinux())
+				return IdentityReader.TryGetLinuxFileId(filepath, out var first, followLinks: true) &&
+					IdentityReader.TryGetLinuxFileId(otherFilepath, out var second, followLinks: true) && first == second;
 			if (Mono.Unix.Native.Syscall.stat(filepath, out var statA) != 0)
 				return false;
 			if (Mono.Unix.Native.Syscall.stat(otherFilepath, out var statB) != 0)

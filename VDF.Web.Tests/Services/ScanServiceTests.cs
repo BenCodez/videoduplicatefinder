@@ -23,6 +23,7 @@ namespace VDF.Web.Tests.Services;
 [Collection("WebSettingsOverride")]
 public sealed class ScanServiceTests : IDisposable {
 	readonly ScanService scan;
+	static readonly string EntryFolder = Path.GetFullPath(Path.Combine(Path.GetTempPath(), $"vdf-webtests-{Guid.NewGuid():N}"));
 
 	public ScanServiceTests() {
 		// Never read/write the developer's real web-settings.json.
@@ -37,7 +38,7 @@ public sealed class ScanServiceTests : IDisposable {
 	}
 
 	internal static FileEntry MakeEntry(string name) => new() {
-		_Path = @"C:\vdf-webtests\" + name,
+		_Path = Path.Combine(EntryFolder, name),
 		FileSize = 1000,
 		invalid = false,
 		IsImage = false,

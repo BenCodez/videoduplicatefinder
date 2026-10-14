@@ -30,6 +30,7 @@ namespace VDF.Core {
 		SilentAudioTrack = 128,      // File has audio but it's silent; fingerprint is all zeros and unusable
 		ReparsePoint = 256,          // File has FILE_ATTRIBUTE_REPARSE_POINT (symlink, junction, cloud placeholder)
 		ReparsePointChecked = 512,   // ReparsePoint has been populated; entries from older databases lack it
+		ExifCreationDate = 1024,     // Creation date is a timezone-less EXIF capture time
 
 		AllErrors = ThumbnailError | MetadataError | TooDark
 	}

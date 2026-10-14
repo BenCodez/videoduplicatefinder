@@ -186,6 +186,8 @@
                                 Command="{Binding ImportScanResultsFromFileCommand}"
                                 Header="{Binding Source={x:Static local:App.Lang}, Path=[MainWindow.Menu.ImportScanResults]}"
                                 IsEnabled="{Binding !IsScanning}" />
+                            <MenuItem Header="Selection, favourites and recovery…"
+                                Command="{Binding OpenAutomationSettingsCommand}" />
                             <Separator />
                             <!-- Database maintenance: disabled while a scan runs (same rule the
                                  old menu enforced by hiding the submenu) -->

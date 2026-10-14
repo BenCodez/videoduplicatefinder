@@ -386,9 +386,9 @@ namespace VDF.Core {
 						isScanning = false; // search-only: no StartCompare to clear it
 				}
 				else {
+					isScanning = false;
 					ScanAborted?.Invoke(this, new EventArgs());
 					Logger.Instance.Info(T("Log.ScanAborted"));
-					isScanning = false;
 				}
 			}
 			catch (Exception ex) {
@@ -770,6 +770,7 @@ namespace VDF.Core {
 					// Same bytes, just re-dated: keep the analysis and refresh the timestamps
 					// so the next scan doesn't re-verify.
 					dbEntry.DateCreated = fEntry.DateCreated;
+					dbEntry.Flags.Set(EntryFlags.ExifCreationDate, false);
 					dbEntry.DateModified = fEntry.DateModified;
 				}
 				else {
@@ -816,6 +817,7 @@ namespace VDF.Core {
 			DatabaseUtils.Database.Remove(match);
 			match.Path = fEntry.Path;
 			match.DateCreated = fEntry.DateCreated;
+			match.Flags.Set(EntryFlags.ExifCreationDate, false);
 			match.DateModified = fEntry.DateModified;
 			match.FileSize = fEntry.FileSize;
 			DatabaseUtils.Database.Add(match);
@@ -1062,6 +1064,9 @@ namespace VDF.Core {
 						// (which compares every historical entry) never spins up out-of-scope drives for a read.
 						if (entry.OsHash == null && IsInIncludeScope(entry))
 							entry.OsHash = OsHashUtils.TryCompute(entry.Path);
+
+						if (entry.IsImage && entry.grayBytes?.Count > 0)
+							RefreshImageCreationDate(entry, Settings.UseExifCreationDate);
 
 						if (Settings.IncludeMissingFiles && entry.grayBytes?.Count > 0) {
 							bool hasAllInformation = entry.IsImage && HasUsableCachedGray(entry, 0);
@@ -2947,8 +2952,30 @@ namespace VDF.Core {
 				embeddingSink.SubmitFrame(imageFile, 0, rgb);
 		}
 
+		internal static void RefreshImageCreationDate(FileEntry imageFile, bool useExifIfAvailable) {
+			var file = new FileInfo(imageFile.Path);
+			// Offline results keep their recorded date and provenance.
+			if (!file.Exists) return;
+			imageFile.DateCreated = file.CreationTimeUtc;
+			imageFile.Flags.Set(EntryFlags.ExifCreationDate, false);
+			if (!useExifIfAvailable) return;
+			if (ExifReader.TryGetDateTaken(imageFile.Path, out DateTime exifDate)) {
+				imageFile.DateCreated = exifDate;
+				imageFile.Flags.Set(EntryFlags.ExifCreationDate);
+			}
+			else {
+				string ext = file.Extension;
+				if (ext.Equals(".heic", StringComparison.OrdinalIgnoreCase) ||
+					ext.Equals(".heif", StringComparison.OrdinalIgnoreCase)) {
+					var creationTime = FFProbeEngine.GetCreationTime(imageFile.Path);
+					if (creationTime.HasValue) imageFile.DateCreated = creationTime.Value;
+				}
+			}
+		}
+
 		static bool GetGrayBytesFromImage(FileEntry imageFile, bool useExifIfAvailable, bool extendedLogging, AI.IEmbeddingFrameSink? embeddingSink = null) {
 			try {
+				RefreshImageCreationDate(imageFile, useExifIfAvailable);
 				// Decode through FFmpeg — the same pipeline videos use — so image and video
 				// gray bytes share identical grayscale conversion and scaling.
 				byte[]? grayBytes;
@@ -2999,23 +3026,6 @@ namespace VDF.Core {
 							new MediaInfo.StreamInfo {Height = height, Width = width}
 						}
 				};
-
-				// Extract EXIF capture date if enabled
-				if (useExifIfAvailable) {
-					if (ExifReader.TryGetDateTaken(imageFile.Path, out DateTime exifDate)) {
-						imageFile.DateCreated = exifDate;
-					}
-					else {
-						// HEIC/HEIF carry the date in the container instead; read it via FFprobe.
-						string ext = Path.GetExtension(imageFile.Path);
-						if (ext.Equals(".heic", StringComparison.OrdinalIgnoreCase) ||
-							ext.Equals(".heif", StringComparison.OrdinalIgnoreCase)) {
-							var creationTime = FFProbeEngine.GetCreationTime(imageFile.Path);
-							if (creationTime.HasValue)
-								imageFile.DateCreated = creationTime.Value;
-						}
-					}
-				}
 
 				if (!GrayBytesUtils.VerifyGrayScaleValues(grayBytes)) {
 					imageFile.Flags.Set(EntryFlags.TooDark);
@@ -3115,19 +3125,18 @@ namespace VDF.Core {
 
 		public void Stop() {
 			Logger.Instance.Info("Scan stopped by user");
-			if (isScanning)
-				cancelationTokenSource.Cancel();
+			if (!isScanning) {
+				// No worker is alive to acknowledge Stop. Active workers signal their own
+				// completion after cancellation; emitting early permits an overlapping scan.
+				ScanAborted?.Invoke(this, EventArgs.Empty);
+				return;
+			}
+			cancelationTokenSource.Cancel();
 			// Cancel before resuming: workers parked in WaitWhilePaused observe the
 			// cancelled token and throw instead of waking up and fully processing one
 			// more file each (with a dead token that would poison its results).
 			if (pauseTokenSource.IsPaused)
 				Resume();
-			else
-				// No scan task is alive to observe the cancellation, so nothing would ever
-				// raise ScanAborted. A frontend that still believes a scan is running (its
-				// Stop was clickable) would otherwise wait on its busy overlay forever (#821)
-				// — tell it the scan is over so it can reset.
-				ScanAborted?.Invoke(this, new EventArgs());
 		}
 	}
 }

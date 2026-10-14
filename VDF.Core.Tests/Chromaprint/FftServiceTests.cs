@@ -64,7 +64,7 @@ public class FftServiceTests {
 	}
 
 	[Fact]
-	public void Forward_PureSineWave_PeakAtExpectedBin() {
+	public void Forward_PureCosineWave_HasExpectedConjugatePeaks() {
 		// A pure cosine wave at bin k should produce energy only at bins k and N-k
 		int n = 16;
 		int targetBin = 3;
@@ -76,18 +76,15 @@ public class FftServiceTests {
 
 		FftService.Forward(re, im);
 
-		// Find the bin with maximum magnitude (excluding DC)
-		double maxMag = 0;
-		int maxBin = 0;
-		for (int k = 1; k < n; k++) {
+		// The two conjugate peaks both have amplitude N/2. Floating-point rounding
+		// may make either one marginally larger, so there is no unique ArgMax bin.
+		const double tolerance = 1e-10;
+		for (int k = 0; k < n; k++) {
 			double mag = Math.Sqrt(re[k] * re[k] + im[k] * im[k]);
-			if (mag > maxMag) {
-				maxMag = mag;
-				maxBin = k;
-			}
+			double expected = k == targetBin || k == n - targetBin ? n / 2.0 : 0.0;
+			Assert.True(Math.Abs(mag - expected) <= tolerance,
+				$"Bin {k}: magnitude {mag} should be {expected} within {tolerance}");
 		}
-
-		Assert.Equal(targetBin, maxBin);
 	}
 
 	[Fact]

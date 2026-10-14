@@ -25,10 +25,17 @@ namespace VDF.GUI.Tests;
 // the user found and deleted Settings.json by hand (issue #830, reported as "cannot
 // launch after switching language": the language switch is simply what rewrote the file).
 // Startup must survive any settings-file content.
+[Collection("Automation settings singleton")]
 public class SettingsLoadRecoveryTests : IDisposable {
 	readonly string dir = Directory.CreateTempSubdirectory("vdf-settings-tests-").FullName;
+	readonly string originalSettings = JsonSerializer.Serialize(SettingsFile.Instance, GuiJsonContext.Default.SettingsFile);
+	public SettingsLoadRecoveryTests() {
+		string baseline = WriteSettingsFile("baseline.json", JsonSerializer.Serialize(new SettingsFile { CustomDatabaseFolder = dir }, GuiJsonContext.Default.SettingsFile));
+		SettingsFile.LoadSettings(baseline);
+	}
 
 	public void Dispose() {
+		SettingsFile.LoadSettings(WriteSettingsFile("original.json", originalSettings));
 		SettingsFile.SetSettingsPath(null);
 		try { Directory.Delete(dir, recursive: true); }
 		catch { }
@@ -105,6 +112,60 @@ public class SettingsLoadRecoveryTests : IDisposable {
 		Assert.ThrowsAny<JsonException>(() => SettingsFile.LoadSettings(path));
 	}
 
+	[Theory]
+	[InlineData(false)]
+	[InlineData(true)]
+	public void ValidLegacyImportRecoversUnreadableActiveSettingsAndSavesWithObservedBaseline(bool sameStem) {
+		string active = Path.Combine(dir, "Settings.json");
+		SettingsFile.SetSettingsPath(active);
+		SettingsFile.SaveSettings();
+		File.WriteAllText(active, "{ unreadable synthetic settings");
+		SettingsFile.LoadSettingsAtStartup();
+		Assert.NotNull(SettingsFile.StartupLoadError);
+		string legacy = WriteSettingsFile(sameStem ? "Settings.xml" : "profile.xml", "<Settings><Percent>73</Percent></Settings>");
+
+		SettingsFile.LoadSettings(legacy);
+
+		Assert.Null(SettingsFile.StartupLoadError);
+		Assert.Equal(73, SettingsFile.Instance.Percent);
+		Assert.False(File.Exists(legacy));
+		SettingsFile.SaveSettings();
+		SettingsFile.LoadSettingsAtStartup();
+		Assert.Null(SettingsFile.StartupLoadError);
+		Assert.Equal(73, SettingsFile.Instance.Percent);
+		Assert.Equal("{ unreadable synthetic settings", File.ReadAllText(active + ".corrupt"));
+	}
+
+	[Fact]
+	public void LegacyImportAfterStartupFailureCannotOverwriteANewerActiveGeneration() {
+		string active = WriteSettingsFile("Settings.json", "{ unreadable synthetic settings");
+		SettingsFile.SetSettingsPath(active);
+		SettingsFile.LoadSettingsAtStartup();
+		string newer = JsonSerializer.Serialize(new SettingsFile { CustomDatabaseFolder = dir, Percent = 81 }, GuiJsonContext.Default.SettingsFile);
+		File.WriteAllText(active, newer);
+		string legacy = WriteSettingsFile("profile.xml", "<Settings><Percent>73</Percent></Settings>");
+		SettingsFile.LoadSettings(legacy);
+
+		Assert.Null(SettingsFile.StartupLoadError);
+		Assert.Throws<InvalidDataException>(() => SettingsFile.SaveSettings());
+		Assert.Equal(newer, File.ReadAllText(active));
+	}
+
+	[Fact]
+	public void FailedLegacyMigrationRetainsStartupGuardAndOriginalXml() {
+		string active = WriteSettingsFile("Settings.json", "{ unreadable synthetic settings");
+		SettingsFile.SetSettingsPath(active);
+		SettingsFile.LoadSettingsAtStartup();
+		string legacy = WriteSettingsFile("profile.xml", "<Settings><Percent>73</Percent></Settings>");
+		Directory.CreateDirectory(Path.ChangeExtension(legacy, "json"));
+
+		Assert.ThrowsAny<IOException>(() => SettingsFile.LoadSettings(legacy));
+		Assert.NotNull(SettingsFile.StartupLoadError);
+		Assert.True(File.Exists(legacy));
+		Assert.Throws<InvalidDataException>(() => SettingsFile.SaveSettings());
+		Assert.Equal("{ unreadable synthetic settings", File.ReadAllText(active));
+	}
+
 	[Fact]
 	public void ExplicitLoad_NullDocument_ThrowsInsteadOfClearingAllSettings() {
 		string path = WriteSettingsFile("import.json", "null");
@@ -129,7 +190,9 @@ public class SettingsLoadRecoveryTests : IDisposable {
 
 	[Fact]
 	public void OlderSettings_DarkModeSwitch_IsNotWrittenBack() {
-		string path = WriteSettingsFile("Settings.json", "{ \"DarkMode\": false }");
+		string path = WriteSettingsFile("Settings.json", JsonSerializer.Serialize(new Dictionary<string, object> {
+			["DarkMode"] = false, ["CustomDatabaseFolder"] = dir
+		}));
 		SettingsFile.LoadSettings(path);
 
 		SettingsFile.SaveSettings(path);

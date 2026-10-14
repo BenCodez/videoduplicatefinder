@@ -15,6 +15,8 @@
 //
 
 using Bunit;
+using Microsoft.AspNetCore.Components.RenderTree;
+using Microsoft.AspNetCore.Components.Web;
 using Microsoft.Extensions.DependencyInjection;
 using VDF.Web.Services;
 
@@ -109,4 +111,75 @@ public sealed class SettingsPageTests : BunitContext {
 		page.Find("input[min='48'][max='960']").Change("10");
 		Assert.Equal(48, webSettings.ThumbnailWidth);
 	}
+
+	[Theory]
+	[InlineData(false)]
+	[InlineData(true)]
+	public async Task MaintenanceControlsFollowBusyStateIncludingOpenConfirmation(bool confirmClear) {
+		var page = RenderPage();
+		if (confirmClear) MaintenanceButton(page, "Clear Database").Click();
+		string clearLabel = confirmClear ? "Yes, clear" : "Clear Database";
+		Assert.False(MaintenanceButton(page, "Clean Database").HasAttribute("disabled"));
+		Assert.False(MaintenanceButton(page, clearLabel).HasAttribute("disabled"));
+		var wait = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+		scan.PrepareScanAsync = (_, ct) => wait.Task.WaitAsync(ct);
+		var start = scan.StartScanAndCompare();
+		try {
+			page.WaitForAssertion(() => {
+				Assert.True(MaintenanceButton(page, "Clean Database").HasAttribute("disabled"));
+				Assert.True(MaintenanceButton(page, clearLabel).HasAttribute("disabled"));
+			});
+			Assert.Empty(page.FindAll(".done-msg"));
+		}
+		finally {
+			scan.Stop();
+			await start.WaitAsync(TimeSpan.FromSeconds(10));
+		}
+		page.WaitForAssertion(() => {
+			Assert.False(MaintenanceButton(page, "Clean Database").HasAttribute("disabled"));
+			Assert.False(MaintenanceButton(page, clearLabel).HasAttribute("disabled"));
+		});
+	}
+
+	[Theory]
+	[InlineData(false)]
+	[InlineData(true)]
+	public async Task QueuedMaintenanceDuringBusyWorkShowsFailureWithoutSuccess(bool clear) {
+		var page = RenderPage();
+		if (clear) MaintenanceButton(page, "Clear Database").Click();
+		string label = clear ? "Yes, clear" : "Clean Database";
+		// A click already sent by a browser can arrive after another session starts
+		// work, even though the next render disables the corresponding button.
+		ulong handler = ulong.Parse(MaintenanceButton(page, label).GetAttribute("blazor:onclick")!,
+			System.Globalization.CultureInfo.InvariantCulture);
+		var wait = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+		scan.PrepareScanAsync = (_, ct) => wait.Task.WaitAsync(ct);
+		var start = scan.StartScanAndCompare();
+		try {
+			page.WaitForAssertion(() => Assert.True(MaintenanceButton(page, label).HasAttribute("disabled")));
+			// Dispatch the queued browser event directly; normal DOM clicks reject
+			// the newly disabled button. This bunit API requires render-tree fields.
+#pragma warning disable BL0006
+			await page.InvokeAsync(() => Renderer.DispatchEventAsync(handler,
+				new EventFieldInfo { ComponentId = page.ComponentId }, new MouseEventArgs()));
+#pragma warning restore BL0006
+
+			page.WaitForAssertion(() => {
+				string message = page.Find(".aborted-msg").TextContent;
+				Assert.StartsWith(clear ? "Clear failed:" : "Cleanup failed:", message);
+				Assert.Contains("operation is running", message);
+			});
+			Assert.Empty(page.FindAll(".done-msg"));
+			Assert.DoesNotContain("Cleanup complete", page.Markup);
+			Assert.DoesNotContain("Database cleared", page.Markup);
+			Assert.True(scan.IsBusy);
+		}
+		finally {
+			scan.Stop();
+			await start.WaitAsync(TimeSpan.FromSeconds(10));
+		}
+	}
+
+	static AngleSharp.Dom.IElement MaintenanceButton(IRenderedComponent<VDF.Web.Components.Pages.Settings> page, string label) =>
+		page.FindAll("button").Single(button => button.TextContent == label);
 }

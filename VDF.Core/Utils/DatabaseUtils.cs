@@ -64,10 +64,18 @@ namespace VDF.Core.Utils {
 			if (databaseFile.Exists && databaseFile.Length == 0) //invalid data
 			{
 				databaseFile.Delete();
+				if (databaseFile.FullName == new FileInfo(TempDatabasePath).FullName)
+					return LoadDatabase(); // Preserve a valid primary after an empty interrupted save.
+				DbWrapper = new();
+				pendingFingerprintHealMarker = false;
 				MigrateImageHashesIfNeeded();
 				return true;
 			}
 			if (!databaseFile.Exists) {
+				// A successful load of a fresh folder establishes an empty database;
+				// it must not retain entries or deferred migrations from the old folder.
+				DbWrapper = new();
+				pendingFingerprintHealMarker = false;
 				MigrateImageHashesIfNeeded();
 				return true;
 			}

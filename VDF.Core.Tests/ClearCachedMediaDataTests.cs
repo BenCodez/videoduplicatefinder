@@ -20,17 +20,19 @@ using VDF.Core.Utils;
 namespace VDF.Core.Tests;
 
 public class ClearCachedMediaDataTests {
+	static readonly string MediaFolder = Path.GetFullPath(Path.Combine(Path.GetTempPath(), "vdf-cache-test-media"));
+	static readonly string ClipPath = Path.Combine(MediaFolder, "clip.mp4");
 
 	static FileEntry Populated() {
 		var entry = new FileEntry {
-			Folder = @"D:\media",
+			Folder = MediaFolder,
 			mediaInfo = new MediaInfo { Duration = TimeSpan.FromMinutes(2), Streams = Array.Empty<MediaInfo.StreamInfo>() },
 			FileSize = 1234,
 			DateCreated = new DateTime(2024, 1, 1),
 			OsHash = "abc123",
 			AudioFingerprint = new uint[] { 1, 2, 3 },
 		};
-		entry.Path = @"D:\media\clip.mp4";
+		entry.Path = ClipPath;
 		entry.grayBytes[0.25] = new byte[] { 1, 2 };
 		entry.PHashes[0.25] = 42UL;
 		entry.Flags.Set(EntryFlags.ThumbnailError | EntryFlags.MetadataError | EntryFlags.TooDark |
@@ -59,7 +61,8 @@ public class ClearCachedMediaDataTests {
 		entry.Flags.Set(EntryFlags.ManuallyExcluded | EntryFlags.IsImage | EntryFlags.ReparsePoint | EntryFlags.ReparsePointChecked);
 		entry.ClearCachedMediaData();
 
-		Assert.Equal(@"D:\media\clip.mp4", entry.Path);
+		Assert.Equal(ClipPath, entry.Path);
+		Assert.Equal(MediaFolder, entry.Folder);
 		Assert.Equal(1234, entry.FileSize);
 		Assert.Equal("abc123", entry.OsHash);
 		Assert.True(entry.IsManuallyExcluded);

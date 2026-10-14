@@ -466,11 +466,12 @@ namespace VDF.GUI.ViewModels {
 			var step = _pairFlow.Advance(decision);
 
 			if (step.CheckIndex >= 0 && step.CheckIndex < Items.Count) {
-				Items[step.CheckIndex].Item.Checked = true;
-				ShowMessage(string.Format(App.Lang["Comparer.CheckedMessage"], Items[step.CheckIndex].FileName), 1600);
+				if (Items[step.CheckIndex].Item.ApplyManualSelection(true))
+					ShowMessage(string.Format(App.Lang["Comparer.CheckedMessage"], Items[step.CheckIndex].FileName), 1600);
+				else ShowMessage("Protected or ignored media cannot be marked for removal.", 1600);
 			}
 			if (step.KeepIndex >= 0 && step.KeepIndex < Items.Count)
-				Items[step.KeepIndex].Item.Checked = false;
+				Items[step.KeepIndex].Item.ApplyManualSelection(false);
 
 			if (step.GroupFinished) {
 				if (CanNavigateGroups)

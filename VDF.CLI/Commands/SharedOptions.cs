@@ -81,7 +81,7 @@ namespace VDF.CLI.Commands {
 			DefaultValueFactory = _ => 0
 		};
 
-		internal static readonly Option<string?> Database = new("--db") {
+		internal static readonly Option<string?> Database = new("--db", "--state") {
 			Description = "Custom folder to store the scan database.",
 		};
 

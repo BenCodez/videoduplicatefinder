@@ -45,12 +45,16 @@ namespace VDF.CLI.Commands {
 			var deletePermanentOpt = new Option<bool>("--delete-permanent") {
 				Description = "Permanently delete files. WARNING: irreversible."
 			};
+			var stateOpt = new Option<string?>("--state", "--db") {
+				Description = "Explicit shared database/state folder containing protection settings and reviews. Required for deletion."
+			};
 
 			cmd.Options.Add(inputOpt);
 			cmd.Options.Add(strategyOpt);
 			cmd.Options.Add(dryRunOpt);
 			cmd.Options.Add(deleteOpt);
 			cmd.Options.Add(deletePermanentOpt);
+			cmd.Options.Add(stateOpt);
 
 			cmd.SetAction(async (parseResult, ct) => {
 				var inputFile = parseResult.GetValue(inputOpt)!;
@@ -84,7 +88,7 @@ namespace VDF.CLI.Commands {
 				bool doDelete = parseResult.GetValue(deleteOpt) || doPermanent;
 				bool dryRun = !doDelete || parseResult.GetValue(dryRunOpt);
 
-				int failed = await ExecuteDeletion(marked, dryRun, doPermanent);
+				int failed = await ExecuteDeletion(marked, dryRun, doPermanent, parseResult.GetValue(stateOpt), duplicates, ct);
 				return failed > 0 ? 1 : 0;
 			});
 
@@ -92,101 +96,39 @@ namespace VDF.CLI.Commands {
 		}
 
 		/// <summary>Returns the number of files that failed to delete (0 in dry-run).</summary>
-		internal static async Task<int> ExecuteDeletion(IReadOnlyList<DuplicateItem> marked, bool dryRun, bool permanent) {
+		internal static async Task<int> ExecuteDeletion(IReadOnlyList<DuplicateItem> marked, bool dryRun, bool permanent,
+			string? stateFolder = null, IReadOnlyList<DuplicateItem>? allItems = null, CancellationToken ct = default) {
 			if (marked.Count == 0) {
 				Console.Error.WriteLine("No files selected for deletion by the chosen strategy.");
 				return 0;
 			}
-
+			if (string.IsNullOrWhiteSpace(stateFolder)) {
+				if (!dryRun) {
+					Console.Error.WriteLine("Cleanup refused: --state (or --db) is required. Exported result paths do not identify protection state.");
+					return marked.Count;
+				}
+				Console.Error.WriteLine("Dry-run has no state context; protection and keeper checks are unverified. Supply --state to preview guarded cleanup.");
+				foreach (var item in marked) Console.WriteLine($"[dry-run] would delete: {item.Path}");
+				return 0;
+			}
+			if (allItems is null) {
+				Console.Error.WriteLine("Cleanup refused: complete duplicate groups are required to validate remaining keepers.");
+				return marked.Count;
+			}
+			try { await VDF.Core.Cleanup.CleanupProtectionPolicyStore.LoadAsync(stateFolder, ct); }
+			catch (Exception ex) when (ex is not OperationCanceledException) {
+				Console.Error.WriteLine($"Cleanup refused: {ex.Message}");
+				return marked.Count;
+			}
 			if (!dryRun) {
-				Console.Error.WriteLine();
-				Console.Error.WriteLine("WARNING: Automatic deletion is not recommended.");
-				Console.Error.WriteLine($"         {marked.Count} file(s) will be {(permanent ? "permanently deleted" : "moved to trash")}.");
-				Console.Error.WriteLine("         This action cannot be undone. Proceeding in 3 seconds... (Ctrl+C to abort)");
-				await Task.Delay(3000);
+				Console.Error.WriteLine($"WARNING: {marked.Count} candidate(s) will be {(permanent ? "permanently deleted" : "moved to trash")} only after live protection and keeper checks.");
+				Console.Error.WriteLine("Proceeding in 3 seconds... (Ctrl+C to abort)");
+				await Task.Delay(3000, ct);
 			}
-
-			int deleted = 0, failed = 0;
-			foreach (var item in marked) {
-				if (dryRun) {
-					Console.WriteLine($"[dry-run] would delete: {item.Path}");
-					continue;
-				}
-
-				try {
-					if (permanent) {
-						File.Delete(item.Path);
-					}
-					else {
-						MoveToTrash(item.Path);
-					}
-					Console.Error.WriteLine($"Deleted: {item.Path}");
-					deleted++;
-				}
-				catch (Exception ex) {
-					Console.Error.WriteLine($"Failed to delete '{item.Path}': {ex.Message}");
-					failed++;
-				}
-			}
-
-			if (!dryRun) {
-				Console.Error.WriteLine($"Done. {deleted} deleted, {failed} failed.");
-			}
-			else {
-				Console.Error.WriteLine($"[dry-run] {marked.Count} file(s) would be deleted. Use --delete or --delete-permanent to proceed.");
-			}
+			int failed = await GuardedDeletion.ExecuteAsync(marked, allItems, stateFolder, permanent, dryRun, ct);
+			Console.Error.WriteLine(dryRun ? $"[dry-run] {marked.Count - failed} verified removal candidate(s), {failed} refused." :
+				$"Done. {marked.Count - failed} deleted, {failed} refused or failed.");
 			return failed;
-		}
-
-		static void MoveToTrash(string path) {
-			// Microsoft.VisualBasic.FileIO.FileSystem.DeleteFile with recycle option is Windows-only.
-			// For cross-platform trash support we use a best-effort approach.
-			if (OperatingSystem.IsWindows()) {
-				Microsoft.VisualBasic.FileIO.FileSystem.DeleteFile(
-					path,
-					Microsoft.VisualBasic.FileIO.UIOption.OnlyErrorDialogs,
-					Microsoft.VisualBasic.FileIO.RecycleOption.SendToRecycleBin);
-			}
-			else if (OperatingSystem.IsLinux()) {
-				// XDG trash specification: move to ~/.local/share/Trash/files/
-				string trashDir = Path.Combine(
-					Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
-					".local", "share", "Trash", "files");
-				Directory.CreateDirectory(trashDir);
-				// Skip trash for cross-filesystem files (e.g. network shares) to avoid downloading
-				if (!VDF.Core.Utils.FileUtils.IsOnSameFileSystem(path, trashDir)) {
-					File.Delete(path);
-					return;
-				}
-				string dest = Path.Combine(trashDir, Path.GetFileName(path));
-				// Avoid overwriting existing trash entries
-				int n = 1;
-				while (File.Exists(dest))
-					dest = Path.Combine(trashDir, $"{Path.GetFileNameWithoutExtension(path)}_{n++}{Path.GetExtension(path)}");
-				File.Move(path, dest);
-			}
-			else if (OperatingSystem.IsMacOS()) {
-				// macOS: move to ~/.Trash/
-				string trashDir = Path.Combine(
-					Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
-					".Trash");
-				Directory.CreateDirectory(trashDir);
-				// Skip trash for cross-volume files to avoid cross-volume copy
-				if (!VDF.Core.Utils.FileUtils.IsOnSameFileSystem(path, trashDir)) {
-					File.Delete(path);
-					return;
-				}
-				string dest = Path.Combine(trashDir, Path.GetFileName(path));
-				int n = 1;
-				while (File.Exists(dest))
-					dest = Path.Combine(trashDir, $"{Path.GetFileNameWithoutExtension(path)}_{n++}{Path.GetExtension(path)}");
-				File.Move(path, dest);
-			}
-			else {
-				// Fallback: permanent delete with a warning
-				Console.Error.WriteLine($"Warning: trash not supported on this OS. Permanently deleting: {path}");
-				File.Delete(path);
-			}
 		}
 
 	}

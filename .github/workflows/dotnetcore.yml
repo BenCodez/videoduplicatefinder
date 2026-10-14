@@ -19,17 +19,33 @@ jobs:
       run: dotnet publish VDF.CLI/VDF.CLI.csproj -c Release -v q --self-contained -r win-x64
     - name: Build Web
       run: dotnet publish VDF.Web/VDF.Web.csproj -c Release -v q --self-contained -r win-x64
-    - name: Run Unit Tests
-      run: dotnet test VDF.Core.Tests/VDF.Core.Tests.csproj -c Release -v q
-    - name: Run CLI Tests
-      run: dotnet test VDF.CLI.Tests/VDF.CLI.Tests.csproj -c Release -v q
-    - name: Run GUI Tests
-      run: dotnet test VDF.GUI.Tests/VDF.GUI.Tests.csproj -c Release -v q
-    - name: Run GUI Headless Tests
-      run: dotnet test VDF.GUI.HeadlessTests/VDF.GUI.HeadlessTests.csproj -c Release -v q
-    - name: Run Web Tests
-      run: dotnet test VDF.Web.Tests/VDF.Web.Tests.csproj -c Release -v q
     - name: Install FFmpeg
       run: choco install ffmpeg -y --no-progress
+    - name: Run Unit Tests
+      run: dotnet test VDF.Core.Tests/VDF.Core.Tests.csproj -c Release -v q --logger "console;verbosity=normal"
+    - name: Run CLI Tests
+      run: dotnet test VDF.CLI.Tests/VDF.CLI.Tests.csproj -c Release -v q --logger "console;verbosity=normal"
+    - name: Run GUI Tests
+      run: dotnet test VDF.GUI.Tests/VDF.GUI.Tests.csproj -c Release -v q --logger "console;verbosity=normal"
+    - name: Repeat thumbnail reader concurrency regression
+      shell: pwsh
+      run: |
+        for ($iteration = 1; $iteration -le 10; $iteration++) {
+          Write-Host "Thumbnail reader concurrency iteration $iteration of 10"
+          dotnet test VDF.GUI.Tests/VDF.GUI.Tests.csproj -c Release --no-build --no-restore --filter "FullyQualifiedName~Readers_AreNotBlocked_WhileAWriterEncodes" --logger "console;verbosity=normal"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+        }
+    - name: Run GUI Headless Tests
+      run: dotnet test VDF.GUI.HeadlessTests/VDF.GUI.HeadlessTests.csproj -c Release -v q --logger "console;verbosity=normal"
+    - name: Run Web Tests
+      run: dotnet test VDF.Web.Tests/VDF.Web.Tests.csproj -c Release -v q --logger "console;verbosity=normal"
     - name: Run Integration Tests
       run: dotnet test VDF.IntegrationTests/VDF.IntegrationTests.csproj -c Release -v normal
+    - name: Repeat hardlink batch regressions
+      shell: pwsh
+      run: |
+        for ($iteration = 1; $iteration -le 10; $iteration++) {
+          Write-Host "Hardlink batch regression iteration $iteration of 10"
+          dotnet test VDF.GUI.HeadlessTests/VDF.GUI.HeadlessTests.csproj -c Release --no-build --no-restore --filter "FullyQualifiedName~HardLinkBatchRefreshes|FullyQualifiedName~CleanupBatchWithUncachedIdentitiesSkipsOnlyCompletedRows" --logger "console;verbosity=normal"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+        }

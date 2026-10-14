@@ -26,5 +26,6 @@ namespace VDF.Core {
 		// group with the same flag, which carries no information.
 		GrayscaleMatched = 8,
 		PHashMatched = 16,
+		ExifCreationDate = 32, // Creation date is a timezone-less EXIF capture time
 	};
 }

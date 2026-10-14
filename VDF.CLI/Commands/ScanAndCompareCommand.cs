@@ -73,7 +73,8 @@ namespace VDF.CLI.Commands {
 					bool doPermanent = parseResult.GetValue(deletePermanentOpt);
 					bool doDelete = parseResult.GetValue(deleteOpt) || doPermanent;
 					bool dryRun = !doDelete || parseResult.GetValue(dryRunOpt);
-					failed = await MarkCommand.ExecuteDeletion(marked, dryRun, doPermanent);
+					failed = await MarkCommand.ExecuteDeletion(marked, dryRun, doPermanent,
+						parseResult.GetValue(SharedOptions.Database), duplicates.ToList(), ct);
 				}
 
 				string output = ResultFormatter.Format(duplicates, format);

@@ -326,6 +326,11 @@
           </Button.Content>
           <Button.Flyout>
             <MenuFlyout>
+              <MenuItem Header="Apply configured keeper profile" Command="{Binding ApplyAutomationSelectionCommand}" IsEnabled="{Binding !IsAutomationWorking}" />
+              <MenuItem Header="Keep newest" Command="{Binding KeepNewestAutomationCommand}" IsEnabled="{Binding !IsAutomationWorking}" />
+              <MenuItem Header="Keep oldest" Command="{Binding KeepOldestAutomationCommand}" IsEnabled="{Binding !IsAutomationWorking}" />
+              <MenuItem Header="Configure selection, favourites and recovery…" Command="{Binding OpenAutomationSettingsCommand}" />
+              <Separator />
               <MenuItem IsEnabled="False" FontSize="11"
                   Header="{Binding Source={x:Static local:App.Lang}, Path=[Results.AutoSelect.PerGroup]}" />
               <MenuItem
@@ -641,6 +646,12 @@
                     Command="{Binding $parent[UserControl].((vm:MainWindowVM)DataContext).ToggleCheckboxCommand}"
                     Header="{Binding Source={x:Static local:App.Lang}, Path=[Results.Row.ToggleCheck]}"
                     InputGesture="{Binding Source={x:Static Settings:KeyboardShortcutManager.Instance}, Path=[ToggleCheckbox]}" />
+                <MenuItem Header="Keep this file" Command="{Binding $parent[UserControl].((vm:MainWindowVM)DataContext).KeepAutomationItemCommand}" CommandParameter="{Binding Item}" />
+                <MenuItem Header="Protect this file" Command="{Binding $parent[UserControl].((vm:MainWindowVM)DataContext).ProtectAutomationItemCommand}" CommandParameter="{Binding Item}" />
+                <MenuItem Header="Remove manual protection" Command="{Binding $parent[UserControl].((vm:MainWindowVM)DataContext).UnprotectAutomationItemCommand}" CommandParameter="{Binding Item}" IsVisible="{Binding Item.ManuallyProtected}" />
+                <MenuItem Header="Ignore this group" Command="{Binding $parent[UserControl].((vm:MainWindowVM)DataContext).IgnoreAutomationGroupCommand}" CommandParameter="{Binding Item}" />
+                <MenuItem Header="Reject this group" Command="{Binding $parent[UserControl].((vm:MainWindowVM)DataContext).RejectAutomationGroupCommand}" CommandParameter="{Binding Item}" />
+                <MenuItem Header="Reset review choices for this group" Command="{Binding $parent[UserControl].((vm:MainWindowVM)DataContext).ResetAutomationGroupReviewCommand}" CommandParameter="{Binding Item}" />
                 <!-- Both are mouse-only on the row itself: the details button cannot be
                      tabbed to inside a list, and the differences show on hover. -->
                 <MenuItem
@@ -688,6 +699,7 @@
                   DockPanel.Dock="Left"
                   Width="30"
                   VerticalAlignment="Center"
+                  IsEnabled="{Binding Item.CanMarkForRemoval}"
                   IsChecked="{Binding Item.Checked}">
                 <!-- "Mark for deletion: clip.mp4": a bare checkbox says nothing about what it marks -->
                 <AutomationProperties.Name>
@@ -868,7 +880,7 @@
                   </TextBlock>
                 </Border>
                 <TextBlock FontSize="11.5" Opacity="{DynamicResource VdfTextDim80Opacity}"
-                           Text="{Binding Item.ShownDate, Converter={StaticResource ExtraShortDateTimeConverter}}" />
+                           Text="{Binding Item.ShownDisplayDate, Converter={StaticResource ExtraShortDateTimeConverter}}" />
               </StackPanel>
               <!-- Duration · Resolution: ONE hover zone for both metrics — two stacked
                    zones flipped the display on tiny vertical mouse moves (#849) -->
@@ -923,6 +935,15 @@
                      the neighboring metadata columns. -->
                 <DockPanel LastChildFill="True">
                   <StackPanel DockPanel.Dock="Right" Orientation="Horizontal" Spacing="6" Margin="6,0,0,0">
+                  <Border Classes="hdrchip" IsVisible="{Binding Item.IsNfoFavourite}" ToolTip.Tip="{Binding Item.AutomationTooltip}">
+                    <TextBlock Text="Favourite" />
+                  </Border>
+                  <Border Classes="hdrchip" IsVisible="{Binding Item.IsProtected}" ToolTip.Tip="{Binding Item.AutomationTooltip}">
+                    <TextBlock Text="Protected" />
+                  </Border>
+                  <Border Classes="hdrchip" IsVisible="{Binding Item.IsAutomationKeeper}" ToolTip.Tip="{Binding Item.AutomationTooltip}">
+                    <TextBlock Text="Keeper" />
+                  </Border>
                   <!-- AI chip: pair found only by the AI embedding pass, not the classic
                        check. Lives with the badges — as a docked pseudo-column it shifted
                        every metadata cell on AI-matched rows out of alignment (#837). -->
@@ -962,7 +983,7 @@
                           ToolTip.Tip="{Binding Source={x:Static local:App.Lang}, Path=[DupList.OfflineTooltip]}">
                     <TextBlock Text="{Binding Source={x:Static local:App.Lang}, Path=[DupList.Offline]}"
                                FontSize="10" FontWeight="Bold"
-                               Foreground="{DynamicResource VdfMutedBrush}" />
+                               Foreground="{DynamicResource VdfMutedTextBrush}" />
                   </Border>
                   <!-- Tier-2 metadata: toggles the details panel under this row -->
                   <Button Classes="group-action" Padding="4,0" FontSize="12" Content="ⓘ"
@@ -1008,6 +1029,8 @@
                         Text="{Binding Item.ItemInfo.Path, Converter={StaticResource DirectoryPathConverter}}" />
                   </DockPanel>
                 </Border>
+                <TextBlock FontSize="11" Text="{Binding Item.ReviewStatus}" IsVisible="{Binding Item.HasReviewStatus}"
+                           TextTrimming="CharacterEllipsis" ToolTip.Tip="{Binding Item.AutomationTooltip}" />
               </StackPanel>
             </DockPanel>
           </Border>
@@ -1029,6 +1052,10 @@
                         CommandParameter="{Binding Item}" />
               </StackPanel>
               <WrapPanel>
+                <StackPanel Margin="0,0,26,2" MinWidth="180" MaxWidth="500">
+                  <TextBlock Classes="colheader" Text="Selection and protection" />
+                  <TextBlock FontSize="12" Text="{Binding Item.AutomationTooltip}" TextWrapping="Wrap" />
+                </StackPanel>
                 <StackPanel Margin="0,0,26,2" MinWidth="220">
                   <StackPanel Orientation="Horizontal">
                     <TextBlock Classes="colheader" IsVisible="{Binding !IsImage}"
@@ -1099,6 +1126,7 @@
                 <MenuItem
                     Command="{Binding DeleteCheckedItemsPermanentlyCommand}"
                     Header="{Binding Source={x:Static local:App.Lang}, Path=[MainWindow.ContextMenu.DeletePermanently]}" />
+                <MenuItem Header="Review quarantine…" Command="{Binding PreviewQuarantineCommand}" />
                 <Separator />
                 <MenuItem
                     Command="{Binding CopyCheckedItemsCommand}"
@@ -1181,6 +1209,7 @@
           <TextBlock FontSize="12" Opacity="{DynamicResource VdfTextFaintOpacity}">
             <Run Text="{Binding TotalSizeRemoved, Mode=OneWay}" /><Run Text=" " /><Run Text="{Binding Source={x:Static local:App.Lang}, Path=[Results.Status.RemovedSuffix]}" />
           </TextBlock>
+          <TextBlock FontSize="12" Text="{Binding AutomationStatus}" TextTrimming="CharacterEllipsis" MaxWidth="500" ToolTip.Tip="{Binding AutomationStatus}" />
         </StackPanel>
         <!-- determinate thumbnail-load progress (#791) -->
         <StackPanel DockPanel.Dock="Right" Orientation="Horizontal" Spacing="8"

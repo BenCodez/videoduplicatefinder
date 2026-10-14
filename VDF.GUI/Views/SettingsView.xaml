@@ -712,6 +712,12 @@
                 </StackPanel>
               </views:SettingRow>
 
+              <views:SettingRow Title="Selection, favourites and recovery"
+                  Description="Set numeric folder priorities, keeper profiles, NFO favourite protection and quarantine recovery."
+                  SearchTags="automation priority favourite favorite NFO quarantine keeper quality review protection newest oldest">
+                <Button Content="Configure selection and recovery…" Command="{Binding OpenAutomationSettingsCommand}" />
+              </views:SettingRow>
+
               <views:SettingRow
                   Title="{Binding Source={x:Static local:App.Lang}, Path=[MainWindow.Settings.SaveResultsOnExit]}"
                   Description="{Binding Source={x:Static local:App.Lang}, Path=[MainWindow.Settings.SaveResultsOnExitTooltip]}">
@@ -849,26 +855,102 @@
 
               <views:SettingRow
                   Title="{Binding Source={x:Static local:App.Lang}, Path=[MainWindow.Settings.EnableScheduledScan]}"
-                  Description="{Binding Source={x:Static local:App.Lang}, Path=[Settings.Row.ScheduledScan.Desc]}"
-                  SearchTags="schedule automatic daily">
+                  Description="Scans and compares while this application is running, including when the browser is closed. Review decisions are saved before replacing results."
+                  SearchTags="schedule automatic daily weekly periodic">
                 <ToggleSwitch Classes="plain"
                               IsChecked="{Binding Source={x:Static Settings:SettingsFile.Instance}, Path=EnableScheduledScan}" />
               </views:SettingRow>
 
+              <views:SettingRow Title="Schedule type"
+                  Description="Run daily, on selected weekdays, or periodically to reconcile files on network mounts."
+                  SearchTags="daily weekly interval reconciliation"
+                  IsEnabled="{Binding Source={x:Static Settings:SettingsFile.Instance}, Path=EnableScheduledScan}">
+                <ComboBox Width="220" ItemsSource="{Binding ScheduleKindOptions}" SelectedItem="{Binding SelectedScheduleKind}">
+                  <ComboBox.ItemTemplate>
+                    <DataTemplate x:DataType="vm:ScheduleKindOption"><TextBlock Text="{Binding Name}" /></DataTemplate>
+                  </ComboBox.ItemTemplate>
+                </ComboBox>
+              </views:SettingRow>
+
               <views:SettingRow
                   Title="{Binding Source={x:Static local:App.Lang}, Path=[Settings.Row.ScheduledScanTime.Title]}"
-                  Description="{Binding Source={x:Static local:App.Lang}, Path=[MainWindow.Settings.ScheduledScanTimeTooltip]}"
+                  Description="Daily and weekly start time, HH:mm, in the configured container/system timezone."
                   IsEnabled="{Binding Source={x:Static Settings:SettingsFile.Instance}, Path=EnableScheduledScan}">
                 <TextBox Width="90" HorizontalContentAlignment="Center"
+                         IsEnabled="{Binding ScheduleUsesCalendar}"
                          Text="{Binding Source={x:Static Settings:SettingsFile.Instance}, Path=ScheduledScanTime}" />
+              </views:SettingRow>
+
+              <views:SettingRow Title="Weekdays" Description="Choose the days used by the weekly schedule."
+                  SearchTags="weekly monday tuesday wednesday thursday friday saturday sunday"
+                  IsEnabled="{Binding Source={x:Static Settings:SettingsFile.Instance}, Path=EnableScheduledScan}">
+                <WrapPanel Width="310" IsEnabled="{Binding ScheduleUsesWeekdays}">
+                  <CheckBox Content="Mon" IsChecked="{Binding ScheduledMonday}" Margin="0,0,8,0" />
+                  <CheckBox Content="Tue" IsChecked="{Binding ScheduledTuesday}" Margin="0,0,8,0" />
+                  <CheckBox Content="Wed" IsChecked="{Binding ScheduledWednesday}" Margin="0,0,8,0" />
+                  <CheckBox Content="Thu" IsChecked="{Binding ScheduledThursday}" Margin="0,0,8,0" />
+                  <CheckBox Content="Fri" IsChecked="{Binding ScheduledFriday}" Margin="0,0,8,0" />
+                  <CheckBox Content="Sat" IsChecked="{Binding ScheduledSaturday}" Margin="0,0,8,0" />
+                  <CheckBox Content="Sun" IsChecked="{Binding ScheduledSunday}" />
+                </WrapPanel>
+              </views:SettingRow>
+
+              <views:SettingRow Title="Periodic interval (minutes)"
+                  Description="Reconcile every 5–10080 minutes. Unchanged files reuse the scan database and fingerprints."
+                  SearchTags="periodic incremental interval network mount"
+                  IsEnabled="{Binding Source={x:Static Settings:SettingsFile.Instance}, Path=EnableScheduledScan}">
+                <NumericUpDown Width="120" Minimum="5" Maximum="10080" Increment="5" FormatString="0"
+                    IsEnabled="{Binding ScheduleUsesInterval}"
+                    Value="{Binding Source={x:Static Settings:SettingsFile.Instance}, Path=ScheduledScanIntervalMinutes}" />
+              </views:SettingRow>
+
+              <views:SettingRow Title="Missed scan window (hours)"
+                  Description="After a restart or busy period, run the most recent missed slot once within this window. Claimed jobs are not replayed."
+                  SearchTags="restart catchup missed scan"
+                  IsEnabled="{Binding Source={x:Static Settings:SettingsFile.Instance}, Path=EnableScheduledScan}">
+                <NumericUpDown Width="120" Minimum="1" Maximum="168" Increment="1" FormatString="0"
+                    Value="{Binding Source={x:Static Settings:SettingsFile.Instance}, Path=ScheduledScanCatchUpHours}" />
+              </views:SettingRow>
+
+              <views:SettingRow Title="Scheduled scan profile"
+                  Description="Reuse a Setup scan profile or your current settings. Existing scan and comparison concurrency limits apply."
+                  SearchTags="scan profile resource concurrency"
+                  IsEnabled="{Binding Source={x:Static Settings:SettingsFile.Instance}, Path=EnableScheduledScan}">
+                <ComboBox Width="220" ItemsSource="{Binding ScheduledProfileOptions}" SelectedItem="{Binding SelectedScheduledProfile}">
+                  <ComboBox.ItemTemplate>
+                    <DataTemplate x:DataType="vm:ScheduledProfileOption"><TextBlock Text="{Binding Name}" /></DataTemplate>
+                  </ComboBox.ItemTemplate>
+                </ComboBox>
               </views:SettingRow>
 
               <views:SettingRow
                   Title="{Binding Source={x:Static local:App.Lang}, Path=[MainWindow.Settings.NotifyScheduledScanComplete]}"
-                  Description="{Binding Source={x:Static local:App.Lang}, Path=[Settings.Row.NotifyScheduled.Desc]}"
+                  Description="Show a desktop notification after a successful scheduled scan. Background scans never wait for a dialog."
                   IsEnabled="{Binding Source={x:Static Settings:SettingsFile.Instance}, Path=EnableScheduledScan}">
                 <ToggleSwitch Classes="plain"
                               IsChecked="{Binding Source={x:Static Settings:SettingsFile.Instance}, Path=NotifyOnScheduledScanComplete}" />
+              </views:SettingRow>
+
+              <views:SettingRow Title="Run now"
+                  Description="Scan and compare with the scheduled profile now. Automatic scanning only marks removal candidates; it never deletes files."
+                  SearchTags="run scheduled scan now">
+                <Button Content="Run now" Command="{Binding RunScheduledScanNowCommand}" />
+              </views:SettingRow>
+
+              <views:SettingRow Title="Next scheduled scan" Description="{Binding ScheduledTimezoneText}"
+                  SearchTags="next scan timezone status">
+                <TextBlock Width="270" TextWrapping="Wrap" Text="{Binding ScheduledNextScanText}" />
+              </views:SettingRow>
+              <views:SettingRow Title="Last scheduled scan" Description="Start time and outcome, retained across application restarts."
+                  SearchTags="last scan status failure cancellation">
+                <TextBlock Width="270" TextWrapping="Wrap" Text="{Binding ScheduledLastScanText}" />
+              </views:SettingRow>
+              <views:SettingRow Title="Duration and progress" Description="Elapsed time for the last scheduled scan; current scan progress is also shown on the scanning screen."
+                  SearchTags="duration elapsed scan progress">
+                <StackPanel Width="270">
+                  <TextBlock Text="{Binding ScheduledDurationText}" />
+                  <TextBlock IsVisible="{Binding IsScanning}" Text="{Binding ScanProgressCount}" />
+                </StackPanel>
               </views:SettingRow>
 
               <views:SettingRow

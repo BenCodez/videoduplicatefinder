@@ -31,7 +31,7 @@ static class MetadataCompareSample {
 		var wrong = new List<MetadataField> { C("creation_time", "2023-08-15T12:34:56Z"), C("com.apple.quicktime.creationdate", "2023-08-15T12:34:56"), C("location", "+48.1+011.5/") };
 		var right = new List<MetadataField> { C("creation_time", "2023-08-15T12:34:56Z"), C("com.apple.quicktime.creationdate", "2023-08-15T14:34:56+0200") };
 		var items = new[] { "IMG_0412.MOV", "IMG_0412 (1).MOV", "IMG_0412 (2).MOV", "IMG_0412 (3).MOV" }
-			.Select(name => new DuplicateItemVM(new DuplicateItem { Path = $@"Z:\does\not\exist\{name}" })).ToList();
+			.Select(name => new DuplicateItemVM(new DuplicateItem { Path = Path.Combine(ResultsFixture.RootFolder, "metadata", name) })).ToList();
 		var vm = new MetadataCompareVM(items);
 		vm.Apply(new IReadOnlyList<MetadataField>?[] { wrong, right, wrong, null });
 		return new MetadataCompareWindow(vm);
