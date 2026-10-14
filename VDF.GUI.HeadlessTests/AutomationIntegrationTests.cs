@@ -91,6 +91,7 @@ public sealed class AutomationIntegrationTests : IDisposable {
 		SettingsFile.Instance.AutomationSelection.AutoAfterScan = false;
 		try {
 			var vm = new MainWindowVM();
+			vm.Scanner.Settings.CustomDatabaseFolder = folder; // The scanner produced these results in this state.
 			var group = Guid.NewGuid();
 			for (int i = 0; i < 5000; i++) vm.Scanner.Duplicates.Add(new DuplicateItem {
 				Path = Path.Combine(folder, $"missing-{i}.mp4"), Folder = folder, GroupId = group, SizeLong = 1

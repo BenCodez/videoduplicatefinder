@@ -22,8 +22,10 @@ public sealed class QuarantinePreviewItem {
 
 public sealed class QuarantinePreviewVM : ReactiveObject {
 	readonly MainWindowVM host;
+	readonly MainWindowVM.ResultsStateAuthority authority;
 	public QuarantinePreviewVM(MainWindowVM host, IEnumerable<QuarantinePreviewItem> items, string destination) {
 		this.host = host;
+		authority = host.CaptureResultsStateAuthority();
 		Items = new(items);
 		Destination = destination;
 	}
@@ -44,7 +46,7 @@ public sealed class QuarantinePreviewVM : ReactiveObject {
 		if (!CanExecute) return;
 		IsWorking = true;
 		try {
-			Status = await host.ExecuteQuarantinePreviewAsync(Items.ToList(), Destination);
+			Status = await host.ExecuteQuarantinePreviewAsync(Items.ToList(), Destination, authority);
 			IsComplete = true;
 		}
 		catch (Exception ex) { Status = $"Quarantine failed: {ex.Message}"; }

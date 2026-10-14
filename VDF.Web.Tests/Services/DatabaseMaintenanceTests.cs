@@ -97,6 +97,53 @@ public sealed class DatabaseMaintenanceTests : IAsyncLifetime {
 	[Theory]
 	[InlineData(false)]
 	[InlineData(true)]
+	public async Task MoveRefusesBusyReviewWriterIncludingFirstInitialization(bool initialized) {
+		string reviews = Path.Combine(databaseA, "ReviewedFiles.json");
+		if (initialized) await new ReviewStore(reviews).SaveAsync([]);
+		var item = PublishResult();
+		string destination = Path.Combine(folder, "busy-review-move");
+		using (var writer = JournalWriteLease.Acquire(reviews)) {
+			var result = await scan.MoveItemsAsync([item], destination);
+			Assert.Equal(0, result.Done);
+			Assert.Equal(1, result.Failed);
+			Assert.NotEmpty(result.Errors);
+			Assert.False(Directory.Exists(destination));
+			Assert.True(File.Exists(mediaPath));
+			Assert.Contains(item, scan.Duplicates);
+			Assert.Equal(databaseABefore, File.ReadAllBytes(Path.Combine(databaseA, "ScannedFiles.db")));
+		}
+		var identity = Assert.IsType<FileIdentity>(FileIdentity.Capture(mediaPath));
+		await new ReviewStore(reviews).SaveAsync([new() { Identity = identity, ManuallyProtected = true }]);
+		var retry = await scan.MoveItemsAsync([item], destination);
+		Assert.Equal(0, retry.Done);
+		Assert.True(identity.MatchesCurrent());
+		Assert.False(Directory.Exists(destination));
+	}
+
+	[Fact]
+	public async Task MoveHoldsReviewLeaseThroughRenameAndReleasesItAfterCommit() {
+		var item = PublishResult();
+		string reviews = Path.Combine(databaseA, "ReviewedFiles.json");
+		string destination = Path.Combine(folder, "leased-move");
+		bool invoked = false;
+		scan.FileMover = (source, target) => {
+			invoked = true;
+			Assert.ThrowsAny<IOException>(() => {
+				using var competingWriter = JournalWriteLease.Acquire(reviews);
+			});
+			File.Move(source, target);
+		};
+		var result = await scan.MoveItemsAsync([item], destination);
+		Assert.True(invoked);
+		Assert.Equal(1, result.Done);
+		Assert.Equal(0, result.Failed);
+		using var released = JournalWriteLease.Acquire(reviews);
+		Assert.Equal(new byte[] { 1, 2, 3, 4 }, File.ReadAllBytes(Path.Combine(destination, Path.GetFileName(mediaPath))));
+	}
+
+	[Theory]
+	[InlineData(false)]
+	[InlineData(true)]
 	public async Task MoveAfterMaintenanceSwitchUpdatesOnlyTheResultsDatabase(bool malformedDatabaseB) {
 		var item = PublishResult();
 		string databaseBPath = Path.Combine(databaseB, "ScannedFiles.db");

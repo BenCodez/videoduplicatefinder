@@ -15,6 +15,7 @@ public sealed class QuarantineService {
     private readonly string _historyPath;
     internal Func<QuarantineCheckpoint, CancellationToken, Task>? CheckpointAsync { get; set; }
 	internal Func<string?, CancellationToken, Task>? ValidateProtectionAsync { get; set; }
+	internal Func<string, CancellationToken, Task<IDisposable>>? AcquireProtectionLeaseAsync { get; set; }
 	internal Func<FileIdentity, FileIdentity, FileIdentity, CancellationToken, Task>? RefreshRestoredProtectionAsync { get; set; }
 
     public QuarantineService(string historyPath) => _historyPath = SafePaths.Normalize(historyPath);
@@ -102,15 +103,18 @@ public sealed class QuarantineService {
                 var verifiedClaim = await FreshAsync(record.SourceStagingPath, ct).ConfigureAwait(false);
                 if (!record.Target.MatchesRelocated(verifiedClaim))
                     throw new IOException("The source claim changed; deletion was cancelled.");
-				if (ValidateProtectionAsync is not null) await ValidateProtectionAsync(record.SourceStagingPath, ct).ConfigureAwait(false);
-                if (!IdentityReader.MatchesCurrentSnapshot(record.Keeper))
-                    throw new IOException("The remaining keeper changed or lacks a reliable current filesystem snapshot.");
-                if (!IdentityReader.MatchesCurrentSnapshot(verifiedClaim!))
-                    throw new IOException("The source claim changed or lacks a reliable current filesystem snapshot.");
-                SafePaths.RequireRegularFile(record.SourceStagingPath);
-                ct.ThrowIfCancellationRequested();
-                File.Delete(record.SourceStagingPath);
-                deleted = true;
+				using (var protectionLease = AcquireProtectionLeaseAsync is null ? null :
+					await AcquireProtectionLeaseAsync(record.SourceStagingPath, ct).ConfigureAwait(false)) {
+					if (ValidateProtectionAsync is not null) await ValidateProtectionAsync(record.SourceStagingPath, ct).ConfigureAwait(false);
+                    if (!IdentityReader.MatchesCurrentSnapshot(record.Keeper))
+                        throw new IOException("The remaining keeper changed or lacks a reliable current filesystem snapshot.");
+                    if (!IdentityReader.MatchesCurrentSnapshot(verifiedClaim!))
+                        throw new IOException("The source claim changed or lacks a reliable current filesystem snapshot.");
+                    SafePaths.RequireRegularFile(record.SourceStagingPath);
+                    ct.ThrowIfCancellationRequested();
+                    File.Delete(record.SourceStagingPath);
+                    deleted = true;
+				}
                 DurableFileOperations.FlushDirectory(Path.GetDirectoryName(record.OriginalPath)!);
                 // Cancellation after this commit point must not report a rollback.
                 SetState(record, QuarantineState.Quarantined);
@@ -155,6 +159,10 @@ public sealed class QuarantineService {
                 throw new IOException("The quarantine copy is unavailable or has been replaced.");
             if (SafePaths.Exists(record.RestoringPath))
                 throw new IOException("An interrupted restore staging file exists; it was preserved.");
+            // A retained quarantine copy can be restored again after the previous
+            // destination is removed. Proof belongs to this attempt only.
+            record.RestoredIdentity = null;
+            record.RestoreClaimIdentity = null;
             SetState(record, QuarantineState.Restoring);
             await SaveAsync(records, ct).ConfigureAwait(false);
             bool committed = false;
@@ -164,17 +172,27 @@ public sealed class QuarantineService {
                 await Checkpoint(QuarantineCheckpoint.RestoreCopied, ct).ConfigureAwait(false);
                 if (!copy.Matches(await FreshAsync(record.QuarantinePath, ct).ConfigureAwait(false)))
                     throw new IOException("The quarantine copy changed during restore.");
+                record.RestoreClaimIdentity = await FreshAsync(record.RestoringPath, ct).ConfigureAwait(false);
+                if (record.RestoreClaimIdentity is null || !record.Target.HasSameBytes(record.RestoreClaimIdentity))
+                    throw new IOException("The restore staging file could not be verified; all copies were retained.");
+                // Persist the exact staging inode before its rename. Matching bytes
+                // at the destination alone cannot prove an interrupted commit.
+                await SaveAsync(records, ct).ConfigureAwait(false);
+                await Checkpoint(QuarantineCheckpoint.RestorePrepared, ct).ConfigureAwait(false);
                 SafePaths.RequireDirectory(Path.GetDirectoryName(record.OriginalPath)!);
                 SafePaths.RequireNoLinks(record.OriginalPath, true);
                 SafePaths.RequireRegularFile(record.RestoringPath);
+                if (!record.RestoreClaimIdentity.Matches(await FreshAsync(record.RestoringPath, ct).ConfigureAwait(false)))
+                    throw new IOException("The verified restore staging file changed before commit.");
                 ct.ThrowIfCancellationRequested();
                 // Set the local commit flag immediately after the rename so a
                 // directory flush failure cannot be reported as a rollback.
                 File.Move(record.RestoringPath, record.OriginalPath, false);
                 committed = true;
                 DurableFileOperations.FlushDirectory(Path.GetDirectoryName(record.OriginalPath)!);
+                await Checkpoint(QuarantineCheckpoint.RestoreRenamed, CancellationToken.None).ConfigureAwait(false);
                 record.RestoredIdentity = await FreshAsync(record.OriginalPath, CancellationToken.None).ConfigureAwait(false);
-                if (record.RestoredIdentity is null || !record.Target.HasSameBytes(record.RestoredIdentity))
+                if (record.RestoredIdentity is null || !record.RestoreClaimIdentity.MatchesRelocated(record.RestoredIdentity))
                     throw new IOException("The restored file could not be verified; the quarantine copy was retained.");
                 SetState(record, QuarantineState.Restored);
                 record.Error = string.Empty;
@@ -300,17 +318,18 @@ public sealed class QuarantineService {
         if (journal is null && SafePaths.Exists(_historyPath + ".bak"))
             throw new IOException("The current quarantine journal is missing; recovery is required before cleanup.");
         return journal?.Operations.Any(record =>
-            (record.ProtectionRefreshClaim is not null || record.State is QuarantineState.Prepared or QuarantineState.CopyReady or
-                QuarantineState.SourceClaimed or QuarantineState.NeedsAttention) &&
-            record.Target.StableFileId == identity.StableFileId &&
+                (record.ProtectionRefreshClaim is not null || record.State is QuarantineState.Prepared or QuarantineState.CopyReady or
+                QuarantineState.SourceClaimed or QuarantineState.Restoring or QuarantineState.NeedsAttention) &&
+            (record.Target.StableFileId == identity.StableFileId || record.RestoreClaimIdentity?.StableFileId == identity.StableFileId) &&
             (activeClaim is null || !SafePaths.Same(activeClaim, record.SourceStagingPath))) == true;
     }
 
     private bool ValidateEnvelope(QuarantineEnvelope envelope) {
-        if (envelope.Version is not (1 or QuarantineEnvelope.CurrentVersion))
+        if (envelope.Version is not (1 or 2 or QuarantineEnvelope.CurrentVersion))
             throw new NotSupportedException("The cleanup history schema is unsupported; it was preserved.");
         if (envelope.Operations is null) return false;
         if (envelope.Version == 1 && envelope.Operations.Any(record => record?.ProtectionRefreshClaim is not null)) return false;
+        if (envelope.Version < 3 && envelope.Operations.Any(record => record?.RestoreClaimIdentity is not null)) return false;
         var ids = new HashSet<string>(StringComparer.Ordinal);
         try {
             return envelope.Operations.All(record => record is not null && ids.Add(record.OperationId) &&
@@ -338,6 +357,9 @@ public sealed class QuarantineService {
                 SafePaths.Same(record.QuarantineIdentity.Path, record.QuarantinePath) && record.Target.HasSameBytes(record.QuarantineIdentity)) &&
             (record.RestoredIdentity is null || record.RestoredIdentity.IsWellFormed() &&
                 SafePaths.Same(record.RestoredIdentity.Path, record.OriginalPath) && record.Target.HasSameBytes(record.RestoredIdentity)) &&
+            (record.RestoreClaimIdentity is null || record.RestoreClaimIdentity.IsWellFormed() &&
+                SafePaths.Same(record.RestoreClaimIdentity.Path, record.RestoringPath) && record.Target.HasSameBytes(record.RestoreClaimIdentity) &&
+                (record.RestoredIdentity is null || record.RestoreClaimIdentity.MatchesRelocated(record.RestoredIdentity))) &&
             (record.ProtectionRefreshClaim is null || record.ProtectionRefreshClaim.IsWellFormed() &&
                 SafePaths.Same(record.ProtectionRefreshClaim.Path, record.SourceStagingPath) &&
                 record.Target.MatchesRelocated(record.ProtectionRefreshClaim));
@@ -353,13 +375,14 @@ public sealed class QuarantineService {
                 SafePaths.RequireNoLinks(record.OriginalPath, true);
                 if (record.State == QuarantineState.Restoring) {
                     var restored = await FreshAsync(record.OriginalPath, CancellationToken.None).ConfigureAwait(false);
-                    if (restored is not null && record.Target.HasSameBytes(restored)) {
+                    if (restored is not null && record.RestoreClaimIdentity?.MatchesRelocated(restored) == true &&
+                        !SafePaths.Exists(record.RestoringPath)) {
                         record.RestoredIdentity = restored;
                         SetState(record, QuarantineState.Restored);
                         record.Reason += " Recovered a completed restore; the quarantine recovery copy was retained.";
                     }
                     else {
-                        SetState(record, restored is null && !SafePaths.Exists(record.OriginalPath)
+                        SetState(record, restored is null && !SafePaths.Exists(record.OriginalPath) && !SafePaths.Exists(record.RestoringPath)
                             ? QuarantineState.Quarantined : QuarantineState.NeedsAttention);
                         record.Reason += " Interrupted restore was stopped; existing files and restore staging were retained.";
                     }
@@ -516,6 +539,7 @@ public sealed class QuarantineService {
         QuarantinePath = record.QuarantinePath, StagingPath = record.StagingPath,
         SourceStagingPath = record.SourceStagingPath, RestoringPath = record.RestoringPath,
         QuarantineIdentity = record.QuarantineIdentity, RestoredIdentity = record.RestoredIdentity,
+        RestoreClaimIdentity = record.RestoreClaimIdentity,
         ProtectionRefreshClaim = record.ProtectionRefreshClaim,
         State = record.State, ByteIdentical = record.ByteIdentical, Reason = record.Reason,
         Error = record.Error, SidecarsLeftInPlace = record.SidecarsLeftInPlace.ToList(),

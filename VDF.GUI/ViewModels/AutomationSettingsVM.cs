@@ -129,15 +129,22 @@ public sealed class AutomationSettingsVM : ReactiveObject {
 		finally { IsWorking = false; }
 	});
 	public ReactiveCommand<Unit, Unit> ReloadHistoryCommand => ReactiveCommand.CreateFromTask(ReloadHistoryAsync);
-	public ReactiveCommand<QuarantineRecord, Unit> RestoreQuarantineCommand => ReactiveCommand.CreateFromTask<QuarantineRecord>(async record => {
+	public ReactiveCommand<QuarantineRecord, Unit> RestoreQuarantineCommand => ReactiveCommand.CreateFromTask<QuarantineRecord>(async (record, cancellationToken) => {
 		if (record == null) return;
+		if (IsWorking) { Status = "Wait for the current settings operation to finish before restoring a file."; return; }
 		IsWorking = true;
 		try {
-			await QuarantineService().RestoreAsync(record.OperationId);
+			if (host != null) {
+				if (!await host.RestoreQuarantineAsync(record.OperationId, cancellationToken)) {
+					Status = "Wait for the current scan or operation to finish before restoring a file.";
+					return;
+				}
+			}
+			else await QuarantineService().RestoreAsync(record.OperationId, cancellationToken);
 			Status = $"Restored: {record.OriginalPath}. Rescan to include it in the results.";
 			await ReloadHistoryAsync();
-			if (host != null) await host.InitialiseAutomationReviewAsync();
 		}
+		catch (OperationCanceledException) { Status = "Restore cancelled."; }
 		catch (Exception ex) { Status = $"Restore failed: {ex.Message}"; }
 		finally { IsWorking = false; }
 	});

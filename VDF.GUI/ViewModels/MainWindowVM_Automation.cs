@@ -37,9 +37,37 @@ public partial class MainWindowVM {
 	CancellationTokenSource? reviewSaveDebounce;
 	Task reviewSaveTask = Task.CompletedTask;
 	int automaticReviewMutation;
-	public string AutomationReviewFile => Path.Combine(CoreUtils.ResolveDatabaseFolder(SettingsFile.Instance.CustomDatabaseFolder), "ReviewedFiles.json");
-	public string QuarantineHistoryFile => Path.Combine(CoreUtils.ResolveDatabaseFolder(SettingsFile.Instance.CustomDatabaseFolder), "QuarantineHistory.json");
-	public string AutomationSelectionPlanFile => Path.Combine(CoreUtils.ResolveDatabaseFolder(SettingsFile.Instance.CustomDatabaseFolder), "SelectionPlan.json");
+	// This binding belongs to a result generation, never to the editable settings.
+	// Collection resets used by filtering/grouping do not reset its authority.
+	internal sealed class ResultsStateAuthority(string folder) {
+		internal string Folder { get; } = folder;
+	}
+	ResultsStateAuthority? resultsStateAuthority;
+	string? pendingScanStateFolder;
+	static string NormalizeStateFolder(string folder) => Path.TrimEndingDirectorySeparator(Path.GetFullPath(folder));
+	static string CurrentResultsStateFolder => NormalizeStateFolder(CoreUtils.ResolveDatabaseFolder(SettingsFile.Instance.CustomDatabaseFolder));
+	string ResultsStateFolder => resultsStateAuthority?.Folder ?? CurrentResultsStateFolder;
+	internal ResultsStateAuthority CaptureResultsStateAuthority() => resultsStateAuthority ??= new(CurrentResultsStateFolder);
+	void BindResultsState(string folder) => resultsStateAuthority = new(NormalizeStateFolder(folder));
+	void ResetResultsState() => resultsStateAuthority = null;
+	bool CurrentFolderMatches(ResultsStateAuthority authority) {
+		string configured = SettingsFile.Instance.CustomDatabaseFolder;
+		string folder = string.IsNullOrWhiteSpace(configured) ? CoreUtils.ResolveDatabaseFolder(null) : configured;
+		return AutomationPathComparer.Equals(authority.Folder, NormalizeStateFolder(folder)) &&
+			AutomationPathComparer.Equals(authority.Folder, CurrentResultsStateFolder);
+	}
+	void RequireResultsGeneration(ResultsStateAuthority authority) {
+		if (!ReferenceEquals(resultsStateAuthority, authority))
+			throw new IOException("These results or this preview have been replaced. Create a new preview from the current results.");
+	}
+	internal void RequireCleanupAuthority(ResultsStateAuthority authority) {
+		RequireResultsGeneration(authority);
+		if (!CurrentFolderMatches(authority))
+			throw new IOException("The database folder changed after these results were produced. Restore the original folder or start a new scan/import before cleanup.");
+	}
+	public string AutomationReviewFile => Path.Combine(ResultsStateFolder, "ReviewedFiles.json");
+	public string QuarantineHistoryFile => Path.Combine(ResultsStateFolder, "QuarantineHistory.json");
+	public string AutomationSelectionPlanFile => Path.Combine(ResultsStateFolder, "SelectionPlan.json");
 	public string AutomationStatus {
 		get;
 		private set => this.RaiseAndSetIfChanged(ref field, value);
@@ -55,7 +83,7 @@ public partial class MainWindowVM {
 
 	/// <summary>Reserve startup before recovery yields, through database, results, and review loading.</summary>
 	public async Task LoadStartupStateAsync() {
-		if (IsStartupLoading) return;
+		if (ScanOrDataWorkActive) return;
 		IsStartupLoading = true;
 		IsBusy = true;
 		IsBusyOverlayText = "Recovering saved cleanup state...";
@@ -72,9 +100,16 @@ public partial class MainWindowVM {
 		InitializeScheduledScanning();
 	}
 
-	async Task<ReviewStore> GetAutomationReviewStoreAsync() {
-		await SettingsFile.ExportCleanupProtectionPolicyAsync();
-		string path = AutomationReviewFile;
+	async Task<ReviewStore> GetAutomationReviewStoreAsync(ResultsStateAuthority authority, bool savingReview = false) {
+		RequireResultsGeneration(authority);
+		// A pending A decision must still flush to A after selecting B. Do not
+		// project B's settings or initialize B's journal during that flush.
+		if (!savingReview || CurrentFolderMatches(authority)) {
+			RequireCleanupAuthority(authority);
+			await SettingsFile.ExportCleanupProtectionPolicyAsync();
+			RequireCleanupAuthority(authority);
+		}
+		string path = Path.Combine(authority.Folder, "ReviewedFiles.json");
 		if (automationReviewStore == null || !AutomationPathComparer.Equals(path, automationReviewStorePath)) {
 			automationReviewStorePath = path;
 			automationReviewStore = new ReviewStore(path);
@@ -83,6 +118,7 @@ public partial class MainWindowVM {
 		// Never repair a missing or corrupt current ledger from cached decisions
 		// before a cleanup or automatic review save can use those decisions.
 		await store.LoadForCleanupAsync();
+		RequireResultsGeneration(authority);
 		return store;
 	}
 
@@ -101,11 +137,13 @@ public partial class MainWindowVM {
 
 	/// <summary>Loads validated review decisions and current NFO/folder protections. File and NFO work runs off the UI thread.</summary>
 	public async Task<IReadOnlyDictionary<string, SelectionCandidate>> BuildAutomationCandidatesAsync() {
+		var authority = CaptureResultsStateAuthority();
+		RequireCleanupAuthority(authority);
 		var rows = Duplicates.Select(row => new AutomationRowSnapshot(row, row.AutomationReviewVersion,
 			row.AutomationReviewRestored, row.AutomationSnapshotInvalid, row.AutomationIdentity, row.AutomationFileSnapshot)).ToList();
 		var options = AutomationSettingsVM.CloneSelectionOptions(SettingsFile.Instance.AutomationSelection ?? new());
 		var nfoOptions = AutomationSettingsVM.CloneNfoOptions(SettingsFile.Instance.NfoFavourites ?? new());
-		var store = await GetAutomationReviewStoreAsync();
+		var store = await GetAutomationReviewStoreAsync(authority);
 		// Observe one immutable journal generation before inspection awaits. A
 		// debounced save may reload this store while filesystem work is pending.
 		var observed = store.Records.Select(record => AutomationReviewBaseline.Of(record)!)
@@ -133,6 +171,7 @@ public partial class MainWindowVM {
 		});
 
 		if (BeforeAutomationInspectionAppliedAsync is not null) await BeforeAutomationInspectionAppliedAsync();
+		RequireCleanupAuthority(authority);
 		var candidates = new Dictionary<string, SelectionCandidate>(AutomationPathComparer);
 		var liveRows = Duplicates.ToHashSet();
 		automaticReviewMutation++;
@@ -198,6 +237,7 @@ public partial class MainWindowVM {
 		}
 		finally { automaticReviewMutation--; }
 		var plan = await Task.Run(() => SelectionPlanner.BuildPlan(candidates.Values, options));
+		RequireCleanupAuthority(authority);
 		liveRows = Duplicates.ToHashSet();
 		automaticReviewMutation++;
 		try {
@@ -242,10 +282,46 @@ public partial class MainWindowVM {
 
 	public async Task InitialiseAutomationReviewAsync() => await RunAutomationSelectionAsync(false);
 
+	/// <summary>Reserve the host's operations before restore or protection refresh can yield.</summary>
+	internal async Task<bool> RestoreQuarantineAsync(string operationId, CancellationToken cancellationToken = default) {
+		if (ScanOrDataWorkActive || !scanRunGate.TryBegin()) return false;
+		bool cleanupReserved = false;
+		bool automationReserved = false;
+		bool workStarted = false;
+		CancellationTokenSource? restoreCancellation = null;
+		try {
+			cleanupReserved = cleanupOperationGate.Wait(0);
+			if (!cleanupReserved) return false;
+			automationReserved = automationWorkGate.Wait(0);
+			if (!automationReserved) return false;
+			cancellationToken.ThrowIfCancellationRequested();
+			workStarted = true;
+			IsBusy = true;
+			IsAutomationWorking = true;
+			this.RaisePropertyChanged(nameof(HasActiveScanRun));
+			IsBusyOverlayText = "Restoring quarantined file…";
+			restoreCancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, BeginCancelableBusyOperation());
+			var guard = new CleanupProtectionGuard(Path.GetDirectoryName(QuarantineHistoryFile)!);
+			await guard.CreateQuarantineService().RestoreAsync(operationId, restoreCancellation.Token);
+			await BuildAutomationCandidatesAsync();
+			await SaveAutomationReviewRecordsAsync();
+			return true;
+		}
+		finally {
+			if (workStarted) { EndCancelableBusyOperation(); IsAutomationWorking = false; IsBusy = false; }
+			restoreCancellation?.Dispose();
+			if (automationReserved) automationWorkGate.Release();
+			if (cleanupReserved) cleanupOperationGate.Release();
+			scanRunGate.Complete();
+			if (workStarted) this.RaisePropertyChanged(nameof(HasActiveScanRun));
+		}
+	}
+
 	async Task RunAutomationSelectionAsync(bool applySelection, SelectionProfile? profile = null, SelectionDateSource? dateSource = null, bool useHighlightedScope = true) {
 		await automationWorkGate.WaitAsync();
 		IsAutomationWorking = true;
 		try {
+			var authority = CaptureResultsStateAuthority();
 			SelectionPlan? planToSave = null;
 			var candidates = await BuildAutomationCandidatesAsync();
 			if (applySelection) {
@@ -257,6 +333,7 @@ public partial class MainWindowVM {
 				var scoped = candidates.Values.Where(c => selectedGroups == null || selectedGroups.Contains(c.Item.GroupId)).ToList();
 				var versions = Duplicates.ToDictionary(d => d.ItemInfo.Path, d => d.AutomationReviewVersion, AutomationPathComparer);
 				var plan = await Task.Run(() => SelectionPlanner.BuildPlan(scoped, options));
+				RequireCleanupAuthority(authority);
 				var changedGroups = Duplicates.Where(d => versions.TryGetValue(d.ItemInfo.Path, out int version) && version != d.AutomationReviewVersion)
 					.Select(d => d.ItemInfo.GroupId).ToHashSet();
 				if (changedGroups.Count > 0) plan.Decisions.RemoveAll(d => changedGroups.Contains(d.GroupId));
@@ -266,7 +343,10 @@ public partial class MainWindowVM {
 				AutomationStatus = $"{plan.Decisions.Count(d => d.RemoveCandidate)} removal candidates; estimated savings {plan.EstimatedSavings.BytesToString()}. Review before cleanup.";
 			}
 			await SaveAutomationReviewRecordsAsync();
-			if (planToSave != null) await SelectionPlanStore.SaveAsync(AutomationSelectionPlanFile, planToSave);
+			if (planToSave != null) {
+				RequireCleanupAuthority(authority);
+				await SelectionPlanStore.SaveAsync(Path.Combine(authority.Folder, "SelectionPlan.json"), planToSave);
+			}
 		}
 		catch (Exception ex) {
 			AutomationStatus = $"Selection/review could not be completed: {ex.Message}";
@@ -396,9 +476,10 @@ public partial class MainWindowVM {
 	internal Func<Task>? BeforeAutomationReviewReconciliationAsync { get; set; }
 
 	public async Task SaveAutomationReviewRecordsAsync() {
+		var authority = CaptureResultsStateAuthority();
 		await automationReviewSaveGate.WaitAsync();
 		try {
-			var store = await GetAutomationReviewStoreAsync();
+			var store = await GetAutomationReviewStoreAsync(authority, savingReview: true);
 			var snapshot = Duplicates.Where(d => d.ManuallyProtected || d.ManualReviewChoice != ReviewChoice.None ||
 				d.AutomaticallySelected || d.IsAutomationKeeper || d.AutomationIdentity != null)
 				.Select(d => (Row: d, Path: d.ItemInfo.Path, Baseline: d.ObservedReview,
@@ -420,8 +501,10 @@ public partial class MainWindowVM {
 						Reason = entry.State.Row.SelectionReason, UpdatedUtc = DateTime.UtcNow
 					})).ToList();
 			if (BeforeAutomationReviewCommitAsync is not null) await BeforeAutomationReviewCommitAsync();
+			RequireResultsGeneration(authority);
 			var conflicts = new HashSet<DuplicateItemVM>();
 			var committed = await store.UpdateWithSnapshotAsync(current => {
+				RequireResultsGeneration(authority);
 				var merged = current.ToDictionary(record => record.Identity.Path, AutomationPathComparer);
 				foreach (var update in updates) {
 					merged.TryGetValue(update.Record.Identity.Path, out var existing);
@@ -434,6 +517,7 @@ public partial class MainWindowVM {
 				return merged.Values;
 			});
 			if (BeforeAutomationReviewReconciliationAsync is not null) await BeforeAutomationReviewReconciliationAsync();
+			RequireResultsGeneration(authority);
 			var committedByPath = committed.ToDictionary(record => record.Identity.Path, AutomationPathComparer);
 			automaticReviewMutation++;
 			try {

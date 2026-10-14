@@ -308,9 +308,14 @@ public sealed class CleanupSafetyTests : IAsyncLifetime {
 
 		Assert.Equal(1, moved.Done);
 		Assert.Equal(0, moved.Failed);
-		Assert.False(File.Exists(Path.Combine(stateFolder, "ReviewedFiles.json")));
+		var reviews = new ReviewStore(Path.Combine(stateFolder, "ReviewedFiles.json"));
+		await reviews.LoadAsync();
+		Assert.Empty(reviews.Records);
+		Assert.False(File.Exists(Path.Combine(stateFolder, CleanupProtectionPolicyStore.FileName)));
 		AssertRetained(await scan.DeleteItemsAsync([alias], permanent: true), alias, keeper);
-		Assert.False(File.Exists(Path.Combine(stateFolder, "ReviewedFiles.json")));
+		await reviews.LoadAsync();
+		Assert.Empty(reviews.Records);
+		Assert.False(File.Exists(Path.Combine(stateFolder, CleanupProtectionPolicyStore.FileName)));
 		Assert.True(HardLinkUtils.AreSameFile(aliasPath, Path.Combine(destination, Path.GetFileName(target.Path))));
 	}
 

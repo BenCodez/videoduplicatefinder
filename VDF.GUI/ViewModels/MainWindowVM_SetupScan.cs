@@ -122,6 +122,7 @@ namespace VDF.GUI.ViewModels {
 
 		internal void DiscardResultsToSetup() {
 			Duplicates.Clear(); // Reset event → checked counters/undo stack clear + state raise
+			ResetResultsState();
 			ShowNoDuplicatesNotice = false;
 			BuildActiveResultsView();
 			RefreshGroupStats();

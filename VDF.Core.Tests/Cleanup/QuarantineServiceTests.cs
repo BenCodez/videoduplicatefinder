@@ -260,7 +260,7 @@ public sealed class QuarantineServiceTests : IDisposable {
     }
 
     [Fact]
-    public async Task VersionOneHistory_IsRecoveredAndMigratedToVersionTwo() {
+    public async Task VersionOneHistory_IsRecoveredAndMigratedToCurrentVersion() {
         var pair = await PairAsync();
         var operation = MakeRecord(pair, QuarantineState.SourceClaimed);
         File.Move(pair.Target.Path, operation.SourceStagingPath);
@@ -358,9 +358,12 @@ public sealed class QuarantineServiceTests : IDisposable {
         var pair = await PairAsync();
         var service = new QuarantineService(History);
         var operation = await service.QuarantineAsync(pair.Target, pair.Keeper, Destination);
-        File.Copy(operation.QuarantinePath, pair.Target.Path);
+        File.Copy(operation.QuarantinePath, operation.RestoringPath);
+        File.SetLastWriteTimeUtc(operation.RestoringPath, pair.Target.LastWriteUtc);
+        operation.RestoreClaimIdentity = FileIdentity.Capture(operation.RestoringPath)!;
         operation.State = QuarantineState.Restoring;
         await WriteJournalAsync(operation);
+        File.Move(operation.RestoringPath, pair.Target.Path);
         var recovered = Assert.Single(await service.HistoryAsync());
         Assert.Equal(QuarantineState.Restored, recovered.State);
         Assert.True(File.Exists(pair.Target.Path));
@@ -481,10 +484,13 @@ public sealed class QuarantineServiceTests : IDisposable {
         var pair = await PairAsync();
         var service = new QuarantineService(History);
         var operation = await service.QuarantineAsync(pair.Target, pair.Keeper, Destination);
+        File.Copy(operation.QuarantinePath, operation.RestoringPath);
+        File.SetLastWriteTimeUtc(operation.RestoringPath, pair.Target.LastWriteUtc);
+        operation.RestoreClaimIdentity = FileIdentity.Capture(operation.RestoringPath)!;
         operation.State = QuarantineState.Restoring;
         await DurableJsonFile.WriteAsync(History, new QuarantineEnvelope { Operations = new() { operation } },
             CleanupJsonContext.Default.QuarantineEnvelope, envelope => envelope.Version == QuarantineEnvelope.CurrentVersion);
-        File.Copy(operation.QuarantinePath, pair.Target.Path); // Restore committed before the final state save.
+        File.Move(operation.RestoringPath, pair.Target.Path); // Verified staging rename committed before the final state save.
         await File.WriteAllTextAsync(History, "{ corrupt current primary");
         var recovered = Assert.Single(await service.HistoryAsync());
         Assert.Equal(QuarantineState.Restored, recovered.State);

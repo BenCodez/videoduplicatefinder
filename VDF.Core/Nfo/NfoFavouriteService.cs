@@ -33,6 +33,8 @@ public sealed class NfoFavouriteService {
 	// Used to check the explicitly required cache/large-directory behavior in tests.
 	internal long ParseCount => Interlocked.Read(ref _parseCount);
 	internal long DirectoryEnumerationCount => Interlocked.Read(ref _directoryEnumerationCount);
+	internal int CachedDirectoryCount { get { lock (_cacheGate) return _directories.Count; } }
+	internal int CachedSidecarCount { get { lock (_cacheGate) return _directories.Cost; } }
 
 	/// <summary>
 	/// Clears directory association snapshots and parsed XML. Call at the beginning
@@ -170,8 +172,7 @@ public sealed class NfoFavouriteService {
 	DirectorySnapshot GetDirectory(string path) {
 		DateTime stamp;
 		try {
-			if ((File.GetAttributes(path) & FileAttributes.Directory) == 0)
-				return DirectorySnapshot.Uncertain("The NFO directory is unavailable.");
+			SafePaths.RequireDirectory(path);
 			stamp = Directory.GetLastWriteTimeUtc(path);
 		}
 		catch (Exception ex) when (IsFileError(ex)) {
@@ -189,7 +190,7 @@ public sealed class NfoFavouriteService {
 		DirectorySnapshot snapshot = entry.Snapshot.Value;
 		lock (_cacheGate) {
 			if (_directories.TryGet(path, out DirectoryCacheEntry? current) && ReferenceEquals(current, entry))
-				_directories.Set(path, entry, Math.Clamp(snapshot.SidecarCount, 1, MaximumCachedSidecars));
+				_directories.Set(path, entry, Math.Max(snapshot.SidecarCount, 1));
 		}
 		return snapshot;
 	}
@@ -211,12 +212,15 @@ public sealed class NfoFavouriteService {
 					return DirectorySnapshot.Uncertain("The NFO directory exceeds the inspection limit; favourite status is uncertain.");
 				if ((file.Attributes & FileAttributes.Directory) != 0) continue;
 				string extension = Path.GetExtension(file.Name);
+				if (extension.Equals(".nfo", StringComparison.OrdinalIgnoreCase) || FileUtils.IsVideoExtension(extension))
+					SafePaths.RequireRegularFile(file.FullName);
 				if (extension.Equals(".nfo", StringComparison.OrdinalIgnoreCase)) nfos.Add(file.FullName);
 				if (FileUtils.IsVideoExtension(extension)) {
 					videoCount = Math.Min(2, videoCount + 1);
 					soleVideo = videoCount == 1 ? file.FullName : null;
 				}
 			}
+			SafePaths.RequireDirectory(path);
 			if (Directory.GetLastWriteTimeUtc(path) != initialStamp)
 				return DirectorySnapshot.Uncertain("The NFO directory changed during inspection; favourite status is uncertain.");
 			nfos.Sort(StringComparer.Ordinal);
@@ -235,9 +239,9 @@ public sealed class NfoFavouriteService {
 	ParseResult ReadNfo(string path, MarkerOptions options) {
 		byte[] bytes;
 		try {
+			using var file = NfoFileReader.Open(path);
+			FileStream stream = file.Stream;
 			// An extra byte detects growth beyond the limit without an unbounded read.
-			using var stream = new FileStream(path, FileMode.Open, FileAccess.Read,
-				FileShare.ReadWrite | FileShare.Delete, 4096, FileOptions.SequentialScan);
 			if (stream.Length > MaximumNfoBytes)
 				return new(false, true, "NFO exceeds the size limit; favourite status is uncertain.");
 			using var buffer = new MemoryStream();
@@ -249,6 +253,7 @@ public sealed class NfoFavouriteService {
 					return new(false, true, "NFO exceeds the size limit; favourite status is uncertain.");
 			}
 			bytes = buffer.ToArray();
+			file.RequireUnchanged();
 		}
 		catch (Exception ex) when (IsFileError(ex)) {
 			return new(false, true, "NFO could not be read; favourite status is uncertain.");
@@ -319,7 +324,8 @@ public sealed class NfoFavouriteService {
 			sawMarker ? "no positive favourite marker in the configured elements." : "no recognized favourite marker.");
 	}
 
-	static bool IsFileError(Exception ex) => ex is IOException or UnauthorizedAccessException or System.Security.SecurityException;
+	static bool IsFileError(Exception ex) => ex is IOException or UnauthorizedAccessException or
+		System.Security.SecurityException or NotSupportedException or DllNotFoundException or EntryPointNotFoundException;
 
 	sealed record DirectorySnapshot(IReadOnlyDictionary<string, string[]> ByBaseName, string[] MovieNfos,
 		string[] SeriesNfos, string[] SeasonNfos, int SidecarCount, int VideoCount, string? SoleVideo,
@@ -359,6 +365,8 @@ public sealed class NfoFavouriteService {
 		readonly Dictionary<string, (T Value, LinkedListNode<string> Node, int Cost)> _entries = new(comparer);
 		readonly LinkedList<string> _order = new();
 		int _cost;
+		public int Count => _entries.Count;
+		public int Cost => _cost;
 		public bool TryGet(string key, out T value) {
 			if (!_entries.TryGetValue(key, out var entry)) {
 				value = default!;
@@ -373,7 +381,11 @@ public sealed class NfoFavouriteService {
 			if (_entries.TryGetValue(key, out var existing)) {
 				_order.Remove(existing.Node);
 				_cost -= existing.Cost;
+				_entries.Remove(key);
 			}
+			// An oversized snapshot can be inspected, but must not be retained or
+			// evict useful smaller snapshots while trying to fit the budget.
+			if (cost > maximumCost) return;
 			_entries[key] = (value, _order.AddLast(key), cost);
 			_cost += cost;
 			while (_entries.Count > capacity || _cost > maximumCost) {

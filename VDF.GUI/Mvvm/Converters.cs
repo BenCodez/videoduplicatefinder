@@ -31,7 +31,7 @@ namespace VDF.GUI.Mvvm {
 	}
 	static class ExtraShortDateTimeFormater {
 		static readonly string FormatString;
-		public static string DateToString(DateTime value) => String.Format(FormatString, ResultsDates.ForDisplay(value));
+		public static string DateToString(DateTime value) => String.Format(FormatString, value);
 		static ExtraShortDateTimeFormater() {
 			// "g" would be something like "4/10/2008 6:30 AM"
 			// If not using AM/PM notation the format would be: "d  hh:mm"

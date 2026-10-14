@@ -313,7 +313,8 @@ namespace VDF.Web.Services {
 								throw new IOException("This file is no longer part of the current results.");
 							var identity = CaptureReviewedIdentity(item)
 								?? throw new IOException("The file is unavailable or has changed since scanning. Rescan before moving it.");
-							await ValidateMoveRetentionAsync(identity);
+							using (await AcquireMoveRetentionLeaseAsync())
+								await ValidateMoveRetentionAsync(identity);
 							Directory.CreateDirectory(destinationFolder);
 							string dest = Path.Combine(destinationFolder, Path.GetFileName(item.Path));
 							// Avoid overwriting existing files at destination
@@ -327,8 +328,9 @@ namespace VDF.Web.Services {
 							// Lookup requires the source path to exist; capture the entry before renaming.
 							ScanEngine.GetFromDatabase(item.Path, out var dbEntry);
 							var aliases = CaptureKeeperAliases(identity);
+							using var reviewLease = await AcquireMoveRetentionLeaseAsync();
 							await ValidateMoveRetentionAsync(identity);
-							try { File.Move(item.Path, dest); }
+							try { FileMover(item.Path, dest); }
 							finally {
 								// Renaming also changes native stamps on existing source aliases.
 								RefreshKeeperAliasesAfterLink(aliases);

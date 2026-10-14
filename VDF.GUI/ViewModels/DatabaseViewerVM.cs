@@ -72,7 +72,8 @@ namespace VDF.GUI.ViewModels {
 		public string FileName => System.IO.Path.GetFileName(Entry.Path);
 		public string FolderText => Entry.Folder;
 		public string SizeText => Entry.FileSize.BytesToString();
-		public string DateCreatedText => Entry.DateCreated.ToLocalTime().ToString("d", CultureInfo.CurrentCulture);
+		public string DateCreatedText => (Entry.Flags.Has(EntryFlags.ExifCreationDate)
+			? Entry.DateCreated : Entry.DateCreated.ToLocalTime()).ToString("d", CultureInfo.CurrentCulture);
 		public string DateModifiedText => Entry.DateModified.ToLocalTime().ToString("d", CultureInfo.CurrentCulture);
 		public bool IsImage => Entry.Flags.Any(EntryFlags.IsImage);
 

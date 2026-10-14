@@ -23,6 +23,7 @@ public sealed class CleanupProtectionGuard {
 	IReadOnlyDictionary<string, ReviewRecord> _reviews = new Dictionary<string, ReviewRecord>();
 	HashSet<(string Id, long Length, DateTime Modified, DateTime Created, string Stamp, string Hash)> _retainedFiles = new();
 	internal Func<string?, CancellationToken, Task>? BeforeLiveCheckAsync { get; set; }
+	internal Func<string?, CancellationToken, Task>? AfterLiveCheckAsync { get; set; }
 	public CleanupProtectionGuard(string stateFolder) {
 		_stateFolder = SafePaths.Normalize(stateFolder, rejectTraversal: true);
 		SafePaths.RequireDirectory(_stateFolder);
@@ -133,6 +134,7 @@ public sealed class CleanupProtectionGuard {
 		RequireIndependentPair(target, keeper, requireByteIdentical);
 		FileIdentity[]? group = groupMembers?.ToArray();
 		var removal = CreateRemovalService();
+		removal.AcquireProtectionLeaseAsync = (claim, token) => AcquireMutationLeaseAsync(claim, token);
 		removal.ValidateProtectionAsync = (claim, token) => RequireUnprotectedAsync(target, group, claim, token);
 		return removal.RemoveAsync(target, keeper, removeClaim, ct: ct);
 	}
@@ -149,6 +151,7 @@ public sealed class CleanupProtectionGuard {
 		RequireIndependentPair(target, keeper, identical);
 		FileIdentity[]? group = groupMembers?.ToArray();
 		var service = CreateQuarantineService();
+		service.AcquireProtectionLeaseAsync = (claim, token) => AcquireMutationLeaseAsync(claim, token);
 		service.ValidateProtectionAsync = (claim, token) => RequireUnprotectedAsync(target, group, claim, token);
 		return identical ? service.QuarantineExactAsync(target, keeper, destination, ct: ct) :
 			service.QuarantineAsync(target, keeper, destination, ct: ct);
@@ -189,11 +192,17 @@ public sealed class CleanupProtectionGuard {
 		}, ct).ConfigureAwait(false);
 	}
 
-	async Task RequireUnprotectedAsync(FileIdentity target, IReadOnlyList<FileIdentity>? group, string? claim, CancellationToken ct) {
+	async Task<IDisposable> AcquireMutationLeaseAsync(string claim, CancellationToken ct) {
 		if (BeforeLiveCheckAsync is not null) await BeforeLiveCheckAsync(claim, ct).ConfigureAwait(false);
+		return await CleanupProtectionPolicyStore.AcquireMutationLeaseAsync(_stateFolder, ct).ConfigureAwait(false);
+	}
+
+	async Task RequireUnprotectedAsync(FileIdentity target, IReadOnlyList<FileIdentity>? group, string? claim, CancellationToken ct) {
+		if (claim is null && BeforeLiveCheckAsync is not null) await BeforeLiveCheckAsync(claim, ct).ConfigureAwait(false);
 		await ValidateGroupCoreAsync(group, target, claim, ct).ConfigureAwait(false);
 		var protection = await InspectCoreAsync(target, claim, ct).ConfigureAwait(false);
 		if (protection.IsProtected) throw new IOException(protection.Reason);
+		if (AfterLiveCheckAsync is not null) await AfterLiveCheckAsync(claim, ct).ConfigureAwait(false);
 	}
 
 	async Task<IReadOnlyDictionary<string, ReviewRecord>> GetReviewsAsync(CancellationToken ct) {

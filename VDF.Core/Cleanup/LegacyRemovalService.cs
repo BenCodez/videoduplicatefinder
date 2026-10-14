@@ -23,6 +23,7 @@ public sealed class LegacyRemovalService {
 	readonly string _journalPath;
 	readonly SemaphoreSlim _journalGate;
 	internal Func<string?, CancellationToken, Task>? ValidateProtectionAsync { get; set; }
+	internal Func<string, CancellationToken, Task<IDisposable>>? AcquireProtectionLeaseAsync { get; set; }
 	internal Func<FileIdentity, FileIdentity, FileIdentity, CancellationToken, Task>? RefreshRestoredProtectionAsync { get; set; }
 
 	public LegacyRemovalService(string journalPath) {
@@ -124,11 +125,14 @@ public sealed class LegacyRemovalService {
 						if (!IdentityReader.MatchesCurrentSnapshot(verifiedClaim!))
 							throw new IOException("The claimed media changed or lacks a reliable current filesystem snapshot.");
 					}, ct).ConfigureAwait(false);
-					if (ValidateProtectionAsync is not null) await ValidateProtectionAsync(record.ClaimPath, ct).ConfigureAwait(false);
-					if (!IdentityReader.MatchesCurrentSnapshot(keeper) || verifiedClaim is null || !IdentityReader.MatchesCurrentSnapshot(verifiedClaim))
-						throw new IOException("The source or remaining keeper changed during live protection checks.");
-					ct.ThrowIfCancellationRequested();
-					removeClaim(record.ClaimPath);
+					using (var protectionLease = AcquireProtectionLeaseAsync is null ? null :
+						await AcquireProtectionLeaseAsync(record.ClaimPath, ct).ConfigureAwait(false)) {
+						if (ValidateProtectionAsync is not null) await ValidateProtectionAsync(record.ClaimPath, ct).ConfigureAwait(false);
+						if (!IdentityReader.MatchesCurrentSnapshot(keeper) || verifiedClaim is null || !IdentityReader.MatchesCurrentSnapshot(verifiedClaim))
+							throw new IOException("The source or remaining keeper changed during live protection checks.");
+						ct.ThrowIfCancellationRequested();
+						removeClaim(record.ClaimPath);
+					}
 					if (SafePaths.Exists(record.ClaimPath))
 						throw new IOException("The removal mechanism left the private claim in place.");
 					record.State = LegacyRemovalState.Completed;

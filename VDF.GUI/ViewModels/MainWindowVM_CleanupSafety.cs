@@ -12,6 +12,18 @@ namespace VDF.GUI.ViewModels;
 public partial class MainWindowVM {
     internal sealed record ApprovedRemoval(DuplicateItemVM Item, FileIdentity Target, FileIdentity Keeper);
 
+    internal Func<Task>? BeforeCleanupAuthorityCheckAsync { get; set; }
+    internal CleanupProtectionGuard CreateResultsCleanupGuard(ResultsStateAuthority authority) {
+        RequireCleanupAuthority(authority);
+        return new CleanupProtectionGuard(authority.Folder) {
+            BeforeLiveCheckAsync = (_, _) => { RequireCleanupAuthority(authority); return Task.CompletedTask; },
+            AfterLiveCheckAsync = async (claim, _) => {
+                if (claim is not null && BeforeCleanupAuthorityCheckAsync is not null) await BeforeCleanupAuthorityCheckAsync();
+                RequireCleanupAuthority(authority);
+            }
+        };
+    }
+
     internal FileIdentity[] CaptureCompleteCleanupGroup(Guid groupId, IReadOnlySet<DuplicateItemVM>? completed = null) =>
         Duplicates.Where(row => row.ItemInfo.GroupId == groupId && completed?.Contains(row) != true)
         .Select(row => {
@@ -28,6 +40,8 @@ public partial class MainWindowVM {
     }
 
     internal async Task<Dictionary<DuplicateItemVM, ApprovedRemoval>> PrepareCleanupGuardAsync(IReadOnlyList<DuplicateItemVM> requested) {
+        var authority = CaptureResultsStateAuthority();
+        RequireCleanupAuthority(authority);
         var candidates = await BuildAutomationCandidatesAsync();
         var matcher = new FolderRuleMatcher(Data.SettingsFile.Instance.AutomationSelection.FolderRules,
             Data.SettingsFile.Instance.AutomationSelection.OverlapPolicy);
@@ -37,7 +51,7 @@ public partial class MainWindowVM {
             .GroupBy(d => d.ItemInfo.GroupId).ToDictionary(g => g.Key, g => g.ToList());
         var input = requested.Select(row => (Row: row, Candidate: candidates.GetValueOrDefault(row.ItemInfo.Path),
             Folder: matcher.Match(row.ItemInfo.Path), Identity: row.AutomationIdentity)).ToList();
-        return await Task.Run(() => {
+        var result = await Task.Run(() => {
             var approved = new Dictionary<DuplicateItemVM, ApprovedRemoval>();
             var cachedKeepers = new Dictionary<Guid, FileIdentity>();
             foreach (var entry in input) {
@@ -61,16 +75,21 @@ public partial class MainWindowVM {
             }
             return approved;
         });
+        RequireCleanupAuthority(authority);
+        return result;
     }
 
     internal async Task ReplaceApprovedWithLinkAsync(CleanupProtectionGuard removal, ApprovedRemoval action,
         Dictionary<DuplicateItemVM, ApprovedRemoval> approved, IReadOnlyList<FileIdentity> group, bool hardLink) {
+        var authority = CaptureResultsStateAuthority();
+        RequireCleanupAuthority(authority);
         if (hardLink) await automationReviewSaveGate.WaitAsync();
         bool hardLinkAttempted = false;
         try {
-			if (hardLink) await removal.ValidateHardLinkKeeperAsync(action.Keeper);
+            RequireCleanupAuthority(authority);
+            if (hardLink) await removal.ValidateHardLinkKeeperAsync(action.Keeper);
             if (hardLink) await Dispatcher.UIThread.InvokeAsync(async () => {
-                var store = await GetAutomationReviewStoreAsync();
+                var store = await GetAutomationReviewStoreAsync(authority);
                 static bool DeliberateProtection(bool protect, ReviewChoice choice) => protect ||
                     choice is ReviewChoice.Keep or ReviewChoice.Ignore or ReviewChoice.RejectGroup;
                 bool persisted = store.Records.Any(record => action.Keeper.SameFileSnapshot(record.Identity) &&
@@ -84,8 +103,11 @@ public partial class MainWindowVM {
                 if (persisted || pending)
                     throw new IOException("Hardlink replacement would change a deliberately protected keeper's identity. Use quarantine or choose a keeper without a deliberate protection decision.");
             });
+            RequireCleanupAuthority(authority);
             await removal.RemoveAsync(action.Target, action.Keeper, claim => {
+                RequireCleanupAuthority(authority);
                 if (hardLink) removal.ValidateHardLinkKeeperAsync(action.Keeper).GetAwaiter().GetResult();
+                RequireCleanupAuthority(authority);
                 hardLinkAttempted = hardLink;
                 CreateVerifiedReplacementLink(claim, action.Target.Path, action.Keeper.Path, hardLink);
             }, groupMembers: group);
@@ -118,6 +140,7 @@ public partial class MainWindowVM {
 
     async Task<bool> RefreshCleanupKeeperAfterHardLinkCoreAsync(FileIdentity previous,
         Dictionary<DuplicateItemVM, ApprovedRemoval> approved) {
+            var authority = CaptureResultsStateAuthority();
             var aliases = Duplicates.Where(row => MatchesPreviousKeeperSnapshot(row, previous)).ToArray();
             var versions = aliases.ToDictionary(row => row, row => row.AutomationReviewVersion);
             var baselines = aliases.ToDictionary(row => row, row => row.ObservedReview);
@@ -147,13 +170,15 @@ public partial class MainWindowVM {
                 return captures;
             });
             if (currentAliases is null) return false;
-            var store = await GetAutomationReviewStoreAsync();
+            var store = await GetAutomationReviewStoreAsync(authority, savingReview: true);
             if (BeforeCleanupKeeperReviewRefreshAsync is not null) await BeforeCleanupKeeperReviewRefreshAsync();
+            RequireResultsGeneration(authority);
             // Carry a matching manual review across this verified intentional
             // link-count change in the current journal transaction, preserving
             // cooperating writers' unrelated or newer decisions.
             var foreignRows = new HashSet<DuplicateItemVM>();
             var committed = await store.UpdateWithSnapshotAsync(current => {
+                RequireResultsGeneration(authority);
                 foreach (var row in aliases) {
                     var original = current.FirstOrDefault(record => AutomationPathComparer.Equals(record.Identity.Path, row.ItemInfo.Path));
                     if (AutomationReviewBaseline.Of(original) != baselines[row]) foreignRows.Add(row);
@@ -179,6 +204,7 @@ public partial class MainWindowVM {
                     throw new IOException("The hardlink keeper or an alias changed before its review refresh could be committed.");
                 return records;
             });
+            RequireResultsGeneration(authority);
             if (currentAliases.Values.Any(alias => !alias.Snapshot.MatchesCurrent())) return false;
             var committedByPath = committed.ToDictionary(record => record.Identity.Path, AutomationPathComparer);
             foreach (var row in aliases) {
@@ -186,8 +212,9 @@ public partial class MainWindowVM {
                     !currentAliases.TryGetValue(row.ItemInfo.Path, out var alias)) continue;
                 row.AutomationIdentity = alias.Identity;
                 row.AutomationFileSnapshot = alias.Snapshot;
-                row.ItemInfo.DateCreated = alias.Created;
+                if (!row.ItemInfo.Flags.HasFlag(VDF.Core.DuplicateFlags.ExifCreationDate)) row.ItemInfo.DateCreated = alias.Created;
                 row.RaisePropertyChanged(nameof(DuplicateItemVM.ShownDate));
+                row.RaisePropertyChanged(nameof(DuplicateItemVM.ShownDisplayDate));
                 var record = committedByPath.GetValueOrDefault(row.ItemInfo.Path);
                 row.ObservedReview = AutomationReviewBaseline.Of(record);
                 if (foreignRows.Contains(row) && row.AutomationReviewVersion == versions[row]) {

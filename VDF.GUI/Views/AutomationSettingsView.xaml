@@ -53,7 +53,7 @@
                 <ComboBox.ItemTemplate><DataTemplate x:DataType="selection:FolderOverlapPolicy"><TextBlock Text="{Binding ., Converter={StaticResource AutomationEnumLabel}}" /></DataTemplate></ComboBox.ItemTemplate>
               </ComboBox>
             </Grid>
-            <TextBlock Classes="help" Text="Strict folder priority keeps a file in the highest priority folder before comparing quality. Weighted mode combines normalized quality values and the folder weight. Missing date metadata is reported for review." />
+            <TextBlock Classes="help" Text="Strict folder priority prefers the highest priority folder first by default. Quality first compares the configured quality criteria before using folder priority as a tie-break. Weighted mode combines normalized quality values and the folder weight. Missing date metadata is reported for review." />
             <TextBlock Classes="heading" Text="Folder rules" />
             <TextBlock Classes="help" Text="Higher numbers are preferred. Protect all prevents removal of every matching file. Patterns match the path relative to the folder (for example *.mkv)." />
             <ItemsControl x:Name="FolderRulesList" AutomationProperties.Name="Folder priority rules" ItemsSource="{Binding FolderRules}">

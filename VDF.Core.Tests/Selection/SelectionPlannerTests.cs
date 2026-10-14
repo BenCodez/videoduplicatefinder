@@ -56,11 +56,13 @@ public class SelectionPlannerTests {
         preferred.Item.DateCreated = first.Item.DateCreated.AddTicks(preferLower ? -1 : 1);
         missing.Item.DateModified = missing.Item.DateCreated = default;
         foreach (var mode in Enum.GetValues<SelectionMode>()) {
-            var options = new SelectionOptions {
-                Profile = SelectionProfile.Custom, Mode = mode, FolderWeight = 0,
-                Criteria = [new() { Name = criterion, PreferLower = preferLower }]
-            };
-            Assert.Equal(preferred.Item.Path, Keeper([missing, first, preferred], options));
+            foreach (var profile in new[] { SelectionProfile.Custom, SelectionProfile.QualityFirst }) {
+                var options = new SelectionOptions {
+                    Profile = profile, Mode = mode, FolderWeight = 0,
+                    Criteria = [new() { Name = criterion, PreferLower = preferLower }]
+                };
+                Assert.Equal(preferred.Item.Path, Keeper([missing, first, preferred], options));
+            }
         }
     }
 
@@ -100,12 +102,161 @@ public class SelectionPlannerTests {
         }
     }
 
+    [Theory]
+    [InlineData(SelectionProfile.FolderPriorityFirst)]
+    [InlineData(SelectionProfile.NewestFirst)]
+    [InlineData(SelectionProfile.OldestFirst)]
+    [InlineData(SelectionProfile.Custom)]
+    public void StrictFolderPriorityWinsEvenAgainstBetterQuality(SelectionProfile profile) {
+        var archive = Candidate("archive/a.mp4", priorityResolution: 1280);
+        var download = Candidate("downloads/a.mp4", profile == SelectionProfile.OldestFirst ? 1 : 3, priorityResolution: 3840);
+        archive.Item.DateModified = archive.Item.DateModified.AddDays(1);
+        var options = new SelectionOptions { Profile = profile,
+            FolderRules = new() { new() { Directory = Path.GetDirectoryName(archive.Item.Path)!, Priority = 500 } } };
+        Assert.Equal(archive.Item.Path, Keeper(new[] { download, archive }, options));
+    }
+
     [Fact]
-    public void StrictFolderPriorityWinsEvenAgainstBetterQuality() {
+    public void QualityFirstRanksQualityAcrossFoldersWhileDefaultPreservesFolderPriority() {
         var archive = Candidate("archive/a.mp4", priorityResolution: 1280);
         var download = Candidate("downloads/a.mp4", priorityResolution: 3840);
-        var options = new SelectionOptions { FolderRules = new() { new() { Directory = Path.GetDirectoryName(archive.Item.Path)!, Priority = 500 } } };
-        Assert.Equal(archive.Item.Path, Keeper(new[] { download, archive }, options));
+        var options = new SelectionOptions {
+            FolderRules = [new() { Directory = Path.GetDirectoryName(archive.Item.Path)!, Priority = 500 }]
+        };
+        Assert.Equal(SelectionProfile.FolderPriorityFirst, options.Profile);
+        Assert.Equal(archive.Item.Path, Keeper([download, archive], options));
+        options.Profile = SelectionProfile.QualityFirst;
+        var plan = SelectionPlanner.BuildPlan([archive, download], options);
+        Assert.Equal(download.Item.Path, plan.Decisions.Single(d => d.IsKeeper).Path);
+        Assert.Contains("Keeper chosen by Resolution.", plan.Decisions.Single(d => d.IsKeeper).Reason);
+        Assert.True(plan.Decisions.Single(d => d.Path == archive.Item.Path).RemoveCandidate);
+    }
+
+    [Fact]
+    public void QualityFirstUsesConfiguredCriterionOrderRatherThanWeights() {
+        var archive = Candidate("archive/a.mp4", priorityResolution: 1280);
+        var download = Candidate("downloads/a.mp4", priorityResolution: 3840);
+        archive.Item.BitRateKbs = 2000;
+        var options = new SelectionOptions {
+            Profile = SelectionProfile.QualityFirst,
+            Criteria = [new() { Name = "Resolution", Weight = 0 }, new() { Name = "VideoBitrate", Weight = 100 }],
+            FolderRules = [new() { Directory = Path.GetDirectoryName(archive.Item.Path)!, Priority = 500 }]
+        };
+        Assert.Equal(download.Item.Path, Keeper([archive, download], options));
+        options.Criteria.Reverse();
+        Assert.Equal(archive.Item.Path, Keeper([download, archive], options));
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public void QualityFirstFallsBackToFolderPriorityThenStablePathOrder(bool includeQualityCriteria) {
+        var archiveA = Candidate("archive/a.mp4");
+        var archiveB = Candidate("archive/b.mp4");
+        var download = Candidate("0-downloads/a.mp4");
+        var options = new SelectionOptions {
+            Profile = SelectionProfile.QualityFirst,
+            Criteria = includeQualityCriteria ? [new() { Name = "Resolution" }] : [],
+            FolderRules = [new() { Directory = Path.GetDirectoryName(archiveA.Item.Path)!, Priority = 500 }]
+        };
+        var priorityPlan = SelectionPlanner.BuildPlan([download, archiveB], options);
+        Assert.Equal(archiveB.Item.Path, priorityPlan.Decisions.Single(d => d.IsKeeper).Path);
+        Assert.Contains("Keeper chosen by folder priority.", priorityPlan.Decisions.Single(d => d.IsKeeper).Reason);
+        Assert.Equal(archiveA.Item.Path, Keeper([download, archiveB, archiveA], options));
+        var tiedPlan = SelectionPlanner.BuildPlan([archiveA, archiveB, download], options);
+        Assert.Equal(archiveA.Item.Path, tiedPlan.Decisions.Single(d => d.IsKeeper).Path);
+        Assert.Contains("Tied criteria; path order broke the tie.", tiedPlan.Decisions.Single(d => d.IsKeeper).Reason);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void QualityFirstPreservesPreferLowerAndMissingCriterionAvailability(bool preferLower) {
+        var preferred = Candidate("downloads/z-preferred.mp4", priorityResolution: preferLower ? 1280 : 3840);
+        var other = Candidate("archive/a-other.mp4");
+        var missing = Candidate("archive/0-missing.mp4");
+        missing.Item.FrameSize = string.Empty;
+        var options = new SelectionOptions {
+            Profile = SelectionProfile.QualityFirst,
+            Criteria = [new() { Name = "Resolution", PreferLower = preferLower }],
+            FolderRules = [new() { Directory = Path.GetDirectoryName(other.Item.Path)!, Priority = 500 }]
+        };
+        Assert.Equal(preferred.Item.Path, Keeper([missing, other, preferred], options));
+        Assert.Equal(other.Item.Path, Keeper([missing, other], options));
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void QualityFirstPreservesSingleTickDateDifferencesAcrossFolderPriorities(bool preferLower) {
+        var archive = Candidate("archive/a.mp4");
+        var download = Candidate("downloads/z.mp4");
+        download.Item.DateModified = archive.Item.DateModified.AddTicks(preferLower ? -1 : 1);
+        download.Item.DateCreated = archive.Item.DateCreated.AddTicks(preferLower ? -1 : 1);
+        archive.EmbeddedDateUtc = archive.Item.DateModified;
+        download.EmbeddedDateUtc = download.Item.DateModified;
+        foreach (var source in Enum.GetValues<SelectionDateSource>()) {
+            var options = new SelectionOptions {
+                Profile = SelectionProfile.QualityFirst, DateSource = source,
+                Criteria = [new() { Name = "Date", PreferLower = preferLower }],
+                FolderRules = [new() { Directory = Path.GetDirectoryName(archive.Item.Path)!, Priority = 500 }]
+            };
+            Assert.Equal(download.Item.Path, Keeper([archive, download], options));
+        }
+    }
+
+    [Theory]
+    [InlineData("ManualKeep")]
+    [InlineData("ManualProtection")]
+    [InlineData("NfoProtection")]
+    [InlineData("UncertainProtection")]
+    [InlineData("FolderProtection")]
+    public void QualityFirstCannotOverrideKeeperOrProtectionGuards(string guard) {
+        var retained = Candidate("protected/a.mp4", priorityResolution: 1280);
+        var better = Candidate("downloads/a.mp4", priorityResolution: 3840);
+        var options = new SelectionOptions { Profile = SelectionProfile.QualityFirst };
+        switch (guard) {
+            case "ManualKeep": retained.ManualChoice = ReviewChoice.Keep; break;
+            case "ManualProtection": retained.ManuallyProtected = true; break;
+            case "NfoProtection": retained.NfoProtected = true; break;
+            case "UncertainProtection": retained.ProtectionUncertain = true; break;
+            case "FolderProtection": options.FolderRules = [new() {
+                Directory = Path.GetDirectoryName(retained.Item.Path)!, ProtectAll = true
+            }]; break;
+        }
+        var plan = SelectionPlanner.BuildPlan([better, retained], options);
+        Assert.Equal(retained.Item.Path, plan.Decisions.Single(d => d.IsKeeper).Path);
+        Assert.False(plan.Decisions.Single(d => d.Path == retained.Item.Path).RemoveCandidate);
+        Assert.True(plan.Decisions.Single(d => d.Path == better.Item.Path).RemoveCandidate);
+    }
+
+    [Theory]
+    [InlineData(ReviewChoice.Ignore)]
+    [InlineData(ReviewChoice.RejectGroup)]
+    public void QualityFirstPreservesIgnoredOrRejectedGroups(ReviewChoice choice) {
+        var ignored = Candidate("a.mp4", priorityResolution: 1280);
+        ignored.ManualChoice = choice;
+        var better = Candidate("b.mp4", priorityResolution: 3840);
+        var plan = SelectionPlanner.BuildPlan([better, ignored], new() { Profile = SelectionProfile.QualityFirst });
+        Assert.All(plan.Decisions, decision => Assert.False(decision.RemoveCandidate));
+    }
+
+    [Theory]
+    [InlineData(SelectionProfile.FolderPriorityFirst)]
+    [InlineData(SelectionProfile.QualityFirst)]
+    public void WeightedModeCombinesFolderAndQualityWeightsRegardlessOfProfile(SelectionProfile profile) {
+        var archive = Candidate("archive/a.mp4", priorityResolution: 1280);
+        var download = Candidate("downloads/a.mp4", priorityResolution: 3840);
+        var options = new SelectionOptions {
+            Mode = SelectionMode.Weighted, Profile = profile, FolderWeight = 20,
+            Criteria = [new() { Name = "Resolution", Weight = 10 }],
+            FolderRules = [new() { Directory = Path.GetDirectoryName(archive.Item.Path)!, Priority = 500 }]
+        };
+        Assert.Equal(archive.Item.Path, Keeper([download, archive], options));
+        options.FolderWeight = 1;
+        Assert.Equal(download.Item.Path, Keeper([archive, download], options));
+        archive.NfoProtected = true;
+        Assert.Equal(archive.Item.Path, Keeper([download, archive], options));
     }
 
     [Fact]

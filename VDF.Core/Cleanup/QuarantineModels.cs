@@ -20,6 +20,7 @@ public sealed class QuarantineRecord {
     public string RestoringPath { get; set; } = string.Empty;
     public FileIdentity? QuarantineIdentity { get; set; }
     public FileIdentity? RestoredIdentity { get; set; }
+    public FileIdentity? RestoreClaimIdentity { get; set; }
     public FileIdentity? ProtectionRefreshClaim { get; set; }
     public QuarantineState State { get; set; }
     public bool ByteIdentical { get; set; }
@@ -41,7 +42,7 @@ public sealed class QuarantinePreview {
 }
 
 internal sealed class QuarantineEnvelope {
-	internal const int CurrentVersion = 2;
+	internal const int CurrentVersion = 3;
     [JsonRequired]
     public int Version { get; set; } = CurrentVersion;
     [JsonRequired]
@@ -55,7 +56,7 @@ internal partial class CleanupJsonContext : JsonSerializerContext { }
 
 internal enum QuarantineCheckpoint {
     Prepared, CopyFlushed, CopyCommitted, SourceClaimed, BeforeSourceDelete,
-    RestoreCopied, RestoreCommitted
+    RestoreCopied, RestoreCommitted, RestorePrepared, RestoreRenamed
 }
 
 internal static class CleanupOperationGate {

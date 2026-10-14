@@ -55,7 +55,7 @@ namespace VDF.GUI.ViewModels {
 		// same .tmp file next to the target.
 		readonly SemaphoreSlim scanResultsExportGate = new(1, 1);
 		public string BackupScanResultsFile =>
-			Path.Combine(CoreUtils.ResolveDatabaseFolder(SettingsFile.Instance.CustomDatabaseFolder), "backup.scanresults");
+			Path.Combine(ResultsStateFolder, "backup.scanresults");
 		public string BlacklistedGroupsFile =>
 			Path.Combine(CoreUtils.ResolveDatabaseFolder(SettingsFile.Instance.CustomDatabaseFolder), "BlacklistedGroups.json");
 
@@ -476,6 +476,7 @@ namespace VDF.GUI.ViewModels {
 				}
 			}
 			if (e.NewItems != null) {
+				CaptureResultsStateAuthority();
 				foreach (INotifyPropertyChanged item in e.NewItems) {
 					item.PropertyChanged += DuplicateItemVM_PropertyChanged;
 					// Items can arrive already checked (restored backups); count them
@@ -509,6 +510,7 @@ namespace VDF.GUI.ViewModels {
 			long addedCheckedSize = 0;
 			try {
 				foreach (var item in items) {
+					CaptureResultsStateAuthority();
 					item.PropertyChanged += DuplicateItemVM_PropertyChanged;
 					Duplicates.Add(item);
 					// Items can arrive already checked (restored backups); count them
@@ -621,8 +623,10 @@ namespace VDF.GUI.ViewModels {
 		}
 
 		public async Task RestoreBackupScanResultsAsync() {
-			if (File.Exists(BackupScanResultsFile))
-				await ImportScanResultsIncludingThumbnails(BackupScanResultsFile, startup: true);
+			string folder = CurrentResultsStateFolder;
+			string backup = Path.Combine(folder, "backup.scanresults");
+			if (File.Exists(backup))
+				await ImportScanResultsIncludingThumbnails(backup, startup: true, producingStateFolder: folder);
 		}
 
 		/// <summary>
@@ -684,6 +688,9 @@ namespace VDF.GUI.ViewModels {
 			Dispatcher.UIThread.InvokeAsync(FinishScanResultsAsync);
 
 		internal async Task FinishScanResultsAsync() {
+				// StartScan captures the synced scanner folder before launching; live
+				// settings may have changed while the scanner was running.
+				string producingFolder = pendingScanStateFolder ?? NormalizeStateFolder(CoreUtils.ResolveDatabaseFolder(Scanner.Settings.CustomDatabaseFolder));
 				string completionStatus = "Completed";
 				try {
 				IsScanning = false;
@@ -702,6 +709,8 @@ namespace VDF.GUI.ViewModels {
 					Scanner.Duplicates.RemoveWhere(d => blacklistedGids.Contains(d.GroupId));
 
 				var freshRows = await Task.Run(() => Scanner.Duplicates.Select(item => new DuplicateItemVM(item)).ToArray());
+				BindResultsState(producingFolder);
+				pendingScanStateFolder = null;
 				AddDuplicatesInBulk(freshRows);
 
 				// A completed scan that matched nothing drops back to the Setup screen; flag
@@ -1060,8 +1069,9 @@ namespace VDF.GUI.ViewModels {
 		public ReactiveCommand<Unit, Unit> ImportScanResultsFromFileCommand => ReactiveCommand.CreateFromTask(
 			() => ImportScanResultsIncludingThumbnails(), CanStartScan);
 
-		internal async Task ImportScanResultsIncludingThumbnails(string? path = null, bool startup = false) {
+		internal async Task ImportScanResultsIncludingThumbnails(string? path = null, bool startup = false, string? producingStateFolder = null) {
 			if (IsScanning || HasActiveScanRun || IsAutomationWorking || (!startup && (IsBusy || IsStartupLoading))) return;
+			string importStateFolder = producingStateFolder ?? CurrentResultsStateFolder;
 			IsBusy = true;
 			IsBusyOverlayText = App.Lang["Busy.ImportScanResults"];
 			try {
@@ -1120,6 +1130,7 @@ namespace VDF.GUI.ViewModels {
 				Utils.ThumbCacheHelpers.SetActiveProvider(Utils.ThumbPack.Open(TempDirectory.Path));
 
 				Duplicates.Clear();
+				BindResultsState(importStateFolder);
 				AddDuplicatesInBulk(items);
 
 				BuildActiveResultsView();
@@ -1685,9 +1696,11 @@ Non-Windows setup:
 				if (automatic) SettingsFile.Instance.ScheduledLastStatus = "Running";
 				SettingsFile.SaveSettings();
 				SyncCoreSettings();
+				pendingScanStateFolder = NormalizeStateFolder(CoreUtils.ResolveDatabaseFolder(Scanner.Settings.CustomDatabaseFolder));
 				TempDirectory = TempExtractionManager.Register(new("VDF-"));
 				Utils.ThumbCacheHelpers.SetActiveProvider(Utils.ThumbPack.Open(TempDirectory.Path));
 				Duplicates.Clear();
+				BindResultsState(pendingScanStateFolder);
 				ShowNoDuplicatesNotice = false;
 
 				IsScanning = true;
@@ -1718,7 +1731,10 @@ Non-Windows setup:
 				else await MessageBoxService.Show("Scan could not start. See the scan log for details.");
 			}
 			finally {
-				if (!started) CompleteScheduledScan(automatic ? SettingsFile.Instance.ScheduledLastStatus : "Not started");
+				if (!started) {
+					pendingScanStateFolder = null;
+					CompleteScheduledScan(automatic ? SettingsFile.Instance.ScheduledLastStatus : "Not started");
+				}
 			}
 		}
 
@@ -1975,6 +1991,7 @@ Non-Windows setup:
 				toDelete ??= CheckedItemsToDelete;
 				if (toDelete.Count == 0) return;
 				bool createLinks = createSymbolLinksInstead || createHardLinksInstead;
+				var authority = CaptureResultsStateAuthority();
 				var approved = new Dictionary<DuplicateItemVM, ApprovedRemoval>();
 				if (fromDisk || createLinks) {
 					approved = await PrepareCleanupGuardAsync(toDelete);
@@ -1993,19 +2010,25 @@ Non-Windows setup:
 				var deleted = new HashSet<DuplicateItemVM>(ReferenceEqualityComparer<DuplicateItemVM>.Instance);
 				long freed = 0;
 				int total = toDelete.Count;
-				var removal = new VDF.Core.Cleanup.CleanupProtectionGuard(CoreUtils.ResolveDatabaseFolder(Data.SettingsFile.Instance.CustomDatabaseFolder));
+				var removal = (fromDisk || createLinks) ? CreateResultsCleanupGuard(authority) : null;
 				await Task.Run(async () => {
-					if (fromDisk || createLinks) await removal.RecoverAsync();
+					if (fromDisk || createLinks) {
+						RequireCleanupAuthority(authority);
+						await removal!.RecoverAsync();
+						RequireCleanupAuthority(authority);
+					}
 					int done = 0;
 					foreach (var item in toDelete) {
 						try {
 							if (fromDisk || createLinks) {
+								RequireCleanupAuthority(authority);
 								var action = approved[item];
 								bool protectedNow = IsLiveCleanupProtected(item);
 								if (protectedNow) throw new IOException("The file is protected; cleanup was cancelled.");
 								var group = CaptureCompleteCleanupGroup(item.ItemInfo.GroupId, deleted);
-								if (createLinks) await ReplaceApprovedWithLinkAsync(removal, action, approved, group, createHardLinksInstead);
-								else await removal.RemoveAsync(action.Target, action.Keeper, claim => {
+								if (createLinks) await ReplaceApprovedWithLinkAsync(removal!, action, approved, group, createHardLinksInstead);
+								else await removal!.RemoveAsync(action.Target, action.Keeper, claim => {
+									RequireCleanupAuthority(authority);
 									if (permanently) File.Delete(claim);
 									else if (!MoveCleanupClaimToTrash(claim, action.Target.Path)) throw new IOException("Moving to trash failed; the original file was retained.");
 								}, groupMembers: group);

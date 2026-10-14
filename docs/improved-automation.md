@@ -24,11 +24,15 @@ dates use UTC; absent/invalid dates lose to known dates and do not count as the 
 copy. Identical criteria use ordinal path order. Rows explain the date and deciding
 rule. An embedded date is metadata, not proof of when a video was filmed.
 
-Strict folder priority chooses the highest configured numeric priority before quality
-or dates. Quality-first and date-first profiles refine the candidates within that
-priority. To trade folder preference against quality use weighted mode; each configured
-criterion is normalized within its candidate group before its weight is applied.
-Size is not a default quality signal. Custom criteria can prefer lower values.
+Strict mode normally chooses the highest configured numeric folder priority before
+quality or dates; this includes the default FolderPriorityFirst and the NewestFirst,
+OldestFirst and Custom profiles. Explicitly choosing QualityFirst instead applies the
+configured quality criteria in order across folders, then uses folder priority when
+those criteria tie, followed by ordinal path order. With no quality criteria configured,
+QualityFirst falls back to folder priority. In weighted mode every profile combines the
+folder weight with normalized criterion weights; QualityFirst does not override that
+scoring. Protection, manual Keep decisions and group Ignore/Reject decisions still take
+precedence. Size is not a default quality signal. Custom criteria can prefer lower values.
 
 Folder rules use absolute paths and directory boundaries. Linux comparisons are case
 sensitive. Nested rules can use the most specific or highest-priority match; protection

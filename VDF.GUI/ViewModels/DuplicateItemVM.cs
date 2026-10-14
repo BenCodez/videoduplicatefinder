@@ -34,6 +34,8 @@ namespace VDF.GUI.ViewModels {
 		/// <summary>The date the results show for this file, created or modified per the setting (#907).</summary>
 		[JsonIgnore]
 		public DateTime ShownDate => ResultsDates.Of(ItemInfo);
+		[JsonIgnore]
+		public DateTime ShownDisplayDate => ResultsDates.ForDisplay(ItemInfo);
 		readonly TimeProvider timeProvider;
 
 		//For JSON deserialization only

@@ -25,6 +25,38 @@ public static class CleanupProtectionPolicyStore {
 	public const string FileName = "CleanupProtectionPolicy.json";
 	static readonly System.Collections.Concurrent.ConcurrentDictionary<string, SemaphoreSlim> SaveGates = new(VDF.Core.Utils.PathComparer.ForCurrentPlatform);
 
+	// Final mutation shares the exact persistent leases used by policy, settings
+	// and review writers. Busy writers cause refusal rather than stale permission.
+	internal static async Task<IDisposable> AcquireMutationLeaseAsync(string stateFolder, CancellationToken ct) {
+		var leases = new List<IDisposable>();
+		try {
+			string path = PolicyPath(stateFolder);
+			leases.Add(JournalWriteLease.Acquire(path));
+			var envelope = await DurableJsonFile.ReadPrimaryAsync(path,
+				ProtectionPolicyJsonContext.Default.ProtectionPolicyEnvelope, Validate, ct).ConfigureAwait(false)
+				?? throw new InvalidDataException("Shared cleanup protection settings are missing.");
+			if (envelope.SourceSettings is { } source) {
+				leases.Add(JournalWriteLease.Acquire(source.Path));
+				if (!source.HasSameBytes(await Task.Run(() => SettingsIdentity(source.Path, ct), ct).ConfigureAwait(false)))
+					throw new InvalidDataException("Saved GUI protections changed; refresh their projection before cleanup.");
+			}
+			leases.Add(JournalWriteLease.Acquire(Path.Combine(Path.GetDirectoryName(path)!, "ReviewedFiles.json")));
+			ct.ThrowIfCancellationRequested();
+			return new MutationLease(leases);
+		}
+		catch {
+			for (int i = leases.Count - 1; i >= 0; i--) leases[i].Dispose();
+			throw;
+		}
+	}
+
+	sealed class MutationLease(List<IDisposable> leases) : IDisposable {
+		public void Dispose() {
+			for (int i = leases.Count - 1; i >= 0; i--) leases[i].Dispose();
+			leases.Clear();
+		}
+	}
+
 	/// <summary>Checks established protection state before an autosave can recreate missing settings.</summary>
 	public static async Task ValidateSettingsWriteAsync(string stateFolder, CancellationToken ct = default) {
 		string path = PolicyPath(stateFolder);

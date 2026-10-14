@@ -12,7 +12,7 @@ namespace VDF.GUI.ViewModels;
 
 public partial class MainWindowVM {
 	public ReactiveCommand<Unit, Unit> PreviewQuarantineCommand => ReactiveCommand.CreateFromTask(async () => {
-		if (IsScanning || IsBusy || IsAutomationWorking) return;
+		if (ScanOrDataWorkActive) return;
 		try {
 			var preview = await CreateQuarantinePreviewAsync();
 			new QuarantinePreviewView(preview).Show(ApplicationHelpers.MainWindow);
@@ -21,9 +21,12 @@ public partial class MainWindowVM {
 	});
 
 	internal async Task<QuarantinePreviewVM> CreateQuarantinePreviewAsync() {
-		await automationWorkGate.WaitAsync();
+		if (ScanOrDataWorkActive || !automationWorkGate.Wait(0))
+			throw new InvalidOperationException("Wait for the current scan or operation to finish before creating a quarantine preview.");
 		IsAutomationWorking = true;
 		try {
+			var authority = CaptureResultsStateAuthority();
+			RequireCleanupAuthority(authority);
 			var candidates = await BuildAutomationCandidatesAsync();
 			var checkedRows = CheckedItemsToDelete;
 			var groups = Duplicates.GroupBy(d => d.ItemInfo.GroupId).ToDictionary(g => g.Key, g => g.ToList());
@@ -52,13 +55,15 @@ public partial class MainWindowVM {
 				};
 			}).ToList());
 			string destination = string.IsNullOrWhiteSpace(SettingsFile.Instance.QuarantineFolder)
-				? Path.Combine(CoreUtils.ResolveDatabaseFolder(SettingsFile.Instance.CustomDatabaseFolder), "quarantine") : SettingsFile.Instance.QuarantineFolder;
-			var service = new CleanupProtectionGuard(CoreUtils.ResolveDatabaseFolder(SettingsFile.Instance.CustomDatabaseFolder)).CreateQuarantineService();
+				? Path.Combine(authority.Folder, "quarantine") : SettingsFile.Instance.QuarantineFolder;
+			var service = CreateResultsCleanupGuard(authority).CreateQuarantineService();
 			var validatedItems = new List<QuarantinePreviewItem>(items.Count);
 			foreach (var item in items) {
 				if (!item.CanQuarantine || item.TargetIdentity == null || item.KeeperIdentity == null) { validatedItems.Add(item); continue; }
 				try {
+					RequireCleanupAuthority(authority);
 					var validation = await service.PreviewAsync(item.TargetIdentity, item.KeeperIdentity, destination);
+					RequireCleanupAuthority(authority);
 					validatedItems.Add(new QuarantinePreviewItem {
 						Path = item.Path, KeeperPath = item.KeeperPath, SizeBytes = item.SizeBytes, CanQuarantine = true,
 						ByteIdentical = validation.ByteIdentical, TargetIdentity = item.TargetIdentity, KeeperIdentity = item.KeeperIdentity,
@@ -67,14 +72,15 @@ public partial class MainWindowVM {
 				}
 				catch (Exception ex) { validatedItems.Add(new QuarantinePreviewItem { Path = item.Path, KeeperPath = item.KeeperPath, SizeBytes = item.SizeBytes, Reason = ex.Message }); }
 			}
+			RequireCleanupAuthority(authority);
 			return new QuarantinePreviewVM(this, validatedItems, destination);
 		}
 		finally { IsAutomationWorking = false; automationWorkGate.Release(); }
 	}
 
-	internal async Task<string> ExecuteQuarantinePreviewAsync(IReadOnlyList<QuarantinePreviewItem> preview, string destination) {
-		if (IsScanning || IsBusy || IsAutomationWorking) throw new InvalidOperationException("Wait for the current scan or operation to finish.");
-		await automationWorkGate.WaitAsync();
+	internal async Task<string> ExecuteQuarantinePreviewAsync(IReadOnlyList<QuarantinePreviewItem> preview, string destination, ResultsStateAuthority authority) {
+		if (ScanOrDataWorkActive || !automationWorkGate.Wait(0))
+			throw new InvalidOperationException("Wait for the current scan or operation to finish before quarantining files.");
 		IsAutomationWorking = true;
 		IsBusy = true;
 		IsBusyOverlayText = "Quarantining reviewed files…";
@@ -82,10 +88,12 @@ public partial class MainWindowVM {
 		int moved = 0, skipped = 0;
 		string warning = string.Empty;
 		try {
+			RequireCleanupAuthority(authority);
 			var candidates = await BuildAutomationCandidatesAsync();
+			RequireCleanupAuthority(authority);
 			var rows = Duplicates.ToDictionary(d => d.ItemInfo.Path, AutomationPathComparer);
 			var rejectedGroups = Duplicates.Where(d => d.ManualReviewChoice is ReviewChoice.Ignore or ReviewChoice.RejectGroup).Select(d => d.ItemInfo.GroupId).ToHashSet();
-			var service = new CleanupProtectionGuard(CoreUtils.ResolveDatabaseFolder(SettingsFile.Instance.CustomDatabaseFolder));
+			var service = CreateResultsCleanupGuard(authority);
 			foreach (var item in preview.Where(i => i.CanQuarantine)) {
 				if (cancellationToken.IsCancellationRequested) { warning = "Cancelled; completed moves are retained."; break; }
 				if (item.TargetIdentity == null || item.KeeperIdentity == null || !rows.TryGetValue(item.Path, out var row) || !row.Checked ||
@@ -95,6 +103,7 @@ public partial class MainWindowVM {
 				try {
 					IsBusyOverlayText = $"Quarantining {Path.GetFileName(item.Path)}…";
 					bool liveProtected = await Task.Run(() => { automationNfo.ClearCache(); return IsLiveCleanupProtected(row); }, cancellationToken);
+					RequireCleanupAuthority(authority);
 					if (liveProtected || !row.Checked || keeper.Checked) { skipped++; continue; }
 					if (row.IsProtected || candidate.ManuallyProtected || candidate.NfoProtected || candidate.ProtectionUncertain) { skipped++; continue; }
 					var group = CaptureCompleteCleanupGroup(row.ItemInfo.GroupId);

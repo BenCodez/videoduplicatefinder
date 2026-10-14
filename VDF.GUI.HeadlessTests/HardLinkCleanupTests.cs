@@ -1,4 +1,5 @@
 using System.Reactive.Linq;
+using System.Reflection;
 using VDF.Core.Cleanup;
 using VDF.Core.Review;
 using VDF.Core.Selection;
@@ -88,17 +89,23 @@ public sealed class HardLinkCleanupTests {
         await vm.SaveAutomationReviewRecordsAsync();
         var approved = await vm.PrepareCleanupGuardAsync([first, second]);
         var old = first.AutomationIdentity!;
-        var guard = new CleanupProtectionGuard(folder);
         bool vetoWritten = false;
-        await Assert.ThrowsAsync<IOException>(() => Task.Run(() => guard.RemoveAsync(
-            approved[first].Target, approved[first].Keeper, claim => {
-                vetoWritten = true;
-                new ReviewStore(vm.AutomationReviewFile).UpdateAsync(records =>
+        var guard = new CleanupProtectionGuard(folder);
+        // Inject the competing writer before reservation, while keeping the
+        // production-only test seam internal to Core.
+        typeof(CleanupProtectionGuard).GetProperty("BeforeLiveCheckAsync", BindingFlags.Instance | BindingFlags.NonPublic)!
+            .SetValue(guard, (Func<string?, CancellationToken, Task>)(async (claim, _) => {
+                if (claim is null) return;
+                await new ReviewStore(vm.AutomationReviewFile).UpdateAsync(records =>
                     records.Where(record => record.Identity.Path != old.Path).Concat([
                         new ReviewRecord { Identity = old, Choice = choice }
-                    ])).GetAwaiter().GetResult();
-                throw new IOException("Synthetic interrupted cleanup after the late review.");
-            }, groupMembers: vm.CaptureCompleteCleanupGroup(group))));
+                    ]));
+                vetoWritten = true;
+            }));
+        await Assert.ThrowsAsync<IOException>(() => Task.Run(() => guard.RemoveAsync(
+            approved[first].Target, approved[first].Keeper,
+            _ => throw new InvalidOperationException("A committed group veto must prevent the mutation."),
+            groupMembers: vm.CaptureCompleteCleanupGroup(group))));
         Assert.True(vetoWritten);
         var saved = new ReviewStore(vm.AutomationReviewFile);
         await saved.LoadAsync();

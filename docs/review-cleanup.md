@@ -1,9 +1,13 @@
 # Review persistence and quarantine
 
-Reviews remain version 1 JSON journals. Legacy removal and quarantine history
-write version 2, read existing version 1 history, and migrate it on the next save.
-Version 2 records include durable proof for protection refresh after a verified
-source restoration; older applications refuse this format. Pair an older image
+Reviews remain version 1 JSON journals. Legacy removal history writes version 2;
+quarantine history writes version 3. Safe version 1 and 2 quarantine history is
+read and migrated on the next save. Version 2 records include durable proof for
+protection refresh after a verified source restoration. Version 3 additionally
+persists the verified restore-staging identity before rename. Interrupted restore
+recovery requires that exact native file at the original path and no surviving
+staging file; matching bytes alone are insufficient. Older applications reject
+the newer history versions. Pair an older image
 with the complete pre-upgrade configuration/state snapshot when rolling back.
 First preserve the complete current state and quarantine destinations, and finish
 pending recovery in the newer image. A pre-upgrade snapshot cannot undo later
@@ -141,3 +145,21 @@ network filesystem have not been verified by these tests.
 Linux scan-time `HardLinkUtils.AreSameFile` retains the existing stat-following
 behavior for symbolic aliases when scan settings include reparse links. Review
 identities, snapshots, and cleanup retain their no-follow rejection policy.
+
+Final cleanup validation and its synchronous mutation share persistent policy,
+review and saved-settings leases with cooperating writers. A busy writer causes
+refusal; a decision committed before final reservation is validated and retained.
+The leases end before rollback/recovery refreshes decisions. Local NFO files are
+proven regular before I/O, and changes during a read make protection uncertain.
+Web moves reserve the review writer lease across final retention validation and
+rename, including hardlink aliases. A new optional Web state initializes only an
+empty review generation; this does not create the shared policy required for
+deletion. Missing established review generations still refuse moves.
+
+GUI result generations retain their producing state folder for review, plan,
+backup and history files. Editing the configured database folder cannot lend
+an empty new journal's permissions to old result rows: cleanup refuses until
+the original folder is restored or a fresh scan/import replaces the results.
+Pending review decisions flush to their original journal before replacement.
+Quarantine previews also retain their result generation and cannot execute
+against a subsequently replaced result set.

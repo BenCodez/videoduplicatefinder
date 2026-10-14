@@ -90,14 +90,17 @@ public static class SelectionPlanner {
                 }
             }
         }
-        var criteria = new List<QualityRanker.Criterion<Evaluated>> {
-            new("folder priority", e => e.Folder.Priority, false)
-        };
+        var criteria = new List<QualityRanker.Criterion<Evaluated>>();
+        var folderPriority = new QualityRanker.Criterion<Evaluated>("folder priority", e => e.Folder.Priority, false);
+        // QualityFirst is an explicit opt-in to ranking quality across folders.
+        // Other strict profiles preserve folder priority ahead of quality/dates.
+        if (options.Profile != SelectionProfile.QualityFirst) criteria.Add(folderPriority);
         foreach (var c in Criteria(options)) {
             // Availability of a date/metadata beats missing values in both directions.
             criteria.Add(new(c.Name + " availability", e => Value(e, c.Name, options).HasValue ? 1 : 0, false));
             criteria.Add(new(c.Name, e => Value(e, c.Name, options) ?? 0, false, c.PreferLower));
         }
+        if (options.Profile == SelectionProfile.QualityFirst) criteria.Add(folderPriority);
         var result = QualityRanker.PickKeeperWithReason(items, criteria, e => e.Candidate.Item.IsImage);
         return (result.Keeper, result.DecidedBy?.Name ?? "deterministic path order", result.DecidedBy is null && items.Count > 1);
     }

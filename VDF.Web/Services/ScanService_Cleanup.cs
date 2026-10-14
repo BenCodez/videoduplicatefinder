@@ -17,6 +17,18 @@ public sealed partial class ScanService {
 	// Tests exercise trash/link failure without touching the user's recycle bin.
 	internal Func<string, string, bool> TrashMover { get; set; } = MoveClaimToTrash;
 	internal Action<string, string, bool> LinkCreator { get; set; } = CreateLink;
+	internal Action<string, string> FileMover { get; set; } = File.Move;
+
+	async Task<IDisposable> AcquireMoveRetentionLeaseAsync() {
+		string folder = _resultStateFolder ?? throw new IOException("These results have no verified file snapshots.");
+		SafePaths.RequireDirectory(folder);
+		// Establish an empty first generation only for a genuinely new optional
+		// Web state. Initialization preserves a concurrently committed generation.
+		if (!ObserveReviewJournal(folder))
+			await new ReviewStore(Path.Combine(folder, "ReviewedFiles.json")).InitializeAsync();
+		_observedReviewJournals.Add(Path.GetFullPath(folder));
+		return JournalWriteLease.Acquire(Path.Combine(folder, "ReviewedFiles.json"));
+	}
 
 	/// <summary>Anchor the files before completed results become available for cleanup.</summary>
 	internal void CaptureCleanupSnapshots(string? actualStateFolder = null) {
