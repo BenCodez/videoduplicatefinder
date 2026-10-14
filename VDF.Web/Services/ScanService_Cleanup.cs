@@ -14,10 +14,11 @@ public sealed partial class ScanService {
 	string? _resultStateFolder;
 	readonly HashSet<string> _observedReviewJournals = new(PathComparer.ForCurrentPlatform);
 
-	// Tests exercise trash/link failure without touching the user's recycle bin.
+	// Tests exercise file actions and database transitions using copied state.
 	internal Func<string, string, bool> TrashMover { get; set; } = MoveClaimToTrash;
 	internal Action<string, string, bool> LinkCreator { get; set; } = CreateLink;
 	internal Action<string, string> FileMover { get; set; } = File.Move;
+	internal Func<string?, Task<bool>> DatabaseLoader { get; set; } = ScanEngine.LoadDatabase;
 
 	async Task<IDisposable> AcquireMoveRetentionLeaseAsync() {
 		string folder = _resultStateFolder ?? throw new IOException("These results have no verified file snapshots.");
@@ -79,8 +80,18 @@ public sealed partial class ScanService {
 	}
 
 	async Task<bool> LoadDatabaseWithResultsAuthorityAsync(string? folder) {
+		string? requestedFolder = string.IsNullOrEmpty(folder) ? null : NormalizeDatabaseFolder(folder);
+		if (requestedFolder is not null && !Directory.Exists(requestedFolder)) {
+			// An unavailable explicit selection cannot borrow default state. This
+			// preflight has not touched other-folder results or the global wrapper.
+			InvalidateResultsDatabaseAuthority(requestedFolder);
+			throw new DirectoryNotFoundException("The requested database folder is unavailable. Restore it before continuing.");
+		}
 		try {
-			bool loaded = await ScanEngine.LoadDatabase(folder);
+			bool loaded = await DatabaseLoader(folder);
+			if (loaded && requestedFolder is not null && (!Directory.Exists(requestedFolder) ||
+				!PathComparer.ForCurrentPlatform.Equals(requestedFolder, NormalizeDatabaseFolder(DatabaseUtils.GetDatabaseFolderPath()))))
+				throw new IOException("The loaded database no longer matches the requested folder. Restore the folder before continuing.");
 			if (!loaded) InvalidateFailedResultsDatabaseLoad();
 			return loaded;
 		}
@@ -90,11 +101,15 @@ public sealed partial class ScanService {
 		}
 	}
 
-	void InvalidateFailedResultsDatabaseLoad() {
-		// LoadDatabase changes the global folder before importing its wrapper.
-		// Keep other-folder results usable, but revoke authority for failed results loads.
+	static string NormalizeDatabaseFolder(string folder) => Path.TrimEndingDirectorySeparator(Path.GetFullPath(folder));
+
+	void InvalidateFailedResultsDatabaseLoad() => InvalidateResultsDatabaseAuthority(DatabaseUtils.GetDatabaseFolderPath());
+
+	void InvalidateResultsDatabaseAuthority(string folder) {
+		// A rejected selection preserves results from another folder. Failed loads
+		// that touched their producing folder revoke those results' authority.
 		if (_resultStateFolder is not null && PathComparer.ForCurrentPlatform.Equals(
-			Path.GetFullPath(DatabaseUtils.GetDatabaseFolderPath()), Path.GetFullPath(_resultStateFolder)))
+			NormalizeDatabaseFolder(folder), NormalizeDatabaseFolder(_resultStateFolder)))
 			ClearCleanupSnapshots();
 	}
 

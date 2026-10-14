@@ -64,6 +64,10 @@ public sealed class CleanupProtectionGuard {
 		// the verified native/content snapshot so another path's protection counts.
 		if (_retainedFiles.Contains(RetentionKey(keeper)))
 			throw new IOException($"{operation} would change a deliberately protected file's identity. Change the review explicitly before this operation.");
+		// Callers can reach this check after their final media validation. Journal
+		// reads above may await; a replacement must not inherit that earlier proof.
+		if (!IdentityReader.MatchesCurrentSnapshot(keeper))
+			throw new IOException($"{operation} requires the reviewed file's unchanged current native snapshot.");
 	}
 
 	static (string, long, DateTime, DateTime, string, string) RetentionKey(FileIdentity identity) =>

@@ -19,6 +19,7 @@ public sealed class HardLinkCleanupTests {
             SettingsFile.SetSettingsPath(settingsPath);
             settings.CustomDatabaseFolder = folder;
             SettingsFile.SaveSettings();
+            StopShellSettingsAutosave();
             await work(folder);
         }
         catch {
@@ -36,8 +37,19 @@ public sealed class HardLinkCleanupTests {
         finally {
             settings.CustomDatabaseFolder = originalDatabase;
             SettingsFile.SetSettingsPath(null);
+            StopShellSettingsAutosave();
             try { Directory.Delete(folder, true); } catch { }
         }
+    }
+
+    static void StopShellSettingsAutosave() {
+        // This copied-settings fixture persists its setup explicitly. Do not let
+        // the shared window's unrelated delayed save export policy in the middle
+        // of a cleanup assertion; intentional review writers remain active.
+        var window = HeadlessUi.Shell().Window;
+        var timer = (Avalonia.Threading.DispatcherTimer)typeof(VDF.GUI.Views.MainWindow)
+            .GetField("settingsSaveDebounce", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(window)!;
+        timer.Stop();
     }
 
     static DuplicateItemVM Add(MainWindowVM vm, string folder, Guid group, string name) {

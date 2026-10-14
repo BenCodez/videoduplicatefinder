@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 using System.Text.Json;
+using System.Reflection;
 using VDF.Core.Cleanup;
 using VDF.Core.Nfo;
 using VDF.Core.Review;
@@ -609,5 +610,66 @@ public sealed class CleanupProtectionGuardTests : IDisposable {
 		await Policy();
 		await Assert.ThrowsAnyAsync<IOException>(() => new CleanupProtectionGuard(State).RemoveAsync(target, different, File.Delete, requireByteIdentical: true));
 		Assert.True(target.MatchesCurrent());
+	}
+
+	[Theory]
+	[InlineData(false)]
+	[InlineData(true)]
+	public async Task NativeMutationRejectsReplacementDuringRetentionReads(bool move) {
+		var (target, keeper) = Pair();
+		await Policy();
+		var expected = move ? target : keeper;
+		var guard = new CleanupProtectionGuard(State);
+		var gate = (SemaphoreSlim)typeof(CleanupProtectionGuard).GetField("_reviewGate", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(guard)!;
+		await gate.WaitAsync();
+		Task validation;
+		try {
+			validation = move ? guard.ValidateIdentityChangingMoveAsync(expected) : guard.ValidateHardLinkKeeperAsync(expected);
+			Assert.False(validation.IsCompleted);
+			File.Move(expected.Path, expected.Path + ".old");
+			File.WriteAllText(expected.Path, "duplicate media");
+			File.SetLastWriteTimeUtc(expected.Path, expected.LastWriteUtc);
+			File.SetCreationTimeUtc(expected.Path, expected.CreationUtc);
+			Assert.NotEqual(expected.StableFileId, FileIdentity.Capture(expected.Path)!.StableFileId);
+		}
+		finally { gate.Release(); }
+		await Assert.ThrowsAsync<IOException>(() => validation);
+		Assert.Equal("duplicate media", File.ReadAllText(expected.Path));
+		Assert.Equal("duplicate media", File.ReadAllText(expected.Path + ".old"));
+	}
+
+	[Fact]
+	public async Task FinalHardlinkRetentionAwaitCannotDeleteSourceUsingAReplacementKeeper() {
+		var (target, keeper) = Pair();
+		await Policy();
+		var guard = new CleanupProtectionGuard(State);
+		var gate = (SemaphoreSlim)typeof(CleanupProtectionGuard).GetField("_reviewGate", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(guard)!;
+		var callbackEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+		bool reserved = false, mutated = false;
+		guard.AfterLiveCheckAsync = async (claim, ct) => {
+			if (claim is null) return;
+			await gate.WaitAsync(ct);
+			reserved = true;
+		};
+		var removal = Task.Run(() => guard.RemoveAsync(target, keeper, claim => {
+			callbackEntered.TrySetResult();
+			guard.ValidateHardLinkKeeperAsync(keeper).GetAwaiter().GetResult();
+			mutated = true;
+			HardLinkUtils.CreateHardLink(target.Path, keeper.Path);
+			File.Delete(claim);
+		}));
+		try {
+			await callbackEntered.Task.WaitAsync(TimeSpan.FromSeconds(10));
+			Assert.False(removal.IsCompleted);
+			File.Move(keeper.Path, keeper.Path + ".old");
+			File.WriteAllText(keeper.Path, "unrelated replacement");
+		}
+		finally { if (reserved) gate.Release(); }
+		await Assert.ThrowsAsync<IOException>(() => removal);
+		Assert.False(mutated);
+		Assert.True(target.MatchesRelocated(FileIdentity.Capture(target.Path)));
+		Assert.Equal("unrelated replacement", File.ReadAllText(keeper.Path));
+		Assert.Equal("duplicate media", File.ReadAllText(keeper.Path + ".old"));
+		Assert.Empty(Directory.EnumerateFiles(_directory, ".vdf-*.holding", SearchOption.AllDirectories));
 	}
 }

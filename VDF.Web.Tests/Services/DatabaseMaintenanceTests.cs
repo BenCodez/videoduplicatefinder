@@ -87,6 +87,96 @@ public sealed class DatabaseMaintenanceTests : IAsyncLifetime {
 		Assert.Equal(databaseABefore, File.ReadAllBytes(Path.Combine(databaseA, "ScannedFiles.db")));
 	}
 
+	[Theory]
+	[InlineData(false)]
+	[InlineData(true)]
+	public async Task UnavailableExplicitFolderMaintenanceCannotBorrowFallbackState(bool clear) {
+		Directory.Delete(databaseB);
+		scan.Settings.CustomDatabaseFolder = databaseB;
+		int loads = 0;
+		// Model Core's fallback with copied A state; never touch the process's
+		// real default configuration while demonstrating this boundary.
+		scan.DatabaseLoader = async _ => { loads++; return await ScanEngine.LoadDatabase(databaseA); };
+		for (int retry = 0; retry < 2; retry++) {
+			await Assert.ThrowsAnyAsync<IOException>(async () => {
+				if (clear) await scan.ClearDatabaseAsync();
+				else await scan.CleanDatabaseAsync();
+			});
+			Assert.False(scan.IsBusy);
+			Assert.Equal(0, loads);
+			Assert.Equal(mediaPath, Assert.Single(DatabaseUtils.Database).Path);
+			Assert.Equal(databaseABefore, File.ReadAllBytes(Path.Combine(databaseA, "ScannedFiles.db")));
+			Assert.False(Directory.Exists(databaseB));
+		}
+	}
+
+	[Theory]
+	[InlineData(false, false)]
+	[InlineData(false, true)]
+	[InlineData(true, false)]
+	[InlineData(true, true)]
+	public async Task ExplicitFolderMaintenanceRequiresTheLoadedRequestedFolder(bool clear, bool folderRemains) {
+		scan.Settings.CustomDatabaseFolder = databaseB;
+		bool invoked = false;
+		scan.DatabaseLoader = async requested => {
+			Assert.Equal(databaseB, requested);
+			invoked = true;
+			if (!folderRemains) Directory.Move(databaseB, databaseB + ".offline");
+			return await ScanEngine.LoadDatabase(databaseA);
+		};
+		await Assert.ThrowsAnyAsync<IOException>(async () => {
+			if (clear) await scan.ClearDatabaseAsync();
+			else await scan.CleanDatabaseAsync();
+		});
+		Assert.True(invoked);
+		Assert.False(scan.IsBusy);
+		Assert.Equal(mediaPath, Assert.Single(DatabaseUtils.Database).Path);
+		Assert.Equal(databaseABefore, File.ReadAllBytes(Path.Combine(databaseA, "ScannedFiles.db")));
+		Assert.Empty(Directory.EnumerateFileSystemEntries(folderRemains ? databaseB : databaseB + ".offline"));
+	}
+
+	[Fact]
+	public async Task UnavailableOtherFolderMaintenanceKeepsProducingResultsUsable() {
+		var item = PublishResult();
+		Directory.Delete(databaseB);
+		scan.Settings.CustomDatabaseFolder = databaseB;
+		scan.DatabaseLoader = _ => throw new InvalidOperationException("An unavailable selection must not invoke the loader.");
+		await Assert.ThrowsAnyAsync<IOException>(() => scan.ClearDatabaseAsync());
+		string destination = Path.Combine(folder, "moved-after-unavailable-selection");
+		var result = await scan.MoveItemsAsync([item], destination);
+		Assert.Equal(1, result.Done);
+		Assert.Equal(0, result.Failed);
+		Assert.Empty(result.Errors);
+		Assert.False(File.Exists(mediaPath));
+		Assert.Equal(new byte[] { 1, 2, 3, 4 }, File.ReadAllBytes(Path.Combine(destination, Path.GetFileName(mediaPath))));
+		Assert.Equal(Path.GetFullPath(databaseA), Path.GetFullPath(DatabaseUtils.GetDatabaseFolderPath()));
+		Assert.False(Directory.Exists(databaseB));
+	}
+
+	[Fact]
+	public async Task UnavailableResultsFolderCannotLoadFallbackOnRetry() {
+		var item = PublishResult();
+		scan.Settings.CustomDatabaseFolder = databaseB;
+		Assert.Equal(0, await scan.CleanDatabaseAsync());
+		byte[] beforeB = File.ReadAllBytes(Path.Combine(databaseB, "ScannedFiles.db"));
+		Directory.Move(databaseA, databaseA + ".offline");
+		int loads = 0;
+		scan.DatabaseLoader = async _ => { loads++; return await ScanEngine.LoadDatabase(databaseB); };
+		string destination = Path.Combine(folder, "unavailable-results-move");
+		for (int retry = 0; retry < 2; retry++) {
+			var result = await scan.MoveItemsAsync([item], destination);
+			Assert.Equal(0, result.Done);
+			Assert.Equal(1, result.Failed);
+			Assert.NotEmpty(result.Errors);
+			Assert.True(File.Exists(mediaPath));
+			Assert.False(Directory.Exists(destination));
+			Assert.False(Directory.Exists(databaseA));
+			Assert.Equal(0, loads);
+			Assert.Equal(beforeB, File.ReadAllBytes(Path.Combine(databaseB, "ScannedFiles.db")));
+			Assert.Equal(databaseABefore, File.ReadAllBytes(Path.Combine(databaseA + ".offline", "ScannedFiles.db")));
+		}
+	}
+
 	DuplicateItem PublishResult(bool capture = true) {
 		var item = new DuplicateItem(new FileEntry(mediaPath), 0.02f, Guid.NewGuid(), DuplicateFlags.None);
 		scan.Engine.Duplicates.Add(item);

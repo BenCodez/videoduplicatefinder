@@ -38,6 +38,6 @@ jobs:
       run: |
         for ($iteration = 1; $iteration -le 10; $iteration++) {
           Write-Host "Hardlink batch regression iteration $iteration of 10"
-          dotnet test VDF.GUI.HeadlessTests/VDF.GUI.HeadlessTests.csproj -c Release --no-build --no-restore --filter "FullyQualifiedName~HardLinkBatchRefreshes" --logger "console;verbosity=normal"
+          dotnet test VDF.GUI.HeadlessTests/VDF.GUI.HeadlessTests.csproj -c Release --no-build --no-restore --filter "FullyQualifiedName~HardLinkBatchRefreshes|FullyQualifiedName~CleanupBatchWithUncachedIdentitiesSkipsOnlyCompletedRows" --logger "console;verbosity=normal"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
         }

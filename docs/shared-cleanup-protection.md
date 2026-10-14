@@ -60,3 +60,9 @@ refuses a file with a deliberate review on itself or any hardlink alias, because
 renaming changes the aliases' identity stamps. Change that review explicitly before
 moving; routine moves cannot invalidate a durable Keep, Protect, Ignore, or Reject
 decision and then authorize cleanup through a refreshed alias snapshot.
+
+Web database cleanup and clear require an available configured database folder
+and verify that the loaded folder still matches that selection. An unavailable
+explicit folder cannot authorize maintenance of the default database. Restore
+the selected folder before retrying; valid displayed results from another folder
+keep their own file-operation authority.
