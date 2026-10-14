@@ -27,6 +27,14 @@ jobs:
       run: dotnet test VDF.CLI.Tests/VDF.CLI.Tests.csproj -c Release -v q --logger "console;verbosity=normal"
     - name: Run GUI Tests
       run: dotnet test VDF.GUI.Tests/VDF.GUI.Tests.csproj -c Release -v q --logger "console;verbosity=normal"
+    - name: Repeat thumbnail reader concurrency regression
+      shell: pwsh
+      run: |
+        for ($iteration = 1; $iteration -le 10; $iteration++) {
+          Write-Host "Thumbnail reader concurrency iteration $iteration of 10"
+          dotnet test VDF.GUI.Tests/VDF.GUI.Tests.csproj -c Release --no-build --no-restore --filter "FullyQualifiedName~Readers_AreNotBlocked_WhileAWriterEncodes" --logger "console;verbosity=normal"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+        }
     - name: Run GUI Headless Tests
       run: dotnet test VDF.GUI.HeadlessTests/VDF.GUI.HeadlessTests.csproj -c Release -v q --logger "console;verbosity=normal"
     - name: Run Web Tests
