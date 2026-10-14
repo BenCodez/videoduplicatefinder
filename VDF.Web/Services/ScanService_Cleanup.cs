@@ -12,6 +12,7 @@ namespace VDF.Web.Services;
 public sealed partial class ScanService {
 	Dictionary<DuplicateItem, FileSnapshot> _resultSnapshots = new();
 	string? _resultStateFolder;
+	readonly HashSet<string> _observedReviewJournals = new(PathComparer.ForCurrentPlatform);
 
 	// Tests exercise trash/link failure without touching the user's recycle bin.
 	internal Func<string, string, bool> TrashMover { get; set; } = MoveClaimToTrash;
@@ -28,12 +29,61 @@ public sealed partial class ScanService {
 		lock (_operationSync) {
 			_resultSnapshots = snapshots;
 			_resultStateFolder = actualStateFolder ?? CoreUtils.ResolveDatabaseFolder(Settings.CustomDatabaseFolder);
+			ObserveReviewJournal(_resultStateFolder);
 		}
 	}
 
 	void ClearCleanupSnapshots() {
 		_resultSnapshots.Clear();
 		_resultStateFolder = null;
+	}
+
+	bool ObserveReviewJournal(string stateFolder) {
+		string fullFolder = Path.GetFullPath(stateFolder);
+		string path = Path.Combine(fullFolder, "ReviewedFiles.json");
+		try {
+			SafePaths.RequireDirectory(fullFolder);
+			string policyPath = Path.Combine(fullFolder, CleanupProtectionPolicyStore.FileName);
+			if (SafePaths.Exists(path) || SafePaths.Exists(path + ".bak") || SafePaths.Exists(path + ".lock") ||
+				SafePaths.Exists(policyPath) || SafePaths.Exists(policyPath + ".bak"))
+				_observedReviewJournals.Add(fullFolder);
+		}
+		catch {
+			// Inaccessible state must never count as an empty first generation.
+			_observedReviewJournals.Add(fullFolder);
+		}
+		return _observedReviewJournals.Contains(fullFolder);
+	}
+
+	async Task ValidateMoveRetentionAsync(FileIdentity identity) {
+		string folder = _resultStateFolder ?? throw new IOException("These results have no verified file snapshots.");
+		SafePaths.RequireDirectory(folder);
+		// A new optional Web state need not have a review journal. Persistent policy
+		// or lease files also prove initialization after restart; require its primary.
+		if (!ObserveReviewJournal(folder)) return;
+		// Renaming changes every hardlink alias's native stamp. Without a durable
+		// restoration proof we must retain deliberate decisions on any such alias.
+		await new CleanupProtectionGuard(folder).ValidateIdentityChangingMoveAsync(identity);
+	}
+
+	async Task<bool> LoadDatabaseWithResultsAuthorityAsync(string? folder) {
+		try {
+			bool loaded = await ScanEngine.LoadDatabase(folder);
+			if (!loaded) InvalidateFailedResultsDatabaseLoad();
+			return loaded;
+		}
+		catch {
+			InvalidateFailedResultsDatabaseLoad();
+			throw;
+		}
+	}
+
+	void InvalidateFailedResultsDatabaseLoad() {
+		// LoadDatabase changes the global folder before importing its wrapper.
+		// Keep other-folder results usable, but revoke authority for failed results loads.
+		if (_resultStateFolder is not null && PathComparer.ForCurrentPlatform.Equals(
+			Path.GetFullPath(DatabaseUtils.GetDatabaseFolderPath()), Path.GetFullPath(_resultStateFolder)))
+			ClearCleanupSnapshots();
 	}
 
 	static bool MatchesScannedMetadata(DuplicateItem item, long length, DateTime modifiedUtc) =>
@@ -66,14 +116,20 @@ public sealed partial class ScanService {
 				// Maintenance or edited settings can change the process-wide database.
 				// Cleanup records must update the database that produced these results.
 				if (!PathComparer.ForCurrentPlatform.Equals(Path.GetFullPath(DatabaseUtils.GetDatabaseFolderPath()),
-					Path.GetFullPath(_resultStateFolder)) && !await ScanEngine.LoadDatabase(_resultStateFolder))
+					Path.GetFullPath(_resultStateFolder)) && !await LoadDatabaseWithResultsAuthorityAsync(_resultStateFolder)) {
+					// A failed load can set the global folder while retaining another
+					// database wrapper. Retries must require a fresh scan authority.
+					ClearCleanupSnapshots();
 					throw new IOException("The results database could not be loaded; files were retained.");
-				await new LegacyRemovalService(Path.Combine(_resultStateFolder, "LegacyCleanupHistory.json")).RecoverAsync();
+				}
+				await guard.RecoverAsync();
 				var requestedPaths = requested.Select(item => item.Path).ToHashSet(PathComparer.ForCurrentPlatform);
 				var groups = _engine.Duplicates.GroupBy(item => item.GroupId)
 					.ToDictionary(group => group.Key, group => group.ToList());
 				var sw = System.Diagnostics.Stopwatch.StartNew();
 				foreach (var item in requested) {
+					Dictionary<DuplicateItem, FileIdentity>? keeperAliases = null;
+					bool hardLinkAttempted = false;
 					try {
 						if (!_engine.Duplicates.Contains(item))
 							throw new IOException("This file is no longer part of the current results.");
@@ -83,26 +139,33 @@ public sealed partial class ScanService {
 						if (protection.IsProtected) throw new IOException(protection.Reason);
 						if (!groups.TryGetValue(item.GroupId, out var group))
 							throw new IOException("The duplicate group is no longer available.");
-						DuplicateItem? keeperRow = null;
 						FileIdentity? keeper = null;
 						foreach (var candidate in group.Where(row => !requestedPaths.Contains(row.Path))
 							.OrderByDescending(row => row.Similarity)) {
 							var identity = CaptureReviewedIdentity(candidate);
 							if (identity is null || identity.StableFileId == target.StableFileId ||
 								PathComparer.ForCurrentPlatform.Equals(identity.Path, target.Path)) continue;
-							keeperRow = candidate;
 							keeper = identity;
 							break;
 						}
 						if (keeper is null)
 							throw new IOException("This group has no unselected, independent remaining file with a current scan identity.");
 						if (createLinks && hardLinks) await guard.ValidateHardLinkKeeperAsync(keeper);
-						var groupMembers = group.Select(CaptureReviewedIdentity).OfType<FileIdentity>().ToList();
+						// The group list predates this batch: successful removals no longer
+						// have snapshots, but every remaining member must still be verified.
+						var groupMembers = group.Where(row => _engine.Duplicates.Contains(row))
+							.Select(row => CaptureReviewedIdentity(row)
+								?? throw new IOException("A group member is unavailable or has changed since scanning. Rescan before removing files."))
+							.ToList();
+						if (createLinks && hardLinks) keeperAliases = CaptureKeeperAliases(keeper);
 						await guard.RemoveAsync(target, keeper, claim => {
 							// Recheck at the mutation boundary in case another frontend
 							// protected the keeper while its identities were validated.
 							if (createLinks && hardLinks) guard.ValidateHardLinkKeeperAsync(keeper).GetAwaiter().GetResult();
-							if (createLinks) CreateVerifiedReplacementLink(claim, target.Path, keeper.Path, hardLinks);
+							if (createLinks) {
+								hardLinkAttempted = hardLinks;
+								CreateVerifiedReplacementLink(claim, target.Path, keeper.Path, hardLinks);
+							}
 							else if (permanent) File.Delete(claim);
 							else if (!TrashMover(claim, target.Path))
 								throw new IOException("Moving to trash failed; the original file was retained.");
@@ -112,15 +175,16 @@ public sealed partial class ScanService {
 						ScanEngine.RemoveFromDatabase(new FileEntry { Path = item.Path });
 						result.FreedBytes += Math.Max(0, target.Length);
 						result.Done++;
-						// Creating a hardlink changes the keeper's link count/change stamp.
-						// Refresh only this verified, intentional change for the next item.
-						if (createLinks && hardLinks) RefreshKeeperAfterLink(keeperRow!, keeper);
 					}
 					catch (Exception ex) {
 						result.Errors.Add($"{Path.GetFileName(item.Path)}: {ex.Message}");
 						result.Failed++;
 					}
 					finally {
+						// A link attempt can change every keeper alias's stamp even if
+						// a later callback or journal step fails. Refresh only rows that
+						// were fully verified as that native snapshot before the attempt.
+						if (hardLinkAttempted) RefreshKeeperAliasesAfterLink(keeperAliases!);
 						FileOpCurrent++;
 						if (sw.ElapsedMilliseconds >= 100) { sw.Restart(); Notify(); }
 					}
@@ -140,13 +204,28 @@ public sealed partial class ScanService {
 		return result;
 	}
 
-	void RefreshKeeperAfterLink(DuplicateItem row, FileIdentity previous) {
-		var current = FileIdentity.Capture(previous.Path);
-		var snapshot = FileIdentity.CaptureSnapshot(previous.Path);
-		if (current is not null && snapshot is not null && snapshot.Matches(current) &&
-			current.StableFileId == previous.StableFileId && current.Sha256 == previous.Sha256 &&
-			current.Length == previous.Length && current.LastWriteUtc == previous.LastWriteUtc)
-			_resultSnapshots[row] = snapshot;
+	Dictionary<DuplicateItem, FileIdentity> CaptureKeeperAliases(FileIdentity keeper) {
+		var aliases = new Dictionary<DuplicateItem, FileIdentity>();
+		foreach (var (row, snapshot) in _resultSnapshots.ToArray()) {
+			if (!_engine.Duplicates.Contains(row) || snapshot.StableFileId != keeper.StableFileId ||
+				snapshot.Length != keeper.Length || snapshot.LastWriteUtc != keeper.LastWriteUtc ||
+				snapshot.CreationUtc != keeper.CreationUtc || snapshot.ChangeStamp != keeper.ChangeStamp) continue;
+			var previous = CaptureReviewedIdentity(row);
+			if (previous is not null && keeper.SameFileSnapshot(previous)) aliases.Add(row, previous);
+		}
+		return aliases;
+	}
+
+	void RefreshKeeperAliasesAfterLink(IReadOnlyDictionary<DuplicateItem, FileIdentity> aliases) {
+		foreach (var (row, previous) in aliases) {
+			if (!_engine.Duplicates.Contains(row) || !PathComparer.ForCurrentPlatform.Equals(row.Path, previous.Path) ||
+				!_resultSnapshots.TryGetValue(row, out var original) || !original.Matches(previous)) continue;
+			var current = IdentityReader.Capture(previous.Path, true, CancellationToken.None);
+			var snapshot = FileIdentity.CaptureSnapshot(previous.Path);
+			if (current is not null && snapshot is not null && snapshot.Matches(current) &&
+				previous.MatchesRelocated(current) && MatchesScannedMetadata(row, current.Length, current.LastWriteUtc))
+				_resultSnapshots[row] = snapshot;
+		}
 	}
 
 	static bool MoveClaimToTrash(string path, string originalPath) {

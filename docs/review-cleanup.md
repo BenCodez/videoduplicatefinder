@@ -1,7 +1,15 @@
 # Review persistence and quarantine
 
-Reviews and cleanup history are separate version 1 JSON journals. They do not
-change `ScannedFiles.db`, its schema, cached fingerprints, or existing database
+Reviews remain version 1 JSON journals. Legacy removal and quarantine history
+write version 2, read existing version 1 history, and migrate it on the next save.
+Version 2 records include durable proof for protection refresh after a verified
+source restoration; older applications refuse this format. Pair an older image
+with the complete pre-upgrade configuration/state snapshot when rolling back.
+First preserve the complete current state and quarantine destinations, and finish
+pending recovery in the newer image. A pre-upgrade snapshot cannot undo later
+media mutations or protection decisions: reconcile those before older-image
+cleanup, and validate the rollback with read-only media.
+These journals do not change `ScannedFiles.db`, its schema, cached fingerprints, or existing database
 migrations. JSON metadata is generated at build time for Native AOT. Writes use
 unique sibling files, flush file data, and atomically commit **two copies of the
 current generation**: the primary and its `.bak` mirror. A successful save does
@@ -51,6 +59,19 @@ selection/keeper flags, profile, explanation, and update UTC are preserved.
 `SelectionPlanStore` separately saves the full plan as a preview; a stored plan
 never authorizes deletion by itself.
 
+Review writers share a path transaction and an exclusive persistent lock file.
+GUI updates compare each row's observed journal generation with the current
+primary after file capture. Newer decisions at the same path or unrelated paths
+are preserved. A conflicting stale choice loads the saved decision; reapply the
+choice after reconciliation if it is still intended. Checkbox selection never
+implicitly clears a newer manual protection. Each row is reconciled against the generation its own transaction committed,
+even if another inspection reloads the shared cache before the UI resumes.
+Explicit choices made while saving remain pending for a later save, and verified hardlink keeper refresh reconciles
+both identities and foreign decisions before later automatic flushes. A mismatched
+file snapshot requires a rescan instead of attaching the decision to another file. First-time initialization
+creates an empty journal only when both generations are absent. A damaged or
+missing current primary blocks automatic updates and preserves the backup.
+
 `QuarantineService.PreviewAsync` validates and explains the operation without
 creating a journal or moving media. The destination must be outside the source and
 keeper paths, either an existing accessible directory or one new leaf beneath an
@@ -86,6 +107,10 @@ accounted for in history rather than deleted during recovery.
 
 `HistoryAsync` reconciles incomplete operations. A validated interrupted source
 claim is restored only to an empty original path; recovery never resumes deletion.
+Before a verified claim is restored, history records its native identity and full
+bytes. The shared guard then refreshes matching retention decisions at their
+recorded paths, including hardlink aliases. A failed or interrupted refresh stays
+pending and blocks cleanup of that file and its aliases until recovery succeeds.
 Conflicting/replaced paths and offline directories produce `NeedsAttention` and
 retain remaining data. A flushed final copy with an absent original can be
 recognized as completed quarantine. Incomplete restore operations similarly

@@ -20,6 +20,7 @@ public sealed class QuarantineRecord {
     public string RestoringPath { get; set; } = string.Empty;
     public FileIdentity? QuarantineIdentity { get; set; }
     public FileIdentity? RestoredIdentity { get; set; }
+    public FileIdentity? ProtectionRefreshClaim { get; set; }
     public QuarantineState State { get; set; }
     public bool ByteIdentical { get; set; }
     public string Reason { get; set; } = string.Empty;
@@ -40,8 +41,9 @@ public sealed class QuarantinePreview {
 }
 
 internal sealed class QuarantineEnvelope {
+	internal const int CurrentVersion = 2;
     [JsonRequired]
-    public int Version { get; set; } = 1;
+    public int Version { get; set; } = CurrentVersion;
     [JsonRequired]
     public List<QuarantineRecord> Operations { get; set; } = new();
 }

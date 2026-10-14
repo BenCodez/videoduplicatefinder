@@ -28,20 +28,41 @@ public sealed class CleanupProtectionGuard {
 		SafePaths.RequireDirectory(_stateFolder);
 	}
 	public void ClearCache() => _nfo.ClearCache();
-	public Task RecoverAsync() => new LegacyRemovalService(Path.Combine(_stateFolder, "LegacyCleanupHistory.json")).RecoverAsync();
+	public async Task RecoverAsync() {
+		await CreateRemovalService().RecoverAsync().ConfigureAwait(false);
+		var records = await QuarantineHistoryAsync().ConfigureAwait(false);
+		if (records.Any(record => record.ProtectionRefreshClaim is not null || record.State == QuarantineState.NeedsAttention))
+			throw new IOException("Some quarantine sources require recovery or their pending protection refresh before cleanup.");
+	}
+
+	public QuarantineService CreateQuarantineService() => new(Path.Combine(_stateFolder, "QuarantineHistory.json")) {
+		RefreshRestoredProtectionAsync = RefreshRestoredProtectionAsync
+	};
+	public Task<IReadOnlyList<QuarantineRecord>> QuarantineHistoryAsync() => CreateQuarantineService().HistoryAsync();
+
+	LegacyRemovalService CreateRemovalService() => new(Path.Combine(_stateFolder, "LegacyCleanupHistory.json")) {
+		RefreshRestoredProtectionAsync = RefreshRestoredProtectionAsync
+	};
 
 	public Task<CleanupProtectionCheck> InspectAsync(FileIdentity target, CancellationToken ct = default) =>
 		InspectCoreAsync(target, null, ct);
 
 	/// <summary>A hardlink changes keeper metadata; deliberate retention cannot cross that unjournaled change.</summary>
-	public async Task ValidateHardLinkKeeperAsync(FileIdentity keeper, CancellationToken ct = default) {
+	public Task ValidateHardLinkKeeperAsync(FileIdentity keeper, CancellationToken ct = default) =>
+		ValidateNativeIdentityMutationAsync(keeper, "Hardlink replacement", ct);
+
+	internal Task ValidateIdentityChangingMoveAsync(FileIdentity source, CancellationToken ct = default) =>
+		ValidateNativeIdentityMutationAsync(source, "Moving", ct);
+
+	async Task ValidateNativeIdentityMutationAsync(FileIdentity keeper, string operation, CancellationToken ct) {
 		ArgumentNullException.ThrowIfNull(keeper);
 		if (!keeper.IsWellFormed()) throw new IOException("A valid keeper identity is required.");
 		await GetReviewsAsync(ct).ConfigureAwait(false);
+		await RequireNoPendingRecoveryAsync(keeper, null, ct).ConfigureAwait(false);
 		// All hardlink aliases share the metadata that linking changes. Index by
 		// the verified native/content snapshot so another path's protection counts.
 		if (_retainedFiles.Contains(RetentionKey(keeper)))
-			throw new IOException("Hardlink replacement would change a deliberately protected keeper's identity. Use quarantine or choose a keeper without a deliberate protection decision.");
+			throw new IOException($"{operation} would change a deliberately protected file's identity. Change the review explicitly before this operation.");
 	}
 
 	static (string, long, DateTime, DateTime, string, string) RetentionKey(FileIdentity identity) =>
@@ -52,7 +73,13 @@ public sealed class CleanupProtectionGuard {
 		if (!target.IsWellFormed()) throw new IOException("A valid reviewed media identity is required.");
 		CleanupProtectionPolicy policy = await CleanupProtectionPolicyStore.LoadAsync(_stateFolder, ct).ConfigureAwait(false);
 		await GetReviewsAsync(ct).ConfigureAwait(false);
-		if (_retainedFiles.Contains(RetentionKey(target)))
+		await RequireNoPendingRecoveryAsync(target, claimPath, ct).ConfigureAwait(false);
+		FileIdentity? currentClaim = claimPath is null ? null :
+			await Task.Run(() => IdentityReader.Capture(claimPath, true, ct), ct).ConfigureAwait(false);
+		if (claimPath is not null && !target.MatchesRelocated(currentClaim))
+			throw new IOException("The claimed source cannot currently be validated for protection checks.");
+		if (_retainedFiles.Contains(RetentionKey(target)) ||
+			(currentClaim is not null && _retainedFiles.Contains(RetentionKey(currentClaim))))
 			return new(true, "A validated manual protection or review decision requires retaining this file.");
 		var folder = new FolderRuleMatcher(policy.FolderRules, policy.OverlapPolicy).Match(target.Path);
 		if (folder.Protected || folder.Uncertain) return new(true, folder.Reason);
@@ -73,11 +100,21 @@ public sealed class CleanupProtectionGuard {
 		foreach (FileIdentity member in members) {
 			ct.ThrowIfCancellationRequested();
 			if (member is null || !member.IsWellFormed()) throw new IOException("A duplicate group contains an invalid file identity.");
-			if (!reviews.TryGetValue(member.Path, out var record) || !record.Identity.Matches(member) ||
+			await RequireNoPendingRecoveryAsync(member, claimPath, ct).ConfigureAwait(false);
+			if (!reviews.TryGetValue(member.Path, out var record) ||
 				record.Choice is not (ReviewChoice.Ignore or ReviewChoice.RejectGroup)) continue;
-			bool current = claimPath is not null && target is not null && target.Matches(member) ||
-				await Task.Run(() => member.Matches(IdentityReader.Capture(member.Path, true, ct)), ct).ConfigureAwait(false);
-			if (current) throw new IOException("A validated group review decision requires retaining every member of this duplicate group.");
+			bool ownClaim = claimPath is not null && target is not null && SafePaths.Same(target.Path, member.Path);
+			var captured = await Task.Run(() => IdentityReader.Capture(ownClaim ? claimPath! : member.Path, true, ct), ct).ConfigureAwait(false);
+			// A verified rollback can refresh the saved veto while the caller still
+			// holds its old group snapshot. Validate that snapshot before treating a
+			// mismatched review as irrelevant to a genuinely replaced file.
+			if (captured is null || (ownClaim ? !target!.Matches(member) || !target.MatchesRelocated(captured) : !member.Matches(captured)))
+				throw new IOException("A reviewed group member is unavailable or changed. Refresh every member's identity before cleanup.");
+			// The active source is at its private claim path. Both a preclaim veto
+			// and a veto recorded against that exact claimed snapshot must survive;
+			// requiring the absent original path would invalidate this live check.
+			if (ownClaim ? record.Identity.Matches(member) || record.Identity.SameFileSnapshot(captured) : record.Identity.Matches(captured))
+				throw new IOException("A validated group review decision requires retaining every member of this duplicate group.");
 		}
 	}
 
@@ -95,9 +132,8 @@ public sealed class CleanupProtectionGuard {
 		IReadOnlyList<FileIdentity>? groupMembers = null, bool requireByteIdentical = false, CancellationToken ct = default) {
 		RequireIndependentPair(target, keeper, requireByteIdentical);
 		FileIdentity[]? group = groupMembers?.ToArray();
-		var removal = new LegacyRemovalService(Path.Combine(_stateFolder, "LegacyCleanupHistory.json")) {
-			ValidateProtectionAsync = (claim, token) => RequireUnprotectedAsync(target, group, claim, token)
-		};
+		var removal = CreateRemovalService();
+		removal.ValidateProtectionAsync = (claim, token) => RequireUnprotectedAsync(target, group, claim, token);
 		return removal.RemoveAsync(target, keeper, removeClaim, ct: ct);
 	}
 
@@ -112,11 +148,45 @@ public sealed class CleanupProtectionGuard {
 		IReadOnlyList<FileIdentity>? groupMembers, bool identical, CancellationToken ct) {
 		RequireIndependentPair(target, keeper, identical);
 		FileIdentity[]? group = groupMembers?.ToArray();
-		var service = new QuarantineService(Path.Combine(_stateFolder, "QuarantineHistory.json")) {
-			ValidateProtectionAsync = (claim, token) => RequireUnprotectedAsync(target, group, claim, token)
-		};
+		var service = CreateQuarantineService();
+		service.ValidateProtectionAsync = (claim, token) => RequireUnprotectedAsync(target, group, claim, token);
 		return identical ? service.QuarantineExactAsync(target, keeper, destination, ct: ct) :
 			service.QuarantineAsync(target, keeper, destination, ct: ct);
+	}
+
+	async Task RequireNoPendingRecoveryAsync(FileIdentity identity, string? activeClaim, CancellationToken ct) {
+		if (await CreateRemovalService().HasPendingRecoveryAsync(identity, activeClaim, ct).ConfigureAwait(false) ||
+			await CreateQuarantineService().HasPendingRecoveryAsync(identity, activeClaim, ct).ConfigureAwait(false))
+			throw new IOException("A cleanup claim or protection refresh for this file or a hardlink alias requires recovery first.");
+	}
+
+	async Task RefreshRestoredProtectionAsync(FileIdentity original, FileIdentity claim, FileIdentity restored, CancellationToken ct) {
+		if (!original.MatchesRelocated(claim) || !claim.MatchesRelocated(restored))
+			throw new IOException("Only the verified original source claim can refresh deliberate protection after restoration.");
+		var store = new ReviewStore(Path.Combine(_stateFolder, "ReviewedFiles.json"));
+		await store.UpdateAsync(records => {
+			var refreshed = new List<FileIdentity>();
+			var result = records.Select(record => {
+				if (!(record.ManuallyProtected || record.Choice is ReviewChoice.Keep or ReviewChoice.Ignore or ReviewChoice.RejectGroup) ||
+					!(record.Identity.SameFileSnapshot(original) || record.Identity.SameFileSnapshot(claim))) return record;
+				// A record may belong to any hardlink alias. Fully verify its recorded
+				// path; a readable unrelated replacement remains an invalid old review.
+				FileIdentity current = IdentityReader.Capture(record.Identity.Path, true, ct)
+					?? throw new IOException("A retained hardlink alias cannot currently be validated; source protection refresh remains pending.");
+				if (current.StableFileId != restored.StableFileId) return record;
+				if (!restored.SameFileSnapshot(current))
+					throw new IOException("A retained hardlink alias changed during source restoration; protection refresh remains pending.");
+				refreshed.Add(current);
+				return new ReviewRecord {
+					Identity = current, Choice = record.Choice, ManuallyProtected = record.ManuallyProtected,
+					AutomaticallySelected = record.AutomaticallySelected, IsKeeper = record.IsKeeper,
+					Profile = record.Profile, Reason = record.Reason, UpdatedUtc = record.UpdatedUtc
+				};
+			}).ToArray();
+			if (!IdentityReader.MatchesCurrentSnapshot(restored) || refreshed.Any(identity => !IdentityReader.MatchesCurrentSnapshot(identity)))
+				throw new IOException("The restored source or a retained hardlink alias changed before protection refresh.");
+			return result;
+		}, ct).ConfigureAwait(false);
 	}
 
 	async Task RequireUnprotectedAsync(FileIdentity target, IReadOnlyList<FileIdentity>? group, string? claim, CancellationToken ct) {

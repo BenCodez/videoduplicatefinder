@@ -53,7 +53,7 @@ public partial class MainWindowVM {
 			}).ToList());
 			string destination = string.IsNullOrWhiteSpace(SettingsFile.Instance.QuarantineFolder)
 				? Path.Combine(CoreUtils.ResolveDatabaseFolder(SettingsFile.Instance.CustomDatabaseFolder), "quarantine") : SettingsFile.Instance.QuarantineFolder;
-			var service = new QuarantineService(QuarantineHistoryFile);
+			var service = new CleanupProtectionGuard(CoreUtils.ResolveDatabaseFolder(SettingsFile.Instance.CustomDatabaseFolder)).CreateQuarantineService();
 			var validatedItems = new List<QuarantinePreviewItem>(items.Count);
 			foreach (var item in items) {
 				if (!item.CanQuarantine || item.TargetIdentity == null || item.KeeperIdentity == null) { validatedItems.Add(item); continue; }
@@ -97,8 +97,7 @@ public partial class MainWindowVM {
 					bool liveProtected = await Task.Run(() => { automationNfo.ClearCache(); return IsLiveCleanupProtected(row); }, cancellationToken);
 					if (liveProtected || !row.Checked || keeper.Checked) { skipped++; continue; }
 					if (row.IsProtected || candidate.ManuallyProtected || candidate.NfoProtected || candidate.ProtectionUncertain) { skipped++; continue; }
-					var group = Duplicates.Where(member => member.ItemInfo.GroupId == row.ItemInfo.GroupId)
-						.Select(member => member.AutomationIdentity).Where(identity => identity is not null).Cast<FileIdentity>().ToArray();
+					var group = CaptureCompleteCleanupGroup(row.ItemInfo.GroupId);
 					var result = await service.QuarantineAsync(item.TargetIdentity, item.KeeperIdentity, destination,
 						groupMembers: group, ct: cancellationToken);
 					if (result.State == QuarantineState.Quarantined) { Duplicates.Remove(row); moved++; }

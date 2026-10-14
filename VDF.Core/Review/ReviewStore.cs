@@ -25,12 +25,18 @@ public sealed class ReviewRecord {
 /// Offline identities remain stored but Find never returns an unvalidated decision.
 /// </summary>
 public sealed class ReviewStore {
+    // This gate covers the read/transform/write transaction across store instances.
+    // It is deliberately separate from DurableJsonFile's write-only gate.
+    private static readonly ConcurrentDictionary<string, SemaphoreSlim> Gates = new(PathComparer.ForCurrentPlatform);
     private readonly string _path;
-    private readonly SemaphoreSlim _gate = new(1, 1);
+    private readonly SemaphoreSlim _gate;
     private IReadOnlyList<ReviewRecord> _records = Array.Empty<ReviewRecord>();
     private Dictionary<string, ReviewRecord> _byPath = new(PathComparer.ForCurrentPlatform);
 
-    public ReviewStore(string path) => _path = SafePaths.Normalize(path);
+    public ReviewStore(string path) {
+        _path = SafePaths.Normalize(path);
+        _gate = Gates.GetOrAdd(_path, _ => new SemaphoreSlim(1, 1));
+    }
     public IReadOnlyList<ReviewRecord> Records => Volatile.Read(ref _records);
 
     public async Task LoadAsync() {
@@ -65,22 +71,85 @@ public sealed class ReviewStore {
         ArgumentNullException.ThrowIfNull(records);
         // Freeze mutable GUI records before awaiting. No available-file requirement:
         // deliberate protection must survive a temporarily offline media mount.
-        var snapshot = records.Select(Clone).GroupBy(r => r.Identity.Path, PathComparer.ForCurrentPlatform)
-            .Select(g => g.OrderByDescending(r => r.UpdatedUtc).ThenByDescending(r => r.ManuallyProtected).First())
-            .OrderBy(r => r.Identity.Path, PathComparer.ForCurrentPlatform).ToList();
-        var envelope = new ReviewEnvelope { Records = snapshot };
-        if (!ValidateEnvelope(envelope)) throw new InvalidDataException("A review record has an invalid identity or choice.");
+        var snapshot = Freeze(records);
         await _gate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try {
-            await DurableJsonFile.WriteAsync(_path, envelope, ReviewJsonContext.Default.ReviewEnvelope,
-                ValidateEnvelope, cancellationToken).ConfigureAwait(false);
-            ReplaceRecords(snapshot);
+            cancellationToken.ThrowIfCancellationRequested();
+            using var lease = JournalWriteLease.Acquire(_path);
+            await WriteRecordsAsync(snapshot, cancellationToken).ConfigureAwait(false);
         }
         finally { _gate.Release(); }
     }
 
+    /// <summary>
+    /// Applies a pure synchronous transform to the current primary journal in one
+    /// transaction. The transform must not call this store or perform journal I/O.
+    /// A missing or invalid primary requires explicit initialization or recovery.
+    /// </summary>
+    public async Task UpdateAsync(Func<IReadOnlyList<ReviewRecord>, IEnumerable<ReviewRecord>> update,
+        CancellationToken ct = default) {
+        await UpdateWithSnapshotAsync(update, ct).ConfigureAwait(false);
+    }
+
+    // Return this transaction's own generation, independent of later cache reloads.
+    // GUI callers must not use Records after an await to identify what they committed.
+    internal async Task<IReadOnlyList<ReviewRecord>> UpdateWithSnapshotAsync(
+        Func<IReadOnlyList<ReviewRecord>, IEnumerable<ReviewRecord>> update, CancellationToken ct = default) {
+        ArgumentNullException.ThrowIfNull(update);
+        await _gate.WaitAsync(ct).ConfigureAwait(false);
+        try {
+            ct.ThrowIfCancellationRequested();
+            using var lease = JournalWriteLease.Acquire(_path);
+            var envelope = await DurableJsonFile.ReadPrimaryAsync(_path, ReviewJsonContext.Default.ReviewEnvelope,
+                ValidateEnvelope, ct).ConfigureAwait(false) ??
+                throw new InvalidDataException("The current review journal is missing; restore or initialize it before updating.");
+            // Neither a retained callback input nor its mutable output may change
+            // the generation while serialization awaits filesystem operations.
+            var current = envelope.Records.Select(Clone).ToList().AsReadOnly();
+            var updated = update(current) ?? throw new InvalidDataException("The review update returned no records.");
+            var snapshot = Freeze(updated);
+            await WriteRecordsAsync(snapshot, ct).ConfigureAwait(false);
+            return snapshot.Select(Clone).ToList().AsReadOnly();
+        }
+        finally { _gate.Release(); }
+    }
+
+    /// <summary>Creates an empty first generation only when no journal generation exists.</summary>
+    internal async Task InitializeAsync(CancellationToken ct = default) {
+        await _gate.WaitAsync(ct).ConfigureAwait(false);
+        try {
+            ct.ThrowIfCancellationRequested();
+            using var lease = JournalWriteLease.Acquire(_path);
+            var envelope = await DurableJsonFile.ReadPrimaryAsync(_path, ReviewJsonContext.Default.ReviewEnvelope,
+                ValidateEnvelope, ct).ConfigureAwait(false);
+            if (envelope is not null) {
+                ReplaceRecords(envelope.Records);
+                return;
+            }
+            if (SafePaths.Exists(_path + ".bak"))
+                throw new InvalidDataException("The current review journal is missing but a backup exists; restore it before initialization.");
+            await WriteRecordsAsync(new(), ct).ConfigureAwait(false);
+        }
+        finally { _gate.Release(); }
+    }
+
+    private async Task WriteRecordsAsync(List<ReviewRecord> snapshot, CancellationToken ct) {
+        await DurableJsonFile.WriteAsync(_path, new ReviewEnvelope { Records = snapshot },
+            ReviewJsonContext.Default.ReviewEnvelope, ValidateEnvelope, ct).ConfigureAwait(false);
+        ReplaceRecords(snapshot);
+    }
+
+    private static List<ReviewRecord> Freeze(IEnumerable<ReviewRecord> records) {
+        var snapshot = records.Select(Clone).GroupBy(r => r.Identity.Path, PathComparer.ForCurrentPlatform)
+            .Select(g => g.OrderByDescending(r => r.UpdatedUtc).ThenByDescending(r => r.ManuallyProtected).First())
+            .OrderBy(r => r.Identity.Path, PathComparer.ForCurrentPlatform).ToList();
+        if (!ValidateEnvelope(new ReviewEnvelope { Records = snapshot }))
+            throw new InvalidDataException("A review record has an invalid identity or choice.");
+        return snapshot;
+    }
+
     private void ReplaceRecords(List<ReviewRecord> records) {
-        var byPath = records.GroupBy(r => r.Identity.Path, PathComparer.ForCurrentPlatform)
+        var byPath = records.Select(Clone).GroupBy(r => r.Identity.Path, PathComparer.ForCurrentPlatform)
             .ToDictionary(g => g.Key, g => g.OrderByDescending(r => r.UpdatedUtc)
                 .ThenByDescending(r => r.ManuallyProtected).First(), PathComparer.ForCurrentPlatform);
         Volatile.Write(ref _byPath, byPath);

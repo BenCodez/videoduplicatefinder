@@ -23,6 +23,7 @@ public sealed class CleanupProtectionPolicy {
 /// <summary>Durable, versioned projection beside the scan database and reviews.</summary>
 public static class CleanupProtectionPolicyStore {
 	public const string FileName = "CleanupProtectionPolicy.json";
+	static readonly System.Collections.Concurrent.ConcurrentDictionary<string, SemaphoreSlim> SaveGates = new(VDF.Core.Utils.PathComparer.ForCurrentPlatform);
 
 	/// <summary>Checks established protection state before an autosave can recreate missing settings.</summary>
 	public static async Task ValidateSettingsWriteAsync(string stateFolder, CancellationToken ct = default) {
@@ -39,24 +40,42 @@ public static class CleanupProtectionPolicyStore {
 	}
 
 	public static async Task SaveAsync(string stateFolder, CleanupProtectionPolicy policy,
-		string? sourceSettingsPath = null, CancellationToken ct = default) {
+		FileIdentity? sourceSettingsIdentity = null, CancellationToken ct = default) {
 		ArgumentNullException.ThrowIfNull(policy);
 		string path = PolicyPath(stateFolder);
+		var gate = SaveGates.GetOrAdd(path, _ => new SemaphoreSlim(1, 1));
+		await gate.WaitAsync(ct).ConfigureAwait(false);
+		try {
+			using var lease = JournalWriteLease.Acquire(path);
+			await SaveCoreAsync(path, policy, sourceSettingsIdentity, ct).ConfigureAwait(false);
+		}
+		finally { gate.Release(); }
+	}
+
+	static async Task SaveCoreAsync(string path, CleanupProtectionPolicy policy, FileIdentity? sourceSettingsIdentity, CancellationToken ct) {
 		var envelope = ProtectionPolicyEnvelope.From(policy);
-		if (string.IsNullOrWhiteSpace(sourceSettingsPath)) {
-			var current = await DurableJsonFile.ReadPrimaryAsync(path,
-				ProtectionPolicyJsonContext.Default.ProtectionPolicyEnvelope, Validate, ct).ConfigureAwait(false);
+		var current = await DurableJsonFile.ReadPrimaryAsync(path,
+			ProtectionPolicyJsonContext.Default.ProtectionPolicyEnvelope, Validate, ct).ConfigureAwait(false);
+		if (current is null && SafePaths.Exists(path + ".bak"))
+			throw new InvalidDataException("The current cleanup protection policy is missing; restore it before exporting cleanup protection settings.");
+		if (sourceSettingsIdentity is null) {
 			if (current?.SourceSettings is not null)
 				throw new InvalidDataException("An established protection policy references saved GUI settings. Restore those settings before exporting startup defaults.");
+		}
+		else {
+			if (!sourceSettingsIdentity.IsWellFormed()) throw new InvalidDataException("The source settings identity is invalid.");
+			var actual = await Task.Run(() => SettingsIdentity(sourceSettingsIdentity.Path, ct), ct).ConfigureAwait(false);
+			if (!sourceSettingsIdentity.HasSameBytes(actual))
+				throw new InvalidDataException("GUI settings changed while their protection projection was prepared. Reload or refresh them before cleanup.");
+			// Retain the identity of the exact bytes that produced this policy. A later
+			// settings edit must invalidate it, never lend its new hash to old protections.
+			envelope.SourceSettings = sourceSettingsIdentity;
 		}
 		string reviewsPath = Path.Combine(Path.GetDirectoryName(path)!, "ReviewedFiles.json");
 		if (!SafePaths.Exists(reviewsPath) && !SafePaths.Exists(reviewsPath + ".bak")) {
 			if (SafePaths.Exists(path) || SafePaths.Exists(path + ".bak"))
 				throw new InvalidDataException("An initialized state's review journal is missing; restore it before exporting cleanup protection settings.");
-			await new ReviewStore(reviewsPath).SaveAsync(Array.Empty<ReviewRecord>(), ct).ConfigureAwait(false);
-		}
-		if (!string.IsNullOrWhiteSpace(sourceSettingsPath)) {
-			envelope.SourceSettings = await Task.Run(() => SettingsIdentity(sourceSettingsPath, ct), ct).ConfigureAwait(false);
+			await new ReviewStore(reviewsPath).InitializeAsync(ct).ConfigureAwait(false);
 		}
 		await DurableJsonFile.WriteAsync(path, envelope, ProtectionPolicyJsonContext.Default.ProtectionPolicyEnvelope,
 			Validate, ct).ConfigureAwait(false);

@@ -33,6 +33,7 @@ namespace VDF.GUI.Data {
 	public class SettingsFile : ReactiveObject {
 		static SettingsFile? instance;
 		static string? settingsPath;
+		readonly Dictionary<string, VDF.Core.Review.FileIdentity?> knownSettingsIdentities = new(VDF.Core.Utils.PathComparer.ForCurrentPlatform);
 
 		[JsonIgnore]
 		public static SettingsFile Instance => instance ??= new SettingsFile();
@@ -417,9 +418,15 @@ namespace VDF.GUI.Data {
 		public static void SaveSettings(string? path = null) {
 			if (StartupLoadError is not null) throw new InvalidDataException("Settings are unreadable. Restore a valid settings file and reload or restart before saving cleanup protection settings.");
 			lock (settingsWriteGate) {
-				VDF.Core.Cleanup.CleanupProtectionPolicyStore.ValidateSettingsWriteAsync(
-					CoreUtils.ResolveDatabaseFolder(Instance.CustomDatabaseFolder)).GetAwaiter().GetResult();
 				path = Path.GetFullPath(ResolveSettingsPath(path));
+				bool activeSettings = VDF.Core.Review.SafePaths.Same(path, Path.GetFullPath(ResolveSettingsPath(null)));
+				using var lease = VDF.Core.Review.JournalWriteLease.Acquire(path);
+				if (Instance.knownSettingsIdentities.TryGetValue(path, out var loaded) &&
+					(loaded is null ? VDF.Core.Review.SafePaths.Exists(path) : !loaded.MatchesCurrent(forceHash: true)))
+					throw new InvalidDataException("Settings changed outside this GUI. Reload or restart before saving; the newer settings were preserved.");
+				if (activeSettings)
+					VDF.Core.Cleanup.CleanupProtectionPolicyStore.ValidateSettingsWriteAsync(
+						CoreUtils.ResolveDatabaseFolder(Instance.CustomDatabaseFolder)).GetAwaiter().GetResult();
 				Directory.CreateDirectory(Path.GetDirectoryName(path)!);
 				string temp = path + "." + Guid.NewGuid().ToString("N") + ".tmp";
 				try {
@@ -428,7 +435,11 @@ namespace VDF.GUI.Data {
 						stream.Flush(flushToDisk: true);
 					}
 					VDF.Core.Review.DurableFileOperations.Move(temp, path, overwrite: true);
-					ExportCleanupProtectionPolicyAsync(path).GetAwaiter().GetResult();
+					Instance.knownSettingsIdentities[path] = VDF.Core.Review.FileIdentity.Capture(path)
+						?? throw new IOException("The saved settings file could not be validated.");
+					// Named profiles are exports. Only the active settings file can
+					// authorize or anchor the protection policy used by live cleanup.
+					if (activeSettings) ExportCleanupProtectionPolicyAsync(path).GetAwaiter().GetResult();
 				}
 				finally { if (File.Exists(temp)) File.Delete(temp); }
 			}
@@ -436,14 +447,39 @@ namespace VDF.GUI.Data {
 
 		public static Task ExportCleanupProtectionPolicyAsync(string? sourceSettingsPath = null) {
 			if (StartupLoadError is not null) throw new InvalidDataException("Settings are unreadable; existing cleanup protections were preserved. Restore valid settings and reload or restart before cleanup.");
+			string path = Path.GetFullPath(ResolveSettingsPath(null));
+			if (!string.IsNullOrWhiteSpace(sourceSettingsPath) &&
+				!VDF.Core.Review.SafePaths.Same(path, Path.GetFullPath(sourceSettingsPath)))
+				throw new InvalidOperationException("A named settings profile cannot be the source of live cleanup protections. Save it as the active settings before exporting its protection policy.");
 			var settings = Instance;
-			string path = Path.GetFullPath(sourceSettingsPath ?? ResolveSettingsPath(null));
+			string stateFolder = CoreUtils.ResolveDatabaseFolder(settings.CustomDatabaseFolder);
+			VDF.Core.Review.FileIdentity? source = null;
+			if (VDF.Core.Review.SafePaths.Exists(path)) {
+				// A second GUI or an external edit may have changed protections since this
+				// instance loaded. Project saved bytes, not the stale in-memory instance.
+				settings = ReadSavedSettings(path, out var readSource);
+				source = readSource;
+			}
 			return VDF.Core.Cleanup.CleanupProtectionPolicyStore.SaveAsync(
-				CoreUtils.ResolveDatabaseFolder(settings.CustomDatabaseFolder), new VDF.Core.Cleanup.CleanupProtectionPolicy {
+				stateFolder, new VDF.Core.Cleanup.CleanupProtectionPolicy {
 					NfoOptions = settings.NfoFavourites,
 					FolderRules = settings.AutomationSelection.FolderRules,
 					OverlapPolicy = settings.AutomationSelection.OverlapPolicy
-				}, File.Exists(path) ? path : null);
+				}, source);
+		}
+
+		static SettingsFile ReadSavedSettings(string path, out VDF.Core.Review.FileIdentity source) {
+			VDF.Core.Review.SafePaths.RequireRegularFile(path);
+			if (new FileInfo(path).Length > 32L * 1024 * 1024) throw new InvalidDataException("The settings file exceeds the supported size limit.");
+			byte[] bytes = File.ReadAllBytes(path);
+			source = VDF.Core.Review.FileIdentity.Capture(path) ?? throw new IOException("The settings file is unavailable or changed during projection.");
+			if (source.Length != bytes.Length || source.Sha256 != Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(bytes)))
+				throw new InvalidDataException("GUI settings changed while they were read. Reload or refresh them before cleanup.");
+			var settings = JsonSerializer.Deserialize(bytes, GuiJsonContext.Default.SettingsFile)
+				?? throw new JsonException($"'{path}' does not contain a settings object.");
+			settings.MigrateLegacyValues();
+			settings.knownSettingsIdentities[source.Path] = source;
+			return settings;
 		}
 
 		[JsonPropertyName("UseMica")]
@@ -790,10 +826,17 @@ namespace VDF.GUI.Data {
 				return;
 
 			path = ResolveSettingsPath(path);
-			if (!File.Exists(path)) return;
-			instance = JsonSerializer.Deserialize(File.ReadAllBytes(path), GuiJsonContext.Default.SettingsFile)
-				?? throw new JsonException($"'{path}' does not contain a settings object.");
-			instance.MigrateLegacyValues();
+			if (!File.Exists(path)) {
+				if (VDF.Core.Review.SafePaths.Exists(path)) throw new IOException("The settings path is not an available regular file.");
+				Instance.knownSettingsIdentities[Path.GetFullPath(path)] = null;
+				return;
+			}
+			var loaded = ReadSavedSettings(path, out _);
+			// Importing/saving another profile must not forget the baseline of the
+			// active settings file and permit a later autosave to replace external edits.
+			if (instance is not null)
+				foreach (var entry in instance.knownSettingsIdentities) loaded.knownSettingsIdentities.TryAdd(entry.Key, entry.Value);
+			instance = loaded;
 			StartupLoadError = null;
 		}
 

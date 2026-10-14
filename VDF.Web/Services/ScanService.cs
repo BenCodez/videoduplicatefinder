@@ -298,16 +298,23 @@ namespace VDF.Web.Services {
 			var result = new FileOpResult();
 			if (!TryBeginFileOp("Moving", list.Count, result)) return result;
 			try {
-				try { Directory.CreateDirectory(destinationFolder); }
-				catch (Exception ex) {
-					result.Failed = list.Count;
-					result.Errors.Add($"Cannot create destination folder: {ex.Message}");
-					return result;
-				}
-				await Task.Run(() => {
+				await Task.Run(async () => {
+					if (_resultStateFolder is null)
+						throw new IOException("These results have no verified file snapshots. Rescan before moving files.");
+					if (!PathComparer.ForCurrentPlatform.Equals(Path.GetFullPath(DatabaseUtils.GetDatabaseFolderPath()),
+						Path.GetFullPath(_resultStateFolder)) && !await LoadDatabaseWithResultsAuthorityAsync(_resultStateFolder)) {
+						ClearCleanupSnapshots();
+						throw new IOException("The results database could not be loaded; files were retained.");
+					}
 					var sw = System.Diagnostics.Stopwatch.StartNew();
 					foreach (var item in list) {
 						try {
+							if (!_engine.Duplicates.Contains(item))
+								throw new IOException("This file is no longer part of the current results.");
+							var identity = CaptureReviewedIdentity(item)
+								?? throw new IOException("The file is unavailable or has changed since scanning. Rescan before moving it.");
+							await ValidateMoveRetentionAsync(identity);
+							Directory.CreateDirectory(destinationFolder);
 							string dest = Path.Combine(destinationFolder, Path.GetFileName(item.Path));
 							// Avoid overwriting existing files at destination
 							int n = 1;
@@ -315,8 +322,18 @@ namespace VDF.Web.Services {
 							string nameNoExt = Path.GetFileNameWithoutExtension(dest);
 							while (File.Exists(dest))
 								dest = Path.Combine(destinationFolder, $"{nameNoExt}_{n++}{ext}");
-							File.Move(item.Path, dest);
-							if (ScanEngine.GetFromDatabase(item.Path, out var dbEntry) && dbEntry != null)
+							if (!identity.MatchesCurrent(forceHash: true))
+								throw new IOException("The file changed before moving; it was retained.");
+							// Lookup requires the source path to exist; capture the entry before renaming.
+							ScanEngine.GetFromDatabase(item.Path, out var dbEntry);
+							var aliases = CaptureKeeperAliases(identity);
+							await ValidateMoveRetentionAsync(identity);
+							try { File.Move(item.Path, dest); }
+							finally {
+								// Renaming also changes native stamps on existing source aliases.
+								RefreshKeeperAliasesAfterLink(aliases);
+							}
+							if (dbEntry is not null)
 								ScanEngine.UpdateFilePathInDatabase(dest, dbEntry);
 							_engine.Duplicates.Remove(item);
 							_resultSnapshots.Remove(item);
@@ -331,10 +348,16 @@ namespace VDF.Web.Services {
 							if (sw.ElapsedMilliseconds >= 100) { sw.Restart(); Notify(); }
 						}
 					}
-					if (result.Done > 0)
-						ScanEngine.SaveDatabase();
-					DropSingletonGroups();
+					if (result.Done > 0) {
+						try { ScanEngine.SaveDatabase(); }
+						catch (Exception ex) { result.Errors.Add($"Files were moved, but saving the scan database failed: {ex.Message}"); }
+						DropSingletonGroups();
+					}
 				});
+			}
+			catch (Exception ex) {
+				result.Failed = list.Count - result.Done;
+				result.Errors.Add($"Move could not complete; remaining files were retained: {ex.Message}");
 			}
 			finally { EndFileOp(); }
 			return result;
@@ -349,9 +372,12 @@ namespace VDF.Web.Services {
 
 		/// <summary>Removes database entries for files that no longer exist or have errors.</summary>
 		public async Task<int> CleanDatabaseAsync() {
-			if (!TryBeginDataWork()) return 0;
+			if (!TryBeginDataWork())
+				throw new InvalidOperationException("A scan or another file/database operation is running. Wait for it to finish.");
 			try {
-				await ScanEngine.LoadDatabase(Settings.CustomDatabaseFolder);
+				if (!await LoadDatabaseWithResultsAuthorityAsync(Settings.CustomDatabaseFolder)) {
+					throw new IOException("The configured database could not be loaded; cleanup was not performed.");
+				}
 				int before = DatabaseEntryCount;
 				await Task.Run(() => DatabaseUtils.CleanupDatabase(preserveDeletedContentMemory: Settings.RememberDeletedContent));
 				return before - DatabaseEntryCount;
@@ -361,9 +387,12 @@ namespace VDF.Web.Services {
 
 		/// <summary>Wipes all entries from the scan database.</summary>
 		public async Task ClearDatabaseAsync() {
-			if (!TryBeginDataWork()) return;
+			if (!TryBeginDataWork())
+				throw new InvalidOperationException("A scan or another file/database operation is running. Wait for it to finish.");
 			try {
-				await ScanEngine.LoadDatabase(Settings.CustomDatabaseFolder);
+				if (!await LoadDatabaseWithResultsAuthorityAsync(Settings.CustomDatabaseFolder)) {
+					throw new IOException("The configured database could not be loaded; it was not cleared.");
+				}
 				ScanEngine.ClearDatabase();
 				_engine.Duplicates.Clear();
 				ClearCleanupSnapshots();

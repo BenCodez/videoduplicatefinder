@@ -61,7 +61,7 @@ public sealed class QuarantineServiceTests : IDisposable {
         record.QuarantinePath = legacyPath;
         record.QuarantineIdentity = FileIdentity.Capture(legacyPath);
         await DurableJsonFile.WriteAsync(History, new QuarantineEnvelope { Operations = [record] },
-            CleanupJsonContext.Default.QuarantineEnvelope, envelope => envelope.Version == 1);
+            CleanupJsonContext.Default.QuarantineEnvelope, envelope => envelope.Version == QuarantineEnvelope.CurrentVersion);
         await new QuarantineService(History).RestoreAsync(record.OperationId);
         Assert.Equal("original media bytes", await File.ReadAllTextAsync(pair.Target.Path));
         Assert.True(File.Exists(legacyPath));
@@ -260,6 +260,48 @@ public sealed class QuarantineServiceTests : IDisposable {
     }
 
     [Fact]
+    public async Task VersionOneHistory_IsRecoveredAndMigratedToVersionTwo() {
+        var pair = await PairAsync();
+        var operation = MakeRecord(pair, QuarantineState.SourceClaimed);
+        File.Move(pair.Target.Path, operation.SourceStagingPath);
+        await File.WriteAllTextAsync(History, JsonSerializer.Serialize(new QuarantineEnvelope { Version = 1, Operations = [operation] },
+            CleanupJsonContext.Default.QuarantineEnvelope));
+        Assert.Equal(QuarantineState.Recovered, Assert.Single(await new QuarantineService(History).HistoryAsync()).State);
+        var journal = Assert.IsType<QuarantineEnvelope>(await DurableJsonFile.ReadPrimaryAsync(History,
+            CleanupJsonContext.Default.QuarantineEnvelope, envelope => envelope.Version == QuarantineEnvelope.CurrentVersion));
+        Assert.Equal(QuarantineEnvelope.CurrentVersion, journal.Version);
+        Assert.True(pair.Target.MatchesRelocated(FileIdentity.Capture(pair.Target.Path)));
+        Assert.False(File.Exists(operation.SourceStagingPath));
+    }
+
+    [Fact]
+    public async Task VersionOneHistoryWithProtectionRefreshProof_IsRejectedWithoutRestoringSource() {
+        var pair = await PairAsync();
+        var operation = MakeRecord(pair, QuarantineState.SourceClaimed);
+        File.Move(pair.Target.Path, operation.SourceStagingPath);
+        operation.ProtectionRefreshClaim = Assert.IsType<FileIdentity>(FileIdentity.Capture(operation.SourceStagingPath));
+        string invalid = JsonSerializer.Serialize(new QuarantineEnvelope { Version = 1, Operations = [operation] },
+            CleanupJsonContext.Default.QuarantineEnvelope);
+        await File.WriteAllTextAsync(History, invalid);
+        await Assert.ThrowsAsync<InvalidDataException>(() => new QuarantineService(History).HistoryAsync());
+        Assert.Equal(invalid, await File.ReadAllTextAsync(History));
+        Assert.True(File.Exists(operation.SourceStagingPath));
+        Assert.False(File.Exists(pair.Target.Path));
+    }
+
+    [Fact]
+    public async Task UnsupportedHistoryVersion_IsPreservedWithoutMediaMutation() {
+        var pair = await PairAsync();
+        var operation = MakeRecord(pair, QuarantineState.Prepared);
+        string unsupported = JsonSerializer.Serialize(new QuarantineEnvelope { Version = 99, Operations = [operation] },
+            CleanupJsonContext.Default.QuarantineEnvelope);
+        await File.WriteAllTextAsync(History, unsupported);
+        await Assert.ThrowsAsync<NotSupportedException>(() => new QuarantineService(History).HistoryAsync());
+        Assert.Equal(unsupported, await File.ReadAllTextAsync(History));
+        Assert.True(pair.Target.MatchesCurrent());
+    }
+
+    [Fact]
     public async Task HistoryRecovery_RestoresInterruptedSourceClaimWithoutResumingDeletion() {
         var pair = await PairAsync();
         var operation = MakeRecord(pair, QuarantineState.SourceClaimed);
@@ -421,7 +463,7 @@ public sealed class QuarantineServiceTests : IDisposable {
         var second = Assert.IsType<FileIdentity>(FileIdentity.Capture(secondPath));
         var prepared = MakeRecord((second, pair.Keeper), QuarantineState.Prepared);
         await DurableJsonFile.WriteAsync(History, new QuarantineEnvelope { Operations = new() { earlier, prepared } },
-            CleanupJsonContext.Default.QuarantineEnvelope, envelope => envelope.Version == 1);
+            CleanupJsonContext.Default.QuarantineEnvelope, envelope => envelope.Version == QuarantineEnvelope.CurrentVersion);
         File.Copy(second.Path, prepared.QuarantinePath);
         File.Move(second.Path, prepared.SourceStagingPath); // Stops before any later state save.
         await File.WriteAllTextAsync(History, "{ corrupt current primary");
@@ -441,7 +483,7 @@ public sealed class QuarantineServiceTests : IDisposable {
         var operation = await service.QuarantineAsync(pair.Target, pair.Keeper, Destination);
         operation.State = QuarantineState.Restoring;
         await DurableJsonFile.WriteAsync(History, new QuarantineEnvelope { Operations = new() { operation } },
-            CleanupJsonContext.Default.QuarantineEnvelope, envelope => envelope.Version == 1);
+            CleanupJsonContext.Default.QuarantineEnvelope, envelope => envelope.Version == QuarantineEnvelope.CurrentVersion);
         File.Copy(operation.QuarantinePath, pair.Target.Path); // Restore committed before the final state save.
         await File.WriteAllTextAsync(History, "{ corrupt current primary");
         var recovered = Assert.Single(await service.HistoryAsync());

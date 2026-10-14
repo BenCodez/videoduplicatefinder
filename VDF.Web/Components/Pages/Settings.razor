@@ -1,5 +1,6 @@
 @page "/settings"
 @rendermode InteractiveServer
+@implements IDisposable
 @inject VDF.Web.Services.ScanService Scan
 @inject VDF.Web.Services.WebSettingsService WebSettings
 @using System.Globalization
@@ -352,13 +353,13 @@
 
     <h3>Maintenance</h3>
     <div style="display:flex;gap:0.5rem;align-items:center;flex-wrap:wrap;">
-        <button @onclick="CleanDatabase" disabled="@_dbBusy">Clean Database</button>
+        <button @onclick="CleanDatabase" disabled="@(_dbBusy || Scan.IsBusy)">Clean Database</button>
         @if (!_confirmClear) {
-            <button class="danger" @onclick="() => _confirmClear = true" disabled="@_dbBusy">Clear Database</button>
+            <button class="danger" @onclick="() => _confirmClear = true" disabled="@(_dbBusy || Scan.IsBusy)">Clear Database</button>
         }
         else {
             <span style="color:var(--danger-color,#d33);">This will delete ALL stored data. Are you sure?</span>
-            <button class="danger" @onclick="ClearDatabase">Yes, clear</button>
+            <button class="danger" @onclick="ClearDatabase" disabled="@(_dbBusy || Scan.IsBusy)">Yes, clear</button>
             <button @onclick="() => _confirmClear = false">Cancel</button>
         }
     </div>
@@ -421,6 +422,15 @@
     string _testFileB = string.Empty;
     bool _testBusy;
     string? _testResult;
+
+    protected override void OnInitialized() => Scan.StateChanged += OnStateChanged;
+
+    void OnStateChanged() {
+        try { _ = InvokeAsync(StateHasChanged); }
+        catch { }
+    }
+
+    public void Dispose() => Scan.StateChanged -= OnStateChanged;
 
     async Task RunFilePairTest() {
         _testBusy = true;

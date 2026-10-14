@@ -34,10 +34,46 @@ public sealed class CleanupReviewCacheTests {
 				Assert.Equal("{}", File.ReadAllText(path));
 			}
 			Assert.Equal(backup, File.ReadAllBytes(path + ".bak"));
+			// Closing an empty result set has no decisions to save and must remain
+			// possible so the damaged current ledger can be repaired on restart.
+			await vm.PrepareAutomationRescanAsync();
+			Assert.Equal(backup, File.ReadAllBytes(path + ".bak"));
 		}
 		finally {
 			// Appearance and the shared headless shell subscribe to this instance.
 			// Preserve it so later tests keep receiving property changes.
+			settings.CustomDatabaseFolder = originalDatabase;
+			SettingsFile.SetSettingsPath(null);
+			try { Directory.Delete(folder, true); } catch { }
+		}
+	});
+
+	[Fact]
+	public Task EmptyStartupFallbackCanPrepareToCloseWithoutRewritingUnreadableSettings() => HeadlessUi.Run(async () => {
+		string folder = Directory.CreateTempSubdirectory("vdf-unreadable-close-").FullName;
+		var settings = SettingsFile.Instance;
+		string originalDatabase = settings.CustomDatabaseFolder;
+		string path = Path.Combine(folder, "Settings.json");
+		try {
+			SettingsFile.SetSettingsPath(path);
+			settings.CustomDatabaseFolder = folder;
+			SettingsFile.SaveSettings();
+			string policy = Path.Combine(folder, VDF.Core.Cleanup.CleanupProtectionPolicyStore.FileName);
+			byte[] originalPolicy = File.ReadAllBytes(policy);
+			File.WriteAllText(path, "{ malformed json");
+			SettingsFile.LoadSettingsAtStartup();
+			Assert.NotNull(SettingsFile.StartupLoadError);
+			var vm = new MainWindowVM();
+			Assert.Empty(vm.Duplicates);
+			await vm.PrepareAutomationRescanAsync();
+			Assert.Equal("{ malformed json", File.ReadAllText(path));
+			Assert.Equal(originalPolicy, File.ReadAllBytes(policy));
+		}
+		finally {
+			// A missing fresh path clears the startup error without replacing the
+			// instance observed by the shared shell and appearance subscriptions.
+			SettingsFile.SetSettingsPath(Path.Combine(folder, "fresh.json"));
+			SettingsFile.LoadSettingsAtStartup();
 			settings.CustomDatabaseFolder = originalDatabase;
 			SettingsFile.SetSettingsPath(null);
 			try { Directory.Delete(folder, true); } catch { }

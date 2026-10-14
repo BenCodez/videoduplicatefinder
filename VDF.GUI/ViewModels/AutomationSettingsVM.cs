@@ -142,7 +142,8 @@ public sealed class AutomationSettingsVM : ReactiveObject {
 		finally { IsWorking = false; }
 	});
 
-	QuarantineService QuarantineService() => new(host?.QuarantineHistoryFile ?? Path.Combine(CoreUtils.ResolveDatabaseFolder(SettingsFile.Instance.CustomDatabaseFolder), "QuarantineHistory.json"));
+	QuarantineService QuarantineService() => new CleanupProtectionGuard(Path.GetDirectoryName(host?.QuarantineHistoryFile ??
+		Path.Combine(CoreUtils.ResolveDatabaseFolder(SettingsFile.Instance.CustomDatabaseFolder), "QuarantineHistory.json"))!).CreateQuarantineService();
 	public async Task ReloadHistoryAsync() {
 		try {
 			var records = await QuarantineService().HistoryAsync();

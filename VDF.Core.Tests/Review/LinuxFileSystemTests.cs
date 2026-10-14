@@ -5,6 +5,35 @@ using VDF.Core.Utils;
 namespace VDF.Core.Tests.Review;
 
 public sealed class LinuxFileSystemTests {
+    [Theory]
+    [InlineData(Architecture.Arm, 0x8C000)]
+    [InlineData(Architecture.Arm64, 0x8C000)]
+    [InlineData(Architecture.X86, 0xB0000)]
+    [InlineData(Architecture.X64, 0xB0000)]
+    public void DirectoryOpenFlags_MatchLinuxArchitectureUapi(Architecture architecture, int expected) =>
+        Assert.Equal(expected, LinuxFileSystem.DirectoryOpenFlags(architecture));
+
+    [Fact]
+    public void DirectoryOpenFlags_RejectUnsupportedArchitecture() =>
+        Assert.Throws<PlatformNotSupportedException>(() => LinuxFileSystem.DirectoryOpenFlags(Architecture.Wasm));
+
+    [Fact]
+    public void DirectoryFlush_RequiresARealDirectoryAndRefusesSymbolicLinks() {
+        if (!OperatingSystem.IsLinux()) return;
+        string directory = Directory.CreateTempSubdirectory("vdf-directory-flush-").FullName;
+        try {
+            string child = Directory.CreateDirectory(Path.Combine(directory, "real")).FullName;
+            string alias = Path.Combine(directory, "alias");
+            Directory.CreateSymbolicLink(alias, child);
+            string file = Path.Combine(directory, "file");
+            File.WriteAllText(file, "bytes");
+            LinuxFileSystem.FlushDirectory(child);
+            Assert.Throws<IOException>(() => LinuxFileSystem.FlushDirectory(alias));
+            Assert.Throws<IOException>(() => LinuxFileSystem.FlushDirectory(file));
+        }
+        finally { Directory.Delete(directory, true); }
+    }
+
     [Fact]
     public void StatxLayout_MatchesFixedLinuxKernelAbi() {
         Assert.Equal(16, Marshal.SizeOf<LinuxFileSystem.StatxTimestamp>());

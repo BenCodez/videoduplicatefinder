@@ -270,6 +270,11 @@ namespace VDF.GUI.ViewModels {
 		[JsonIgnore]
 		internal int AutomationReviewVersion { get; set; }
 		[JsonIgnore]
+		internal int AutomationProtectionVersion { get; set; }
+		[JsonIgnore]
+		internal AutomationReviewBaseline? ObservedReview { get; set; }
+
+		[JsonIgnore]
 		internal bool AutomationSnapshotInvalid { get; set; }
 		[JsonIgnore]
 		internal VDF.Core.Review.FileIdentity? AutomationIdentity { get; set; }

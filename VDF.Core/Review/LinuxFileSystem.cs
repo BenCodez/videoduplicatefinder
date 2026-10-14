@@ -72,15 +72,16 @@ internal static partial class LinuxFileSystem {
         return true;
     }
 
+    internal static int DirectoryOpenFlags(Architecture architecture) => architecture switch {
+        // Both ARM ABIs override asm-generic fcntl flags for AArch32 compatibility.
+        // See Linux arch/arm{,64}/include/uapi/asm/fcntl.h; on ARM64 0x10000 is O_DIRECT.
+        Architecture.Arm or Architecture.Arm64 => 0x4000 | 0x8000 | 0x80000,
+        Architecture.X86 or Architecture.X64 => 0x10000 | 0x20000 | 0x80000,
+        _ => throw new PlatformNotSupportedException("Directory durability flags are unavailable for this Linux architecture.")
+    };
+
     internal static void FlushDirectory(string directory) {
-        // ARM32 has legacy flag values; x86/x64/ARM64 use asm-generic values.
-        var architecture = RuntimeInformation.ProcessArchitecture;
-        int directoryFlag = architecture == Architecture.Arm ? 0x4000 : 0x10000;
-        int noFollowFlag = architecture == Architecture.Arm ? 0x8000 : 0x20000;
-        if (architecture is not (Architecture.Arm or Architecture.Arm64 or Architecture.X64 or Architecture.X86))
-            throw new PlatformNotSupportedException("Directory durability flags are unavailable for this Linux architecture.");
-        const int CloseOnExec = 0x80000;
-        int descriptor = Open(directory, directoryFlag | noFollowFlag | CloseOnExec);
+        int descriptor = Open(directory, DirectoryOpenFlags(RuntimeInformation.ProcessArchitecture));
         if (descriptor < 0)
             throw new IOException("The containing directory could not be opened for a durability flush.",
                 new Win32Exception(Marshal.GetLastPInvokeError()));

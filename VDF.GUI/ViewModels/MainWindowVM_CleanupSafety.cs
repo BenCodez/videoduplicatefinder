@@ -11,12 +11,20 @@ namespace VDF.GUI.ViewModels;
 
 public partial class MainWindowVM {
     internal sealed record ApprovedRemoval(DuplicateItemVM Item, FileIdentity Target, FileIdentity Keeper);
-    readonly SemaphoreSlim cleanupOperationGate = new(1, 1);
-    string LegacyCleanupJournal => Path.Combine(CoreUtils.ResolveDatabaseFolder(Data.SettingsFile.Instance.CustomDatabaseFolder), "LegacyCleanupHistory.json");
 
+    internal FileIdentity[] CaptureCompleteCleanupGroup(Guid groupId, IReadOnlySet<DuplicateItemVM>? completed = null) =>
+        Duplicates.Where(row => row.ItemInfo.GroupId == groupId && completed?.Contains(row) != true)
+        .Select(row => {
+            var identity = row.AutomationIdentity ?? FileIdentity.Capture(row.ItemInfo.Path);
+            if (!MatchesDisplayedScan(row, identity) || !identity!.MatchesCurrent())
+                throw new IOException("A duplicate group member is unavailable or changed. Retry when readable or rescan before cleanup.");
+            return identity!;
+        }).ToArray();
+
+    readonly SemaphoreSlim cleanupOperationGate = new(1, 1);
+    internal Func<Task>? BeforeCleanupKeeperReviewRefreshAsync { get; set; }
     public async Task RecoverCleanupStateAsync() {
-        await new VDF.Core.Cleanup.LegacyRemovalService(LegacyCleanupJournal).RecoverAsync();
-        await new VDF.Core.Cleanup.QuarantineService(QuarantineHistoryFile).HistoryAsync();
+        await new CleanupProtectionGuard(CoreUtils.ResolveDatabaseFolder(Data.SettingsFile.Instance.CustomDatabaseFolder)).RecoverAsync();
     }
 
     internal async Task<Dictionary<DuplicateItemVM, ApprovedRemoval>> PrepareCleanupGuardAsync(IReadOnlyList<DuplicateItemVM> requested) {
@@ -110,6 +118,10 @@ public partial class MainWindowVM {
 
     async Task<bool> RefreshCleanupKeeperAfterHardLinkCoreAsync(FileIdentity previous,
         Dictionary<DuplicateItemVM, ApprovedRemoval> approved) {
+            var aliases = Duplicates.Where(row => MatchesPreviousKeeperSnapshot(row, previous)).ToArray();
+            var versions = aliases.ToDictionary(row => row, row => row.AutomationReviewVersion);
+            var baselines = aliases.ToDictionary(row => row, row => row.ObservedReview);
+            var protectionVersions = aliases.ToDictionary(row => row, row => row.AutomationProtectionVersion);
             var verified = await Task.Run<(FileIdentity Identity, FileSnapshot Snapshot, DateTime Created)?>(() => {
                 var current = IdentityReader.Capture(previous.Path, true, CancellationToken.None);
                 var snapshot = FileIdentity.CaptureSnapshot(previous.Path);
@@ -119,26 +131,87 @@ public partial class MainWindowVM {
                 return (current, snapshot, new FileInfo(previous.Path).CreationTimeUtc);
             });
             if (verified is not { } refreshed) return false;
+            var currentAliases = await Task.Run(() => {
+                var captures = new Dictionary<string, (FileIdentity Identity, FileSnapshot Snapshot, DateTime Created)>(AutomationPathComparer) {
+                    [previous.Path] = refreshed
+                };
+                foreach (var row in aliases) {
+                    string path = row.ItemInfo.Path;
+                    if (captures.ContainsKey(path)) continue;
+                    var identity = IdentityReader.Capture(path, true, CancellationToken.None);
+                    var snapshot = FileIdentity.CaptureSnapshot(path);
+                    if (identity is null || snapshot is null || !snapshot.Matches(identity) || !refreshed.Identity.SameFileSnapshot(identity))
+                        return null;
+                    captures[path] = (identity, snapshot, new FileInfo(path).CreationTimeUtc);
+                }
+                return captures;
+            });
+            if (currentAliases is null) return false;
             var store = await GetAutomationReviewStoreAsync();
-            var records = store.Records.Select(record => previous.Matches(record.Identity) ? new ReviewRecord {
-                Identity = refreshed.Identity, Choice = record.Choice, ManuallyProtected = record.ManuallyProtected,
-                AutomaticallySelected = record.AutomaticallySelected, IsKeeper = record.IsKeeper,
-                Profile = record.Profile, Reason = record.Reason, UpdatedUtc = DateTime.UtcNow
-            } : record).ToList();
+            if (BeforeCleanupKeeperReviewRefreshAsync is not null) await BeforeCleanupKeeperReviewRefreshAsync();
             // Carry a matching manual review across this verified intentional
-            // link-count change before allowing another action to use the keeper.
-            await store.SaveAsync(records);
-            if (!refreshed.Snapshot.MatchesCurrent()) return false;
-            foreach (var row in Duplicates.Where(row => AutomationPathComparer.Equals(row.ItemInfo.Path, previous.Path))) {
-                if (row.AutomationIdentity is not null && !previous.Matches(row.AutomationIdentity)) continue;
-                row.AutomationIdentity = refreshed.Identity;
-                row.AutomationFileSnapshot = refreshed.Snapshot;
-                row.ItemInfo.DateCreated = refreshed.Created;
+            // link-count change in the current journal transaction, preserving
+            // cooperating writers' unrelated or newer decisions.
+            var foreignRows = new HashSet<DuplicateItemVM>();
+            var committed = await store.UpdateWithSnapshotAsync(current => {
+                foreach (var row in aliases) {
+                    var original = current.FirstOrDefault(record => AutomationPathComparer.Equals(record.Identity.Path, row.ItemInfo.Path));
+                    if (AutomationReviewBaseline.Of(original) != baselines[row]) foreignRows.Add(row);
+                }
+                var records = current.Select(record => {
+                    if (!previous.SameFileSnapshot(record.Identity)) return record;
+                    if (!currentAliases.TryGetValue(record.Identity.Path, out var alias)) {
+                        var identity = IdentityReader.Capture(record.Identity.Path, true, CancellationToken.None)
+                            ?? throw new IOException("A reviewed keeper alias cannot be validated; remaining cleanup requires a rescan.");
+                        if (identity.StableFileId != previous.StableFileId) return record;
+                        var snapshot = FileIdentity.CaptureSnapshot(identity.Path);
+                        if (snapshot is null || !snapshot.Matches(identity) || !refreshed.Identity.SameFileSnapshot(identity))
+                            throw new IOException("A reviewed keeper alias changed during the intentional hardlink refresh.");
+                        currentAliases[identity.Path] = alias = (identity, snapshot, new FileInfo(identity.Path).CreationTimeUtc);
+                    }
+                    return new ReviewRecord {
+                        Identity = alias.Identity, Choice = record.Choice, ManuallyProtected = record.ManuallyProtected,
+                        AutomaticallySelected = record.AutomaticallySelected, IsKeeper = record.IsKeeper,
+                        Profile = record.Profile, Reason = record.Reason, UpdatedUtc = DateTime.UtcNow
+                    };
+                }).ToArray();
+                if (currentAliases.Values.Any(alias => !alias.Snapshot.MatchesCurrent()))
+                    throw new IOException("The hardlink keeper or an alias changed before its review refresh could be committed.");
+                return records;
+            });
+            if (currentAliases.Values.Any(alias => !alias.Snapshot.MatchesCurrent())) return false;
+            var committedByPath = committed.ToDictionary(record => record.Identity.Path, AutomationPathComparer);
+            foreach (var row in aliases) {
+                if (!Duplicates.Contains(row) || !MatchesPreviousKeeperSnapshot(row, previous) ||
+                    !currentAliases.TryGetValue(row.ItemInfo.Path, out var alias)) continue;
+                row.AutomationIdentity = alias.Identity;
+                row.AutomationFileSnapshot = alias.Snapshot;
+                row.ItemInfo.DateCreated = alias.Created;
                 row.RaisePropertyChanged(nameof(DuplicateItemVM.ShownDate));
+                var record = committedByPath.GetValueOrDefault(row.ItemInfo.Path);
+                row.ObservedReview = AutomationReviewBaseline.Of(record);
+                if (foreignRows.Contains(row) && row.AutomationReviewVersion == versions[row]) {
+                    automaticReviewMutation++;
+                    try { ReconcileAutomationReview(row, record, alias.Identity); }
+                    finally { automaticReviewMutation--; }
+                }
+                else if (foreignRows.Contains(row)) {
+                    automaticReviewMutation++;
+                    try { ObserveAutomationReviewWithPendingChoice(row, record, protectionVersions[row], alias.Identity); }
+                    finally { automaticReviewMutation--; }
+                }
+
             }
             foreach (var entry in approved.ToList())
-                if (previous.Matches(entry.Value.Keeper)) approved[entry.Key] = entry.Value with { Keeper = refreshed.Identity };
+                if (previous.SameFileSnapshot(entry.Value.Keeper) && currentAliases.TryGetValue(entry.Value.Keeper.Path, out var approvedAlias))
+                    approved[entry.Key] = entry.Value with { Keeper = approvedAlias.Identity };
             return true;
+    }
+
+    static bool MatchesPreviousKeeperSnapshot(DuplicateItemVM row, FileIdentity previous) {
+        var expected = previous with { Path = row.ItemInfo.Path };
+        return (row.AutomationIdentity is { } identity ? expected.Matches(identity) : row.AutomationFileSnapshot?.Matches(expected) == true) &&
+            MatchesDisplayedScan(row, expected);
     }
 
     static bool MatchesDisplayedScan(DuplicateItemVM row, FileIdentity? identity) => identity is not null &&

@@ -14,6 +14,18 @@ using VDF.GUI.Views;
 
 namespace VDF.GUI.ViewModels;
 
+// Immutable copy of the exact journal generation observed by a displayed row.
+internal sealed record AutomationReviewBaseline(FileIdentity Identity, ReviewChoice Choice, bool Protected,
+	bool Automatic, bool Keeper, string Profile, string Reason, DateTime UpdatedUtc) {
+	internal static AutomationReviewBaseline? Of(ReviewRecord? record) => record is null ? null : new(
+		record.Identity, record.Choice, record.ManuallyProtected, record.AutomaticallySelected,
+		record.IsKeeper, record.Profile, record.Reason, record.UpdatedUtc);
+	internal ReviewRecord ToRecord() => new() {
+		Identity = Identity, Choice = Choice, ManuallyProtected = Protected, AutomaticallySelected = Automatic,
+		IsKeeper = Keeper, Profile = Profile, Reason = Reason, UpdatedUtc = UpdatedUtc
+	};
+}
+
 public partial class MainWindowVM {
 	static readonly StringComparer AutomationPathComparer = PathComparer.ForCurrentPlatform;
 	readonly SemaphoreSlim automationWorkGate = new(1, 1);
@@ -75,7 +87,7 @@ public partial class MainWindowVM {
 	}
 
 	sealed record AutomationRowSnapshot(DuplicateItemVM Row, int Version, bool Restored, bool Invalid, FileIdentity? Identity, FileSnapshot? FileSnapshot);
-	sealed record AutomationInspection(AutomationRowSnapshot Snapshot, bool Available, bool Stale, bool MetadataChanged, ReviewRecord? Review, NfoResult Nfo, DateTime? EmbeddedDate);
+	sealed record AutomationInspection(AutomationRowSnapshot Snapshot, bool Available, bool Stale, bool MetadataChanged, AutomationReviewBaseline? ObservedReview, ReviewRecord? Review, NfoResult Nfo, DateTime? EmbeddedDate);
 
 	internal static bool AutomationScanMetadataMatches(VDF.Core.ViewModels.DuplicateItem item) {
 		try {
@@ -94,7 +106,11 @@ public partial class MainWindowVM {
 		var options = AutomationSettingsVM.CloneSelectionOptions(SettingsFile.Instance.AutomationSelection ?? new());
 		var nfoOptions = AutomationSettingsVM.CloneNfoOptions(SettingsFile.Instance.NfoFavourites ?? new());
 		var store = await GetAutomationReviewStoreAsync();
-		var savedPaths = store.Records.Select(r => r.Identity.Path).ToHashSet(AutomationPathComparer);
+		// Observe one immutable journal generation before inspection awaits. A
+		// debounced save may reload this store while filesystem work is pending.
+		var observed = store.Records.Select(record => AutomationReviewBaseline.Of(record)!)
+			.ToDictionary(record => record.Identity.Path, AutomationPathComparer);
+		var savedPaths = observed.Keys.ToHashSet(AutomationPathComparer);
 		var inspections = await Task.Run(() => {
 			automationNfo.ClearCache();
 			return rows.Select(snapshot => {
@@ -108,13 +124,15 @@ public partial class MainWindowVM {
 				(snapshot.Identity != null && !currentSnapshot.Matches(snapshot.Identity)) ||
 				(snapshot.FileSnapshot != null && currentSnapshot != snapshot.FileSnapshot)));
 			bool changed = stale || (available && currentSnapshot == null);
-			ReviewRecord? review = !snapshot.Restored && savedPaths.Contains(path) ? store.Find(path) : null;
+			var baseline = observed.GetValueOrDefault(path);
+			ReviewRecord? review = !snapshot.Restored && baseline?.Identity.MatchesCurrent() == true ? baseline.ToRecord() : null;
 			var nfo = automationNfo.Inspect(path, nfoOptions);
 			DateTime? embedded = available && options.DateSource == SelectionDateSource.Embedded ? ReadEmbeddedDate(path) : null;
-			return new AutomationInspection(snapshot, available && !changed, stale, changed, review, nfo, embedded);
+			return new AutomationInspection(snapshot, available && !changed, stale, changed, baseline, review, nfo, embedded);
 			}).ToList();
 		});
 
+		if (BeforeAutomationInspectionAppliedAsync is not null) await BeforeAutomationInspectionAppliedAsync();
 		var candidates = new Dictionary<string, SelectionCandidate>(AutomationPathComparer);
 		var liveRows = Duplicates.ToHashSet();
 		automaticReviewMutation++;
@@ -134,7 +152,10 @@ public partial class MainWindowVM {
 						row.Checked = false;
 						row.SelectionReason = "File identity changed; previous review discarded.";
 					}
+					if (!inspection.Stale && !row.AutomationReviewRestored && inspection.Available)
+						row.ObservedReview = inspection.ObservedReview;
 					if (!inspection.Stale && !row.AutomationReviewRestored && inspection.Review is { } review) {
+						row.ObservedReview = AutomationReviewBaseline.Of(review);
 						row.AutomationIdentity = review.Identity;
 						row.ManuallyProtected = review.ManuallyProtected;
 						row.ManualReviewChoice = review.Choice;
@@ -310,9 +331,69 @@ public partial class MainWindowVM {
 		reviewSaveDebounce?.Cancel();
 		await reviewSaveTask;
 		await automationWorkGate.WaitAsync();
-		try { await SaveAutomationReviewRecordsAsync(); }
+		try {
+			// No decisions can be lost from an empty/unreviewed result set. In
+			// particular, unreadable startup state must not prevent closing to recover.
+			if (Duplicates.Any(d => d.ManuallyProtected || d.ManualReviewChoice != ReviewChoice.None ||
+				d.AutomaticallySelected || d.IsAutomationKeeper || d.AutomationIdentity != null))
+				await SaveAutomationReviewRecordsAsync();
+		}
 		finally { automationWorkGate.Release(); }
 	}
+
+	// Apply a foreign decision without turning checkbox notifications into local edits.
+	void ReconcileAutomationReview(DuplicateItemVM row, ReviewRecord? record, FileIdentity identity) {
+		row.AutomationReviewVersion++;
+		row.ObservedReview = AutomationReviewBaseline.Of(record);
+		if (record is not null && !identity.Matches(record.Identity)) {
+			row.AutomationSnapshotInvalid = true;
+			row.ProtectionUncertain = true;
+			row.IsProtected = true;
+			row.SelectionReason = "The current review belongs to a different file snapshot. Rescan before changing it.";
+			row.Checked = false;
+			row.NotifyAutomationStateChanged();
+			return;
+		}
+		row.ManuallyProtected = record?.ManuallyProtected ?? false;
+		row.ManualReviewChoice = record?.Choice ?? ReviewChoice.None;
+		row.AutomaticallySelected = record?.AutomaticallySelected ?? false;
+		row.IsAutomationKeeper = record?.IsKeeper ?? false;
+		row.SelectionProfileApplied = record?.Profile ?? string.Empty;
+		row.SelectionReason = record?.Reason ?? string.Empty;
+		row.IsAutomationGroupIgnored = row.ManualReviewChoice is ReviewChoice.Ignore or ReviewChoice.RejectGroup;
+		var options = SettingsFile.Instance.AutomationSelection;
+		var folder = new FolderRuleMatcher(options.FolderRules, options.OverlapPolicy).Match(row.ItemInfo.Path);
+		row.IsProtected = row.ManuallyProtected || row.IsNfoFavourite || row.ProtectionUncertain || folder.Protected || folder.Uncertain;
+		row.Checked = row.ManualReviewChoice == ReviewChoice.Remove ||
+			(row.ManualReviewChoice == ReviewChoice.None && row.AutomaticallySelected);
+		row.NotifyAutomationStateChanged();
+	}
+
+	void ObserveAutomationReviewWithPendingChoice(DuplicateItemVM row, ReviewRecord? saved, int protectionVersion, FileIdentity identity) {
+		row.AutomationReviewVersion++;
+		row.ObservedReview = AutomationReviewBaseline.Of(saved);
+		if (saved is not null && !identity.Matches(saved.Identity)) {
+			row.AutomationSnapshotInvalid = true;
+			row.ProtectionUncertain = true;
+			row.IsProtected = true;
+			row.Checked = false;
+			row.NotifyAutomationStateChanged();
+			return;
+		}
+		// A checkbox choice does not express an intent to change protection.
+		// Rebase that untouched field onto the current journal generation.
+		if (row.AutomationProtectionVersion == protectionVersion)
+			row.ManuallyProtected = saved?.ManuallyProtected ?? false;
+		if (row.ManuallyProtected) {
+			row.IsProtected = true;
+			row.Checked = false;
+		}
+		row.NotifyAutomationStateChanged();
+	}
+
+	internal Func<Task>? BeforeAutomationReviewCommitAsync { get; set; }
+	internal Func<Task>? BeforeAutomationInspectionAppliedAsync { get; set; }
+	internal Func<Task>? BeforeAutomationReviewReconciliationAsync { get; set; }
 
 	public async Task SaveAutomationReviewRecordsAsync() {
 		await automationReviewSaveGate.WaitAsync();
@@ -320,37 +401,58 @@ public partial class MainWindowVM {
 			var store = await GetAutomationReviewStoreAsync();
 			var snapshot = Duplicates.Where(d => d.ManuallyProtected || d.ManualReviewChoice != ReviewChoice.None ||
 				d.AutomaticallySelected || d.IsAutomationKeeper || d.AutomationIdentity != null)
-				.Select(d => (Row: d, Path: d.ItemInfo.Path, Choice: d.ManualReviewChoice, Protected: d.ManuallyProtected,
-					Automatic: d.AutomaticallySelected, Keeper: d.IsAutomationKeeper, Version: d.AutomationReviewVersion,
-					Profile: d.SelectionProfileApplied, Reason: d.SelectionReason, Identity: d.AutomationIdentity)).ToList();
-			var merged = store.Records.ToDictionary(r => r.Identity.Path, AutomationPathComparer);
+				.Select(d => (Row: d, Path: d.ItemInfo.Path, Baseline: d.ObservedReview,
+					Identity: d.AutomationIdentity, Snapshot: d.AutomationFileSnapshot, Invalid: d.AutomationSnapshotInvalid)).ToList();
 			var captured = await Task.Run(() => snapshot.Select(state => {
-				var identity = state.Row.AutomationSnapshotInvalid || !AutomationScanMetadataMatches(state.Row.ItemInfo) ? null :
+				var identity = state.Invalid || !AutomationScanMetadataMatches(state.Row.ItemInfo) ? null :
 					state.Identity != null && state.Identity.MatchesCurrent() ? state.Identity : FileIdentity.Capture(state.Path);
-				if (identity != null && state.Row.AutomationFileSnapshot != null && !state.Row.AutomationFileSnapshot.Matches(identity)) identity = null;
+				if (identity != null && state.Snapshot != null && !state.Snapshot.Matches(identity)) identity = null;
 				return (State: state, Identity: identity);
 			}).ToList());
-			var liveRows = Duplicates.ToHashSet();
-			foreach (var entry in captured) {
-				var state = entry.State;
-				// Inconclusive validation must never erase a durable protection. Cleanup
-				// independently validates the saved identity before it can authorize work.
-				if (entry.Identity == null) continue;
-				// A review belongs to the captured file. Never attach it to a replacement at the same path.
-				if (state.Identity != null && state.Identity != entry.Identity) { merged.Remove(state.Path); continue; }
-				bool currentRow = liveRows.Contains(state.Row) && AutomationPathComparer.Equals(state.Row.ItemInfo.Path, state.Path);
-				// Use a newer checkbox/protection choice made while identity capture was running.
-				merged[state.Path] = currentRow ? new ReviewRecord {
-					Identity = entry.Identity, Choice = state.Row.ManualReviewChoice, ManuallyProtected = state.Row.ManuallyProtected,
-					AutomaticallySelected = state.Row.AutomaticallySelected, IsKeeper = state.Row.IsAutomationKeeper,
-					Profile = state.Row.SelectionProfileApplied, Reason = state.Row.SelectionReason, UpdatedUtc = DateTime.UtcNow
-				} : new ReviewRecord {
-					Identity = entry.Identity, Choice = state.Choice, ManuallyProtected = state.Protected,
-					AutomaticallySelected = state.Automatic, IsKeeper = state.Keeper, Profile = state.Profile, Reason = state.Reason, UpdatedUtc = DateTime.UtcNow
-				};
-				if (liveRows.Contains(state.Row) && AutomationPathComparer.Equals(state.Row.ItemInfo.Path, state.Path)) state.Row.AutomationIdentity = entry.Identity;
+			var updates = captured.Where(entry => entry.Identity != null &&
+				(entry.State.Identity == null || entry.State.Identity == entry.Identity) &&
+				Duplicates.Contains(entry.State.Row) && AutomationPathComparer.Equals(entry.State.Row.ItemInfo.Path, entry.State.Path))
+				.Select(entry => (Row: entry.State.Row, Baseline: entry.State.Baseline,
+					Version: entry.State.Row.AutomationReviewVersion, ProtectionVersion: entry.State.Row.AutomationProtectionVersion, Record: new ReviewRecord {
+						Identity = entry.Identity!, Choice = entry.State.Row.ManualReviewChoice,
+						ManuallyProtected = entry.State.Row.ManuallyProtected, AutomaticallySelected = entry.State.Row.AutomaticallySelected,
+						IsKeeper = entry.State.Row.IsAutomationKeeper, Profile = entry.State.Row.SelectionProfileApplied,
+						Reason = entry.State.Row.SelectionReason, UpdatedUtc = DateTime.UtcNow
+					})).ToList();
+			if (BeforeAutomationReviewCommitAsync is not null) await BeforeAutomationReviewCommitAsync();
+			var conflicts = new HashSet<DuplicateItemVM>();
+			var committed = await store.UpdateWithSnapshotAsync(current => {
+				var merged = current.ToDictionary(record => record.Identity.Path, AutomationPathComparer);
+				foreach (var update in updates) {
+					merged.TryGetValue(update.Record.Identity.Path, out var existing);
+					if (AutomationReviewBaseline.Of(existing) != update.Baseline) {
+						conflicts.Add(update.Row);
+						continue;
+					}
+					merged[update.Record.Identity.Path] = update.Record;
+				}
+				return merged.Values;
+			});
+			if (BeforeAutomationReviewReconciliationAsync is not null) await BeforeAutomationReviewReconciliationAsync();
+			var committedByPath = committed.ToDictionary(record => record.Identity.Path, AutomationPathComparer);
+			automaticReviewMutation++;
+			try {
+				foreach (var update in updates) {
+					var row = update.Row;
+					if (!Duplicates.Contains(row) || !AutomationPathComparer.Equals(row.ItemInfo.Path, update.Record.Identity.Path)) continue;
+					var saved = committedByPath.GetValueOrDefault(row.ItemInfo.Path);
+					row.ObservedReview = AutomationReviewBaseline.Of(saved);
+					row.AutomationIdentity = update.Record.Identity;
+					// New local choices made during the transaction remain pending for
+					// the next save against this newly observed generation.
+					if (conflicts.Contains(row) && row.AutomationReviewVersion == update.Version)
+						ReconcileAutomationReview(row, saved, update.Record.Identity);
+					else if (conflicts.Contains(row))
+						ObserveAutomationReviewWithPendingChoice(row, saved, update.ProtectionVersion, update.Record.Identity);
+				}
 			}
-			await store.SaveAsync(merged.Values);
+			finally { automaticReviewMutation--; }
+			if (conflicts.Count > 0) AutomationStatus = "Newer saved review decisions were loaded. Reapply a conflicting choice if still intended.";
 		}
 		finally { automationReviewSaveGate.Release(); }
 	}
@@ -406,6 +508,7 @@ public partial class MainWindowVM {
 	public ReactiveCommand<DuplicateItemVM, Unit> ProtectAutomationItemCommand => ReactiveCommand.CreateFromTask<DuplicateItemVM>(item => AutomationUiCommandAsync(async () => {
 		if (item == null) return;
 		item.AutomationReviewVersion++;
+		item.AutomationProtectionVersion++;
 		item.ManuallyProtected = true;
 		item.IsProtected = true;
 		item.AutomationReviewRestored = true;
@@ -419,6 +522,7 @@ public partial class MainWindowVM {
 	public ReactiveCommand<DuplicateItemVM, Unit> UnprotectAutomationItemCommand => ReactiveCommand.CreateFromTask<DuplicateItemVM>(item => AutomationUiCommandAsync(async () => {
 		if (item == null) return;
 		item.AutomationReviewVersion++;
+		item.AutomationProtectionVersion++;
 		item.ManuallyProtected = false;
 		item.NotifyAutomationStateChanged();
 		await RunAutomationSelectionAsync(false);

@@ -61,6 +61,30 @@ public sealed class GuardedDeletionTests : IDisposable {
 	}
 
 	[Fact]
+	public async Task CleanupRestoresAnInterruptedUnselectedClaimWithoutReplayingItsDeletion() {
+		var (target, keeper) = Pair();
+		Guid oldGroup = Guid.NewGuid();
+		var interrupted = Item(Write("old/target.mkv"), oldGroup);
+		var oldKeeper = Item(Write("old/keeper.mkv"), oldGroup);
+		await Policy();
+		string id = Guid.NewGuid().ToString("N");
+		string claim = Path.Combine(Path.GetDirectoryName(interrupted.Path)!, $".vdf-{id}.holding");
+		var record = new LegacyRemovalRecord {
+			Id = id, Target = FileIdentity.Capture(interrupted.Path)!, Keeper = FileIdentity.Capture(oldKeeper.Path)!,
+			ClaimPath = claim, State = LegacyRemovalState.Claimed, RecoveryRequired = true, Outcome = "Synthetic interruption."
+		};
+		await DurableJsonFile.WriteAsync(Path.Combine(State, "LegacyCleanupHistory.json"), new LegacyRemovalEnvelope { Records = [record] },
+			LegacyRemovalJsonContext.Default.LegacyRemovalEnvelope, LegacyRemovalService.ValidateEnvelope);
+		File.Move(interrupted.Path, claim);
+		Assert.Equal(0, await Delete(target, keeper));
+		Assert.False(File.Exists(target.Path));
+		Assert.True(File.Exists(keeper.Path));
+		Assert.Equal("duplicate media", File.ReadAllText(interrupted.Path));
+		Assert.Equal("duplicate media", File.ReadAllText(oldKeeper.Path));
+		Assert.False(File.Exists(claim));
+	}
+
+	[Fact]
 	public async Task ExplicitDefaultPolicy_RemovesOnlyOneVerifiedCopy() {
 		var (target, keeper) = Pair();
 		await Policy();
@@ -107,6 +131,24 @@ public sealed class GuardedDeletionTests : IDisposable {
 		]);
 		Assert.Equal(1, await Delete(target, keeper));
 		Assert.True(File.Exists(target.Path));
+	}
+
+	[Fact]
+	public async Task UnreadableIgnoredThirdMemberCannotDisappearFromTheGroupGuard() {
+		var (target, keeper) = Pair();
+		var third = Item(Write("media/third.mkv"), target.GroupId);
+		await Policy();
+		await new ReviewStore(Path.Combine(State, "ReviewedFiles.json")).SaveAsync([
+			new() { Identity = FileIdentity.Capture(third.Path)!, Choice = ReviewChoice.Ignore }
+		]);
+		using (var locked = new FileStream(third.Path, FileMode.Open, FileAccess.ReadWrite, FileShare.None)) {
+			Assert.Null(FileIdentity.Capture(third.Path));
+			int failed = await GuardedDeletion.ExecuteAsync([target], [target, keeper, third], State, true, false, CancellationToken.None);
+			Assert.Equal(1, failed);
+			Assert.True(File.Exists(target.Path));
+			Assert.True(File.Exists(keeper.Path));
+		}
+		Assert.Equal("duplicate media", File.ReadAllText(third.Path));
 	}
 
 	[Fact]

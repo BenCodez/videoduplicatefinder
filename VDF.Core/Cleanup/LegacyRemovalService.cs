@@ -23,6 +23,7 @@ public sealed class LegacyRemovalService {
 	readonly string _journalPath;
 	readonly SemaphoreSlim _journalGate;
 	internal Func<string?, CancellationToken, Task>? ValidateProtectionAsync { get; set; }
+	internal Func<FileIdentity, FileIdentity, FileIdentity, CancellationToken, Task>? RefreshRestoredProtectionAsync { get; set; }
 
 	public LegacyRemovalService(string journalPath) {
 		_journalPath = SafePaths.Normalize(journalPath, rejectTraversal: true);
@@ -41,7 +42,7 @@ public sealed class LegacyRemovalService {
 				bool changed = false;
 				foreach (LegacyRemovalRecord record in journal.Records.Where(record => record.RecoveryRequired)) {
 					changed = true;
-					try { await ReconcileAsync(record, "Interrupted removal.").ConfigureAwait(false); }
+					try { await ReconcileAsync(journal, record, "Interrupted removal.").ConfigureAwait(false); }
 					catch (Exception ex) {
 						RequireManualRecovery(record);
 						failures.Add(ex);
@@ -71,7 +72,8 @@ public sealed class LegacyRemovalService {
 				using var lease = AcquireJournalLease();
 				LegacyRemovalEnvelope journal = await LoadAsync(ct).ConfigureAwait(false);
 				if (journal.Records.Any(record => record.RecoveryRequired &&
-					(SafePaths.Same(record.Target.Path, target.Path) || SafePaths.Same(record.Target.Path, keeper.Path) ||
+					(record.Target.StableFileId == target.StableFileId || record.Target.StableFileId == keeper.StableFileId ||
+					SafePaths.Same(record.Target.Path, target.Path) || SafePaths.Same(record.Target.Path, keeper.Path) ||
 					SafePaths.Same(record.ClaimPath, target.Path) || SafePaths.Same(record.ClaimPath, keeper.Path))))
 					throw new IOException("An earlier removal of this media requires recovery first.");
 				await Task.Run(() => ValidateBeforeClaim(target, keeper, ct), ct).ConfigureAwait(false);
@@ -140,7 +142,7 @@ public sealed class LegacyRemovalService {
 				}
 				catch (Exception removalError) {
 					var errors = new List<Exception> { removalError };
-					try { await ReconcileAsync(record, "Removal failed.", allowChangedClaim: claimed).ConfigureAwait(false); }
+					try { await ReconcileAsync(journal, record, "Removal failed.", allowChangedClaim: claimed).ConfigureAwait(false); }
 					catch (Exception recoveryError) {
 						RequireManualRecovery(record);
 						errors.Add(recoveryError);
@@ -190,7 +192,9 @@ public sealed class LegacyRemovalService {
 	static string ClaimPath(string target, string id) => System.IO.Path.Combine(
 		System.IO.Path.GetDirectoryName(target)!, $".vdf-{id}.holding");
 
-	static async Task ReconcileAsync(LegacyRemovalRecord record, string prefix, bool allowChangedClaim = false) {
+	async Task ReconcileAsync(LegacyRemovalEnvelope journal, LegacyRemovalRecord record, string prefix, bool allowChangedClaim = false) {
+		if (record.ProtectionRefreshClaim is not null && RefreshRestoredProtectionAsync is null)
+			throw new IOException("Pending restored-source protection must be refreshed by the guarded recovery service.");
 		SafePaths.RequireDirectory(System.IO.Path.GetDirectoryName(record.Target.Path)!);
 		bool claimExists = SafePaths.Exists(record.ClaimPath);
 		bool originalExists = SafePaths.Exists(record.Target.Path);
@@ -202,12 +206,25 @@ public sealed class LegacyRemovalService {
 				throw new IOException("The private claim no longer matches the original; it was preserved for manual recovery.");
 			if (originalExists)
 				throw new IOException("The original path already exists; neither it nor the private claim was overwritten.");
+			if (reviewedClaim && RefreshRestoredProtectionAsync is not null) {
+				// Persist the validated post-claim snapshot before restoring. If review
+				// refresh fails or the process stops after the rename, recovery can
+				// retry against this proof without trusting an arbitrary changed file.
+				record.ProtectionRefreshClaim = claim;
+				await SaveAsync(journal, CancellationToken.None).ConfigureAwait(false);
+				if (!IdentityReader.MatchesCurrentSnapshot(claim))
+					throw new IOException("The verified source claim changed before restoration.");
+			}
 			SafePaths.RequireNoLinks(record.Target.Path, allowMissing: true);
 			File.Move(record.ClaimPath, record.Target.Path, overwrite: false);
 			DurableFileOperations.FlushDirectory(System.IO.Path.GetDirectoryName(record.Target.Path)!);
 			FileIdentity? restored = await Task.Run(() => IdentityReader.Capture(record.Target.Path, true, CancellationToken.None)).ConfigureAwait(false);
 			if (!claim.MatchesRelocated(restored))
 				throw new IOException("The restored source could not be verified; manual recovery is required.");
+			if (reviewedClaim && RefreshRestoredProtectionAsync is not null) {
+				await RefreshRestoredProtectionAsync(record.Target, claim, restored!, CancellationToken.None).ConfigureAwait(false);
+				record.ProtectionRefreshClaim = null;
+			}
 			record.State = LegacyRemovalState.Failed;
 			record.RecoveryRequired = false;
 			record.Outcome = prefix + " Verified source claim restored without overwriting another file." +
@@ -217,16 +234,35 @@ public sealed class LegacyRemovalService {
 			FileIdentity? original = await Task.Run(() => IdentityReader.Capture(record.Target.Path, true, CancellationToken.None)).ConfigureAwait(false);
 			if (!record.Target.MatchesRelocated(original))
 				throw new IOException("The claim is missing and the original path was replaced; the replacement was preserved.");
+			if (record.ProtectionRefreshClaim is not null) {
+				if (RefreshRestoredProtectionAsync is null || !record.ProtectionRefreshClaim.MatchesRelocated(original))
+					throw new IOException("The restored source requires its pending protection refresh before recovery can complete.");
+				await RefreshRestoredProtectionAsync(record.Target, record.ProtectionRefreshClaim, original!, CancellationToken.None).ConfigureAwait(false);
+				record.ProtectionRefreshClaim = null;
+			}
+			else if (RefreshRestoredProtectionAsync is not null && !record.Target.Matches(original))
+				throw new IOException("The original changed without a durable restoration proof; protection requires manual recovery.");
 			record.State = LegacyRemovalState.Failed;
 			record.RecoveryRequired = false;
 			record.Outcome = prefix + " Claim absent and original verified; removal cancelled.";
 		}
 		else {
+			if (record.ProtectionRefreshClaim is not null)
+				throw new IOException("The source and claim are unavailable while protection refresh is pending; manual recovery is required.");
 			record.State = LegacyRemovalState.Completed;
 			record.RecoveryRequired = false;
 			record.Outcome = prefix + " Both original and claim are absent; outcome is uncertain and deletion will not be replayed.";
 		}
 		record.UpdatedUtc = DateTime.UtcNow;
+	}
+
+	internal async Task<bool> HasPendingRecoveryAsync(FileIdentity identity, string? activeClaim, CancellationToken ct) {
+		var journal = await DurableJsonFile.ReadPrimaryAsync(_journalPath,
+			LegacyRemovalJsonContext.Default.LegacyRemovalEnvelope, ValidateEnvelope, ct).ConfigureAwait(false);
+		if (journal is null && SafePaths.Exists(_journalPath + ".bak"))
+			throw new IOException("The current removal journal is missing; recovery is required before cleanup.");
+		return journal?.Records.Any(record => record.RecoveryRequired && record.Target.StableFileId == identity.StableFileId &&
+			(activeClaim is null || !SafePaths.Same(activeClaim, record.ClaimPath))) == true;
 	}
 
 	static void RequireManualRecovery(LegacyRemovalRecord record) {
@@ -242,6 +278,9 @@ public sealed class LegacyRemovalService {
 		if (journal.Records.Any(record => ReservedJournalPath(record.Target.Path) ||
 			ReservedJournalPath(record.Keeper.Path) || ReservedJournalPath(record.ClaimPath)))
 			throw new InvalidDataException("The removal journal overlaps media or a private claim; it was preserved.");
+		// Version 2 makes pending protection refresh mandatory for recovery. Older
+		// binaries reject it instead of silently ignoring the durable claim proof.
+		journal.Version = LegacyRemovalEnvelope.CurrentVersion;
 		return journal;
 	}
 
@@ -257,9 +296,10 @@ public sealed class LegacyRemovalService {
 	}
 
 	internal static bool ValidateEnvelope(LegacyRemovalEnvelope journal) {
-		if (journal.Version != 1)
+		if (journal.Version is not (1 or LegacyRemovalEnvelope.CurrentVersion))
 			throw new NotSupportedException("The removal journal schema version is unsupported; it was preserved.");
 		if (journal.Records is null || journal.Records.Count > MaximumRecords) return false;
+		if (journal.Version == 1 && journal.Records.Any(record => record?.ProtectionRefreshClaim is not null)) return false;
 		var ids = new HashSet<string>(StringComparer.Ordinal);
 		var claims = new HashSet<string>(PathComparer.ForCurrentPlatform);
 		foreach (LegacyRemovalRecord record in journal.Records) {
@@ -275,6 +315,9 @@ public sealed class LegacyRemovalService {
 					SafePaths.Same(record.Target.Path, record.Keeper.Path) || record.Target.StableFileId == record.Keeper.StableFileId ||
 					!SafePaths.Same(SafePaths.Normalize(record.ClaimPath, rejectTraversal: true), record.ClaimPath) ||
 					!SafePaths.Same(record.ClaimPath, ClaimPath(record.Target.Path, record.Id)) ||
+					(record.ProtectionRefreshClaim is not null && (!record.RecoveryRequired ||
+						!record.ProtectionRefreshClaim.IsWellFormed() || !SafePaths.Same(record.ProtectionRefreshClaim.Path, record.ClaimPath) ||
+						!record.Target.MatchesRelocated(record.ProtectionRefreshClaim))) ||
 					!claims.Add(record.ClaimPath)) return false;
 			}
 			catch (Exception ex) when (ex is ArgumentException or IOException or NotSupportedException) { return false; }
@@ -298,6 +341,7 @@ internal sealed class LegacyRemovalRecord {
 	public LegacyRemovalState State { get; set; }
 	[JsonRequired]
 	public bool RecoveryRequired { get; set; }
+	public FileIdentity? ProtectionRefreshClaim { get; set; }
 	[JsonRequired]
 	public DateTime CreatedUtc { get; set; } = DateTime.UtcNow;
 	[JsonRequired]
@@ -307,8 +351,9 @@ internal sealed class LegacyRemovalRecord {
 }
 
 internal sealed class LegacyRemovalEnvelope {
+	internal const int CurrentVersion = 2;
 	[JsonRequired]
-	public int Version { get; set; } = 1;
+	public int Version { get; set; } = CurrentVersion;
 	[JsonRequired]
 	public List<LegacyRemovalRecord> Records { get; set; } = new();
 }

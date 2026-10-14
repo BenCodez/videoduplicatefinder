@@ -2003,8 +2003,7 @@ Non-Windows setup:
 								var action = approved[item];
 								bool protectedNow = IsLiveCleanupProtected(item);
 								if (protectedNow) throw new IOException("The file is protected; cleanup was cancelled.");
-								var group = Duplicates.Where(row => row.ItemInfo.GroupId == item.ItemInfo.GroupId)
-									.Select(row => row.AutomationIdentity).Where(identity => identity is not null).Cast<VDF.Core.Review.FileIdentity>().ToArray();
+								var group = CaptureCompleteCleanupGroup(item.ItemInfo.GroupId, deleted);
 								if (createLinks) await ReplaceApprovedWithLinkAsync(removal, action, approved, group, createHardLinksInstead);
 								else await removal.RemoveAsync(action.Target, action.Keeper, claim => {
 									if (permanently) File.Delete(claim);

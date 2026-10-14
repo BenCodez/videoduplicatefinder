@@ -21,6 +21,38 @@ namespace VDF.Core.Tests;
 
 [Collection("DatabaseUtils")] // redirects the process-wide database folder — never run parallel to other DB tests
 public class DatabaseCustomFolderTests {
+	[Theory]
+	[InlineData(false)]
+	[InlineData(true)]
+	public async Task SwitchingToAFreshFolderLoadsAnEmptyDatabaseWithoutChangingTheOldFile(bool zeroByteFile) {
+		string root = Directory.CreateTempSubdirectory("vdf-database-switch-").FullName;
+		string first = Directory.CreateDirectory(Path.Combine(root, "first")).FullName;
+		string second = Directory.CreateDirectory(Path.Combine(root, "second")).FullName;
+		try {
+			Assert.True(await ScanEngine.LoadDatabase(first));
+			DatabaseUtils.Database.Add(new FileEntry { Path = Path.Combine(root, "entry.mkv"), Folder = root });
+			ScanEngine.SaveDatabase();
+			string oldPath = Path.Combine(first, "ScannedFiles.db");
+			byte[] oldDatabase = File.ReadAllBytes(oldPath);
+			Assert.True(await ScanEngine.LoadDatabase(first));
+			Assert.Single(DatabaseUtils.Database);
+			string newPath = Path.Combine(second, "ScannedFiles.db");
+			if (zeroByteFile) File.WriteAllBytes(newPath, []);
+			Assert.True(await ScanEngine.LoadDatabase(second));
+			Assert.Empty(DatabaseUtils.Database);
+			ScanEngine.SaveDatabase();
+			Assert.Equal(oldDatabase, File.ReadAllBytes(oldPath));
+			Assert.False(File.Exists(Path.Combine(second, "ScannedFiles.fpheal1")));
+			Assert.True(await ScanEngine.LoadDatabase(first));
+			Assert.Single(DatabaseUtils.Database);
+		}
+		finally {
+			DatabaseUtils.Database.Clear();
+			DatabaseUtils.CustomDatabaseFolder = null;
+			DatabaseUtils.InvalidateDatabaseFolder();
+			try { Directory.Delete(root, recursive: true); } catch { }
+		}
+	}
 
 	// Regression for the startup path: LoadDatabase(customFolder) must make the custom
 	// folder the active database location — before the fix only the first scan did, so

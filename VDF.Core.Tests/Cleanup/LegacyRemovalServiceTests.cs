@@ -469,6 +469,33 @@ public sealed class LegacyRemovalServiceTests : IDisposable {
 	}
 
 	[Fact]
+	public async Task VersionOneJournal_IsRecoveredAndMigratedToVersionTwo() {
+		var (target, keeper) = Pair();
+		LegacyRemovalRecord record = await Interrupted(target, keeper);
+		File.WriteAllText(JournalPath, JsonSerializer.Serialize(new LegacyRemovalEnvelope { Version = 1, Records = [record] },
+			LegacyRemovalJsonContext.Default.LegacyRemovalEnvelope));
+		await Service.RecoverAsync();
+		Assert.Equal(LegacyRemovalEnvelope.CurrentVersion, (await ReadJournal()).Version);
+		Assert.True(target.MatchesRelocated(FileIdentity.Capture(target.Path)));
+		AssertNoClaims();
+	}
+
+	[Fact]
+	public async Task VersionOneJournalWithProtectionRefreshProof_IsRejectedWithoutRestoringSource() {
+		var (target, keeper) = Pair();
+		LegacyRemovalRecord record = await Interrupted(target, keeper);
+		record.ProtectionRefreshClaim = Assert.IsType<FileIdentity>(FileIdentity.Capture(record.ClaimPath));
+		string invalid = JsonSerializer.Serialize(new LegacyRemovalEnvelope { Version = 1, Records = [record] },
+			LegacyRemovalJsonContext.Default.LegacyRemovalEnvelope);
+		File.WriteAllText(JournalPath, invalid);
+		File.Delete(JournalPath + ".bak");
+		await Assert.ThrowsAsync<InvalidDataException>(() => Service.RecoverAsync());
+		Assert.Equal(invalid, File.ReadAllText(JournalPath));
+		Assert.True(File.Exists(record.ClaimPath));
+		Assert.False(File.Exists(target.Path));
+	}
+
+	[Fact]
 	public async Task UnsupportedJournalVersion_IsPreservedWithoutMediaMutation() {
 		var (target, keeper) = Pair();
 		LegacyRemovalRecord record = await Interrupted(target, keeper);

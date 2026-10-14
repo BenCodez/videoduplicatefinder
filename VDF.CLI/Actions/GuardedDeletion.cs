@@ -13,6 +13,7 @@ internal static class GuardedDeletion {
 	internal static async Task<int> ExecuteAsync(IReadOnlyList<DuplicateItem> marked,
 		IReadOnlyList<DuplicateItem> allItems, string stateFolder, bool permanent, bool dryRun, CancellationToken ct) {
 		var guard = new CleanupProtectionGuard(stateFolder);
+		if (!dryRun) await guard.RecoverAsync();
 		await CleanupProtectionPolicyStore.LoadAsync(stateFolder, ct);
 		guard.ClearCache();
 		var selectedPaths = marked.Select(item => Path.GetFullPath(item.Path)).ToHashSet(PathComparer.ForCurrentPlatform);
@@ -38,7 +39,8 @@ internal static class GuardedDeletion {
 				FileIdentity? keeper = null;
 				foreach (DuplicateItem member in group.OrderBy(member => member.Path, PathComparer.ForCurrentPlatform)) {
 					var identity = await Capture(member);
-					if (identity is null) continue;
+					if (identity is null)
+						throw new IOException("A duplicate group member is unavailable or changed; retry when readable or rescan before cleanup.");
 					members.Add(identity);
 					if (keeper is null && !selectedPaths.Contains(identity.Path) && identity.StableFileId != target.StableFileId &&
 						identity.Length == target.Length && identity.Sha256 == target.Sha256) keeper = identity;

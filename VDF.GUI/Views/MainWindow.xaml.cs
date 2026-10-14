@@ -364,7 +364,9 @@ namespace VDF.GUI.Views {
 		void MainWindow_Exit(object? sender, ControlledApplicationLifetimeExitEventArgs e) {
 			if (hasExited) return;
 			hasExited = true;
-			SettingsFile.SaveSettings();
+			settingsSaveDebounce?.Stop();
+			try { SettingsFile.SaveSettings(); }
+			catch (Exception error) { Logger.Instance.Error($"Settings could not be saved on exit; existing files were preserved: {error}"); }
 		}
 
 		async void MainWindow_Startup(object? sender, ControlledApplicationLifetimeStartupEventArgs e) {
@@ -373,8 +375,29 @@ namespace VDF.GUI.Views {
 			try {
 				await vm.LoadStartupStateAsync();
 			}
-			catch (Exception) {
+			catch (Exception error) {
+				Logger.Instance.Error($"Startup state could not be loaded. Scheduled scans remain paused: {error}");
+				if (hasExited || !await WaitForStartupOwnerVisibleAsync(this) || hasExited || !IsVisible) return;
 				await MessageBoxService.Show("Startup state could not be loaded. Scheduled scans remain paused until the problem is resolved.");
+			}
+		}
+
+		internal static async Task<bool> WaitForStartupOwnerVisibleAsync(Window owner) {
+			if (owner.IsVisible) return true;
+			var ready = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+			void VisibilityChanged(object? sender, AvaloniaPropertyChangedEventArgs e) {
+				if (owner.IsVisible) ready.TrySetResult(true);
+			}
+			void Closed(object? sender, EventArgs e) => ready.TrySetResult(false);
+			owner.PropertyChanged += VisibilityChanged;
+			owner.Closed += Closed;
+			try {
+				if (owner.IsVisible) ready.TrySetResult(true);
+				return await ready.Task;
+			}
+			finally {
+				owner.PropertyChanged -= VisibilityChanged;
+				owner.Closed -= Closed;
 			}
 		}
 
