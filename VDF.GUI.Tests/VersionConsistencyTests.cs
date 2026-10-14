@@ -21,9 +21,8 @@ using VDF.GUI.Utils;
 namespace VDF.GUI.Tests;
 
 /// <summary>
-/// The version the titlebar/About box show (VersionPrefix in Directory.Build.props) must
-/// match the GitHub release tag builds are published to. Guards against #826, where the
-/// release line moved to 4.1.x but the app still reported itself as 4.0.0.
+/// The GUI assembly must report the release line declared in Directory.Build.props.
+/// Publication-policy tests separately validate selected version tags against that prefix.
 /// </summary>
 public class VersionConsistencyTests {
 
@@ -36,27 +35,19 @@ public class VersionConsistencyTests {
 		return dir!.FullName;
 	}
 
-	static string ReleaseTagMajorMinor() {
-		string yml = File.ReadAllText(Path.Combine(RepoRoot(), ".github", "workflows", "releases.yml"));
-		var match = Regex.Match(yml, @"tag_name:\s*(\d+)\.(\d+)\.x");
-		Assert.True(match.Success, "releases.yml: no 'tag_name: <major>.<minor>.x' found");
+	static string VersionPrefixMajorMinor() {
+		string props = File.ReadAllText(Path.Combine(RepoRoot(), "Directory.Build.props"));
+		var match = Regex.Match(props, @"<VersionPrefix>(\d+)\.(\d+)\.\d+</VersionPrefix>");
+		Assert.True(match.Success, "Directory.Build.props: no <VersionPrefix> found");
 		return $"{match.Groups[1].Value}.{match.Groups[2].Value}";
 	}
 
 	[Fact]
-	public void VersionPrefix_MatchesReleaseTag() {
-		string props = File.ReadAllText(Path.Combine(RepoRoot(), "Directory.Build.props"));
-		var match = Regex.Match(props, @"<VersionPrefix>(\d+)\.(\d+)\.\d+</VersionPrefix>");
-		Assert.True(match.Success, "Directory.Build.props: no <VersionPrefix> found");
-		Assert.Equal(ReleaseTagMajorMinor(), $"{match.Groups[1].Value}.{match.Groups[2].Value}");
-	}
-
-	[Fact]
-	public void BuiltAssemblyVersion_MatchesReleaseTag() {
+	public void BuiltAssemblyVersion_MatchesVersionPrefix() {
 		// VersionInfo.Version prefers the entry assembly, which under the test host is
 		// testhost rather than the GUI — check the VDF.GUI assembly directly instead.
 		var v = typeof(VersionInfo).Assembly.GetName().Version;
 		Assert.NotNull(v);
-		Assert.Equal(ReleaseTagMajorMinor(), $"{v!.Major}.{v.Minor}");
+		Assert.Equal(VersionPrefixMajorMinor(), $"{v!.Major}.{v.Minor}");
 	}
 }

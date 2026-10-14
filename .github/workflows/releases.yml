@@ -1,80 +1,43 @@
 name: Build releases
 
-# Two kinds of release:
-#   - every push to master rebuilds the rolling 4.1.x release, its assets replaced in place;
-#   - pushing a tag like v4.1.1 publishes a release of that commit whose assets are never
-#     replaced, so package managers (winget) can pin them by hash. The tag's version is
-#     stamped into the binaries and must share major.minor with VersionPrefix in
-#     Directory.Build.props.
+# Pushes and PRs validate packages. Publication requires an explicit manual run
+# selecting a version tag and publish=true; existing releases are preserved.
 
 on:
   push:
     branches: [master]
     tags: ['v*.*.*']
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish native packages from the selected version tag
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
 
 jobs:
-  cleanup:
-    if: github.ref_type == 'branch'
+  prepare:
     runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v5
-      - name: Delete old release assets
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          # Delete all existing assets from the 4.1.x release so they get replaced with fresh
-          # builds. '|| true' covers the very first run, before the release exists.
-          # 4.0.x is FROZEN at v4.0-final (last old-UI build) and must never be touched again.
-          gh release view 4.1.x --json assets --jq '.assets[].name' 2>/dev/null | while read -r asset; do
-            gh release delete-asset 4.1.x "$asset" --yes
-          done || true
-
-  prepare-release:
-    if: github.ref_type == 'tag'
-    runs-on: ubuntu-latest
+    outputs:
+      publish: ${{ steps.prepare.outputs.publish }}
+      version: ${{ steps.prepare.outputs.version }}
     steps:
       - uses: actions/checkout@v5
         with:
           fetch-depth: 0
-      - name: Check the tag and create a draft release
+      - name: Validate publication intent
+        id: prepare
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG: ${{ github.ref_name }}
-        run: |
-          VERSION="${TAG#v}"
-          if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "::error::Tag '$TAG' is not of the form vMAJOR.MINOR.PATCH."
-            exit 1
-          fi
-          PREFIX=$(sed -n 's:.*<VersionPrefix>\(.*\)</VersionPrefix>.*:\1:p' Directory.Build.props)
-          if [[ "${VERSION%.*}" != "${PREFIX%.*}" ]]; then
-            echo "::error::Tag '$TAG' does not match VersionPrefix $PREFIX in Directory.Build.props (major.minor)."
-            exit 1
-          fi
-          # A versioned release is built once. After a failed run, delete the draft
-          # (and the tag if needed) and push the tag again.
-          if gh release view "$TAG" >/dev/null 2>&1; then
-            echo "::error::Release '$TAG' already exists; versioned releases are never rebuilt."
-            exit 1
-          fi
-          # Stays a draft until every platform has uploaded (publish-release below).
-          NOTES="Built from commit ${GITHUB_SHA::7}. The assets of this release never change; the rolling 4.1.x release has the newest build."
-          PREVIOUS=$(git tag --list 'v*.*.*' --sort=v:refname | awk -v t="$TAG" '$0 == t { print prev; exit } { prev = $0 }')
-          if [[ -n "$PREVIOUS" ]]; then
-            gh release create "$TAG" --draft --verify-tag --title "$VERSION" --notes "$NOTES" --generate-notes --notes-start-tag "$PREVIOUS"
-          else
-            gh release create "$TAG" --draft --verify-tag --title "$VERSION" --notes "$NOTES"
-          fi
+          REQUEST_PUBLISH: ${{ inputs.publish || false }}
+        run: python3 .github/scripts/publication.py prepare
 
   build:
-    needs: [cleanup, prepare-release]
-    # One of the two is always skipped (branch push or tag push); run unless the other failed.
-    if: ${{ !cancelled() && !contains(needs.*.result, 'failure') }}
+    needs: prepare
 
     strategy:
-      # One platform failing (e.g. a runner-image hiccup) must not cancel the
-      # siblings: the cleanup job already emptied the release, so a cancelled
-      # matrix would leave it with missing assets until the next push.
       fail-fast: false
       matrix:
         kind: ['linux', 'windows', 'windowsarm64', 'macOS', 'macOSarm64', 'linuxarm64']
@@ -118,20 +81,11 @@ jobs:
       uses: actions/setup-dotnet@v5
       with:
         dotnet-version: '10.0.x'
-    - name: Declare some variables
-      id: vars
-      shell: bash
-      run: echo "sha_short=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
     - name: Build
       shell: bash
+      env:
+        VERSION: ${{ needs.prepare.outputs.version }}
       run: |
-          # A versioned release (tag v4.1.1) stamps its version into every binary;
-          # the rolling release keeps VersionPrefix from Directory.Build.props.
-          if [[ "$GITHUB_REF_TYPE" == tag ]]; then
-            VERSION="${GITHUB_REF_NAME#v}"
-          else
-            VERSION=$(sed -n 's:.*<VersionPrefix>\(.*\)</VersionPrefix>.*:\1:p' Directory.Build.props)
-          fi
           # Build GUI (Native AOT — verified AOT-safe for 4.0: compiled bindings,
           # source-generated JSON, statically-registered MemoryPack formatters)
           dotnet publish ./VDF.GUI/VDF.GUI.csproj -c Release -v q -p:PublishAot=true -p:VersionPrefix="$VERSION" -r "${{ matrix.target }}" -o "outputGUI"
@@ -183,45 +137,39 @@ jobs:
           # Clean up
           rm -rf "outputGUI" "outputCLI" "outputWeb" "Video Duplicate Finder.app"
           
-    - name: Publish
-      if: github.ref_type == 'branch'
-      uses: softprops/action-gh-release@v3
+    - name: Retain validated packages
+      uses: actions/upload-artifact@v4
       with:
-          tag_name: 4.1.x
-          # "Latest" belongs to the newest versioned release; the API default (true)
-          # would move it back here on every push.
-          make_latest: false
-          files: |
+          name: native-${{ matrix.target }}
+          path: |
             GUI-*
             CLI-*
             Web-*
-          body: |
-            Note: These are daily builds. Attachments are automatically created and replaced on every new commit. Regardless of what the message above says. If you experience upgrade issues you may need to delete your 'ScannedFiles.db' file in VDF folder.
-            4.1 highlights: redesigned interface (guided Set up / Scan / Review flow, scan profiles, reworked results list and settings) on top of all 4.0.x features. Databases and settings carry over. Prefer the old interface? The final classic build stays available in the 4.0.x release.
-            Last build based on ${{ steps.vars.outputs.sha_short }}
-      env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-    - name: Upload to the versioned release
-      if: github.ref_type == 'tag'
-      shell: bash
-      env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      # No --clobber: an asset of a versioned release is never replaced.
-      run: gh release upload "$GITHUB_REF_NAME" GUI-* CLI-* Web-*
+          if-no-files-found: error
+          retention-days: 3
 
   publish-release:
-    needs: build
-    # Without a status function the implicit success() also demands every job further up
-    # the chain succeeded, and cleanup is always skipped on a tag push (v4.1.1 stayed a draft).
-    if: ${{ !cancelled() && github.ref_type == 'tag' && needs.build.result == 'success' }}
+    needs: [prepare, build]
+    if: github.event_name == 'workflow_dispatch' && inputs.publish && needs.prepare.outputs.publish == 'true'
     runs-on: ubuntu-latest
+    concurrency:
+      group: native-publication-${{ github.ref }}
+      cancel-in-progress: false
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v5
-      - name: Publish the draft
+        with:
+          fetch-depth: 0
+      - uses: actions/download-artifact@v5
+        with:
+          pattern: native-*
+          merge-multiple: true
+          path: release-assets
+      - name: Publish all validated packages
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        # Only after every platform uploaded: a package manager never sees a partial release.
-        run: gh release edit "$GITHUB_REF_NAME" --draft=false --latest
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REQUEST_PUBLISH: ${{ inputs.publish || false }}
+        run: python3 .github/scripts/publication.py publish-native
 
 

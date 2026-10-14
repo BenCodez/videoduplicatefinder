@@ -4,55 +4,119 @@ on:
   push:
     branches: [master]
     tags: ['v*.*.*']
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish versioned images from the selected version tag
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
 
 jobs:
-  build-and-push:
+  prepare:
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: write
-
+    outputs:
+      publish: ${{ steps.prepare.outputs.publish }}
+      version: ${{ steps.prepare.outputs.version }}
+      image: ${{ steps.prepare.outputs.image }}
+      sha: ${{ steps.prepare.outputs.sha }}
     steps:
       - uses: actions/checkout@v5
-
-      - name: Set up QEMU (multi-arch)
-        uses: docker/setup-qemu-action@v4
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
-
-      - name: Log in to GHCR
-        uses: docker/login-action@v4
         with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+      - name: Validate publication intent
+        id: prepare
+        env:
+          REQUEST_PUBLISH: ${{ inputs.publish || false }}
+        run: python3 .github/scripts/publication.py prepare
 
-      # A version tag (v4.1.1) publishes :4.1.1 and leaves :latest to the branch builds.
-      - name: Choose image tags
-        id: tags
-        shell: bash
-        run: |
-          IMAGE="ghcr.io/${{ github.repository_owner }}/vdf-web"
-          if [[ "$GITHUB_REF_TYPE" == tag && "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            MOVING="$IMAGE:${GITHUB_REF_NAME#v}"
-          else
-            MOVING="$IMAGE:latest"
-          fi
-          {
-            echo "list<<EOF"
-            echo "$MOVING"
-            echo "$IMAGE:${{ github.sha }}"
-            echo "EOF"
-          } >> "$GITHUB_OUTPUT"
-
-      - name: Build and push vdf-web
+  build:
+    needs: prepare
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            arch: amd64
+          - os: ubuntu-24.04-arm
+            arch: arm64
+    steps:
+      - uses: actions/checkout@v5
+      - uses: docker/setup-buildx-action@v4
+      - name: Build vdf-web without publishing
         uses: docker/build-push-action@v7
         with:
           context: .
           file: VDF.Web/Dockerfile
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: ${{ steps.tags.outputs.list }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          platforms: linux/${{ matrix.arch }}
+          push: false
+          load: true
+          tags: vdf-web:validation
+          cache-from: type=gha,scope=web-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=web-${{ matrix.arch }}
+      - name: Export the validated image
+        if: needs.prepare.outputs.publish == 'true'
+        run: docker save vdf-web:validation | gzip > web-image.tar.gz
+      - uses: actions/upload-artifact@v4
+        if: needs.prepare.outputs.publish == 'true'
+        with:
+          name: web-${{ matrix.arch }}
+          path: web-image.tar.gz
+          if-no-files-found: error
+          retention-days: 3
+
+  publish:
+    needs: [prepare, build]
+    if: github.event_name == 'workflow_dispatch' && inputs.publish && needs.prepare.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    concurrency:
+      group: web-publication-${{ github.ref }}
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - name: Revalidate the source tag
+        env:
+          REQUEST_PUBLISH: ${{ inputs.publish || false }}
+        run: python3 .github/scripts/publication.py prepare
+      - uses: actions/download-artifact@v5
+        with:
+          pattern: web-*
+          path: web-images
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Publish both validated architectures
+        env:
+          IMAGE: ${{ needs.prepare.outputs.image }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+          SOURCE_SHA: ${{ needs.prepare.outputs.sha }}
+          REQUEST_PUBLISH: ${{ inputs.publish || false }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          for arch in amd64 arm64; do
+            gzip -dc "web-images/web-$arch/web-image.tar.gz" | docker load
+            test "$(docker image inspect vdf-web:validation --format '{{.Architecture}}')" = "$arch"
+            docker tag vdf-web:validation "$IMAGE:$SOURCE_SHA-$arch"
+          done
+          # Load and verify both artifacts before making any registry write.
+          python3 .github/scripts/publication.py prepare
+          for arch in amd64 arm64; do
+            docker push "$IMAGE:$SOURCE_SHA-$arch"
+          done
+          # Uploads can take minutes; validate again at the manifest boundary.
+          python3 .github/scripts/publication.py prepare
+          docker buildx imagetools create --tag "$IMAGE:$VERSION" --tag "$IMAGE:$SOURCE_SHA" \
+            "$IMAGE:$SOURCE_SHA-amd64" "$IMAGE:$SOURCE_SHA-arm64"
