@@ -112,6 +112,60 @@ public class SettingsLoadRecoveryTests : IDisposable {
 		Assert.ThrowsAny<JsonException>(() => SettingsFile.LoadSettings(path));
 	}
 
+	[Theory]
+	[InlineData(false)]
+	[InlineData(true)]
+	public void ValidLegacyImportRecoversUnreadableActiveSettingsAndSavesWithObservedBaseline(bool sameStem) {
+		string active = Path.Combine(dir, "Settings.json");
+		SettingsFile.SetSettingsPath(active);
+		SettingsFile.SaveSettings();
+		File.WriteAllText(active, "{ unreadable synthetic settings");
+		SettingsFile.LoadSettingsAtStartup();
+		Assert.NotNull(SettingsFile.StartupLoadError);
+		string legacy = WriteSettingsFile(sameStem ? "Settings.xml" : "profile.xml", "<Settings><Percent>73</Percent></Settings>");
+
+		SettingsFile.LoadSettings(legacy);
+
+		Assert.Null(SettingsFile.StartupLoadError);
+		Assert.Equal(73, SettingsFile.Instance.Percent);
+		Assert.False(File.Exists(legacy));
+		SettingsFile.SaveSettings();
+		SettingsFile.LoadSettingsAtStartup();
+		Assert.Null(SettingsFile.StartupLoadError);
+		Assert.Equal(73, SettingsFile.Instance.Percent);
+		Assert.Equal("{ unreadable synthetic settings", File.ReadAllText(active + ".corrupt"));
+	}
+
+	[Fact]
+	public void LegacyImportAfterStartupFailureCannotOverwriteANewerActiveGeneration() {
+		string active = WriteSettingsFile("Settings.json", "{ unreadable synthetic settings");
+		SettingsFile.SetSettingsPath(active);
+		SettingsFile.LoadSettingsAtStartup();
+		string newer = JsonSerializer.Serialize(new SettingsFile { CustomDatabaseFolder = dir, Percent = 81 }, GuiJsonContext.Default.SettingsFile);
+		File.WriteAllText(active, newer);
+		string legacy = WriteSettingsFile("profile.xml", "<Settings><Percent>73</Percent></Settings>");
+		SettingsFile.LoadSettings(legacy);
+
+		Assert.Null(SettingsFile.StartupLoadError);
+		Assert.Throws<InvalidDataException>(() => SettingsFile.SaveSettings());
+		Assert.Equal(newer, File.ReadAllText(active));
+	}
+
+	[Fact]
+	public void FailedLegacyMigrationRetainsStartupGuardAndOriginalXml() {
+		string active = WriteSettingsFile("Settings.json", "{ unreadable synthetic settings");
+		SettingsFile.SetSettingsPath(active);
+		SettingsFile.LoadSettingsAtStartup();
+		string legacy = WriteSettingsFile("profile.xml", "<Settings><Percent>73</Percent></Settings>");
+		Directory.CreateDirectory(Path.ChangeExtension(legacy, "json"));
+
+		Assert.ThrowsAny<IOException>(() => SettingsFile.LoadSettings(legacy));
+		Assert.NotNull(SettingsFile.StartupLoadError);
+		Assert.True(File.Exists(legacy));
+		Assert.Throws<InvalidDataException>(() => SettingsFile.SaveSettings());
+		Assert.Equal("{ unreadable synthetic settings", File.ReadAllText(active));
+	}
+
 	[Fact]
 	public void ExplicitLoad_NullDocument_ThrowsInsteadOfClearingAllSettings() {
 		string path = WriteSettingsFile("import.json", "null");

@@ -468,13 +468,15 @@ namespace VDF.GUI.Data {
 				}, source);
 		}
 
-		static SettingsFile ReadSavedSettings(string path, out VDF.Core.Review.FileIdentity source) {
+		static SettingsFile ReadSavedSettings(string path, out VDF.Core.Review.FileIdentity source,
+			Action<VDF.Core.Review.FileIdentity>? observedSource = null) {
 			VDF.Core.Review.SafePaths.RequireRegularFile(path);
 			if (new FileInfo(path).Length > 32L * 1024 * 1024) throw new InvalidDataException("The settings file exceeds the supported size limit.");
 			byte[] bytes = File.ReadAllBytes(path);
 			source = VDF.Core.Review.FileIdentity.Capture(path) ?? throw new IOException("The settings file is unavailable or changed during projection.");
 			if (source.Length != bytes.Length || source.Sha256 != Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(bytes)))
 				throw new InvalidDataException("GUI settings changed while they were read. Reload or refresh them before cleanup.");
+			observedSource?.Invoke(source);
 			var settings = JsonSerializer.Deserialize(bytes, GuiJsonContext.Default.SettingsFile)
 				?? throw new JsonException($"'{path}' does not contain a settings object.");
 			settings.MigrateLegacyValues();
@@ -820,7 +822,9 @@ namespace VDF.GUI.Data {
 			set => this.RaiseAndSetIfChanged(ref field, value);
 		} = new();
 
-		public static void LoadSettings(string? path = null) {
+		public static void LoadSettings(string? path = null) => LoadSettingsCore(path, null);
+
+		static void LoadSettingsCore(string? path, Action<VDF.Core.Review.FileIdentity>? observedSource) {
 			path ??= settingsPath;
 			if ((path == null || path.EndsWith(".xml", StringComparison.OrdinalIgnoreCase)) && LoadOldSettings(path))
 				return;
@@ -831,7 +835,7 @@ namespace VDF.GUI.Data {
 				Instance.knownSettingsIdentities[Path.GetFullPath(path)] = null;
 				return;
 			}
-			var loaded = ReadSavedSettings(path, out _);
+			var loaded = ReadSavedSettings(path, out _, observedSource);
 			// Importing/saving another profile must not forget the baseline of the
 			// active settings file and permit a later autosave to replace external edits.
 			if (instance is not null)
@@ -855,13 +859,23 @@ namespace VDF.GUI.Data {
 		/// diagnosis and start with default settings instead.
 		/// </summary>
 		public static void LoadSettingsAtStartup() {
+			VDF.Core.Review.FileIdentity? observedSource = null;
 			try {
-				LoadSettings();
+				LoadSettingsCore(null, source => observedSource = source);
 				StartupLoadError = null;
 			}
 			catch (Exception ex) {
 				string message = $"Settings could not be loaded: {ex.Message}";
 				string jsonPath = ResolveSettingsPath(null);
+				// Authorize a later explicit import against only the bytes whose
+				// parsing failed, never a newer file written before this catch ran.
+				try {
+					string fullPath = Path.GetFullPath(jsonPath);
+					Instance.knownSettingsIdentities[fullPath] =
+						observedSource is not null && VDF.Core.Review.SafePaths.Same(fullPath, observedSource.Path)
+							? observedSource : null;
+				}
+				catch { /* An unavailable baseline cannot authorize replacing an existing file. */ }
 				if (File.Exists(jsonPath)) {
 					try {
 						File.Copy(jsonPath, jsonPath + ".corrupt", overwrite: true);
@@ -940,8 +954,19 @@ namespace VDF.GUI.Data {
 			foreach (var n in xDoc.Descendants("CompareHorizontallyFlipped"))
 				if (bool.TryParse(n.Value, out var value))
 					Instance.CompareHorizontallyFlipped = value;
-			SaveSettings(Path.ChangeExtension(path, "json"));
-			File.Delete(path);
+			// Parsing has succeeded. Migration itself saves the imported profile,
+			// so release the startup guard for that explicit recovery and restore
+			// it if saving or preserving the legacy file cannot complete.
+			string? startupError = StartupLoadError;
+			StartupLoadError = null;
+			try {
+				SaveSettings(Path.ChangeExtension(path, "json"));
+				File.Delete(path);
+			}
+			catch {
+				StartupLoadError = startupError;
+				throw;
+			}
 			return true;
 		}
 

@@ -21,6 +21,18 @@ public sealed class HardLinkCleanupTests {
             SettingsFile.SaveSettings();
             await work(folder);
         }
+        catch {
+            // Capture this fixture's cleanup diagnostics before another host
+            // starts and replaces the shared log; preserve the original failure.
+            try {
+                foreach (var line in File.ReadLines(VDF.Core.Utils.Logger.LogFilePath).Where(line =>
+                    line.Contains("hardlink keeper", StringComparison.OrdinalIgnoreCase) ||
+                    line.Contains("hardlink refresh", StringComparison.OrdinalIgnoreCase)))
+                    Console.Error.WriteLine(line);
+            }
+            catch { }
+            throw;
+        }
         finally {
             settings.CustomDatabaseFolder = originalDatabase;
             SettingsFile.SetSettingsPath(null);

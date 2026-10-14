@@ -28,7 +28,7 @@ jobs:
     - name: Run GUI Tests
       run: dotnet test VDF.GUI.Tests/VDF.GUI.Tests.csproj -c Release -v q
     - name: Run GUI Headless Tests
-      run: dotnet test VDF.GUI.HeadlessTests/VDF.GUI.HeadlessTests.csproj -c Release -v q
+      run: dotnet test VDF.GUI.HeadlessTests/VDF.GUI.HeadlessTests.csproj -c Release -v q --logger "console;verbosity=normal"
     - name: Run Web Tests
       run: dotnet test VDF.Web.Tests/VDF.Web.Tests.csproj -c Release -v q
     - name: Run Integration Tests
