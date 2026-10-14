@@ -892,8 +892,11 @@ namespace VDF.GUI.Data {
 			path ??= FileUtils.SafePathCombine(CoreUtils.CurrentFolder, "Settings.xml");
 			if (!File.Exists(path)) return false;
 			var xmlSettings = new XmlReaderSettings { DtdProcessing = DtdProcessing.Prohibit };
-			using var reader = XmlReader.Create(path, xmlSettings);
-			var xDoc = XDocument.Load(reader);
+			XDocument xDoc;
+			// Parsing no longer needs the file when migration removes it. Windows
+			// refuses that deletion while XmlReader still owns its read handle.
+			using (var reader = XmlReader.Create(path, xmlSettings))
+				xDoc = XDocument.Load(reader);
 			foreach (var n in xDoc.Descendants("Include"))
 				Instance.Includes.Add(n.Value);
 			foreach (var n in xDoc.Descendants("Exclude"))
