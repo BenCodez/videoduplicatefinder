@@ -13,6 +13,10 @@ on:
         description: Publish versioned images from the selected version tag
         type: boolean
         default: false
+      expected_sha:
+        description: Expected source commit (set automatically by native release publication)
+        type: string
+        default: ''
 
 permissions:
   contents: read
@@ -33,6 +37,7 @@ jobs:
         id: prepare
         env:
           REQUEST_PUBLISH: ${{ inputs.publish || false }}
+          EXPECTED_SOURCE_SHA: ${{ inputs.expected_sha || '' }}
         run: python3 .github/scripts/publication.py prepare --allow-release
 
   build:
@@ -105,6 +110,7 @@ jobs:
       - name: Revalidate the source tag
         env:
           REQUEST_PUBLISH: ${{ inputs.publish || false }}
+          EXPECTED_SOURCE_SHA: ${{ inputs.expected_sha || '' }}
         run: python3 .github/scripts/publication.py prepare --allow-release
       - uses: actions/download-artifact@v5
         with:
@@ -122,6 +128,7 @@ jobs:
           VERSION: ${{ needs.prepare.outputs.version }}
           SOURCE_SHA: ${{ needs.prepare.outputs.sha }}
           REQUEST_PUBLISH: ${{ inputs.publish || false }}
+          EXPECTED_SOURCE_SHA: ${{ inputs.expected_sha || '' }}
         shell: bash
         run: |
           set -euo pipefail

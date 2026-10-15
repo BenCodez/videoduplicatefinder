@@ -64,6 +64,7 @@ class PublicationTests(unittest.TestCase):
                         GITHUB_REF_NAME="master", GITHUB_SHA=self.sha,
                         GITHUB_REPOSITORY="BenCodez/videoduplicatefinder",
                         GITHUB_REPOSITORY_OWNER="BenCodez", REQUEST_PUBLISH="false",
+                        EXPECTED_SOURCE_SHA="",
                         GITHUB_OUTPUT=str(self.output), COMMAND_LOG=str(self.log),
                         PATH=str(self.bin) + os.pathsep + os.environ["PATH"])
 
@@ -134,6 +135,41 @@ class PublicationTests(unittest.TestCase):
         self.assertEqual(values["publish"], "true")
         self.assertEqual(values["tag"], TAG)
         self.assertEqual(values["sha"], self.sha)
+
+    def test_expected_source_sha_accepts_exact_match_and_rejects_invalid_or_different_commit(self):
+        result, values = self.run_helper(**self.publication(), EXPECTED_SOURCE_SHA=self.sha)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(values["sha"], self.sha)
+        for expected in ("0" * 40, self.sha[:7], self.sha + "\n", "invalid"):
+            with self.subTest(expected=expected):
+                result, values = self.run_helper(**self.publication(), EXPECTED_SOURCE_SHA=expected)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(values, {})
+        self.assertEqual(self.commands(), [])
+
+    def test_dispatch_pin_blocks_tag_moved_before_docker_run_resolves_it(self):
+        self.packages()
+        result = self.run_native_publication_steps()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        dispatch = self.commands()[-1]
+        expected = next(arg.split("=", 1)[1] for arg in dispatch if arg.startswith("expected_sha="))
+        self.assertEqual(expected, self.sha)
+        self.log.unlink()
+        # Simulate tag resolution after dispatch: checkout, GITHUB_SHA and live
+        # tag all agree on the new commit, but the native release used the old one.
+        self.git("-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-q", "--allow-empty", "-m", "moved")
+        moved = self.git("rev-parse", "HEAD").strip()
+        self.git("tag", "-f", TAG)
+        event = self.publication() | {"GITHUB_SHA": moved, "EXPECTED_SOURCE_SHA": expected}
+        result, values = self.run_helper(allow_release=True, **event)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(values, {})
+        self.web_artifacts()
+        step = workflow("docker")["jobs"]["publish"]["steps"][-1]
+        result = subprocess.run(["bash", "-c", step["run"]], cwd=self.root, capture_output=True,
+                                env=self.env | event | {"IMAGE": "ghcr.io/bencodez/vdf-web", "VERSION": VERSION, "SOURCE_SHA": moved})
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(any(row[0] == "push" or row[:2] == ["buildx", "imagetools"] for row in self.commands()))
 
     def test_published_release_requires_docker_opt_in_and_matches_exact_source(self):
         for prerelease in (False, True):
@@ -331,7 +367,8 @@ class PublicationTests(unittest.TestCase):
         self.assertEqual(commands[-2], ["api", "--method", "PATCH",
                                         "repos/BenCodez/videoduplicatefinder/releases/753", "--input", "-"])
         self.assertEqual(commands[-1], ["workflow", "run", "docker.yml", "--repo",
-                                        "BenCodez/videoduplicatefinder", "--ref", TAG, "-f", "publish=true"])
+                                        "BenCodez/videoduplicatefinder", "--ref", TAG, "-f", "publish=true",
+                                        "-f", "expected_sha=" + self.sha])
 
     def test_failed_native_publication_never_dispatches_docker(self):
         self.packages()
@@ -463,6 +500,14 @@ class WorkflowAuthorizationTests(unittest.TestCase):
             for script in helpers:
                 calls = [line for line in script.splitlines() if "publication.py" in line]
                 self.assertTrue(all(line.endswith("prepare --allow-release") for line in calls))
+
+    def test_docker_checks_expected_source_at_prepare_and_all_publication_steps(self):
+        data = workflow("docker")
+        self.assertEqual(data["on"]["workflow_dispatch"]["inputs"]["expected_sha"]["default"], "")
+        for job in ("prepare", "publish"):
+            for step in data["jobs"][job]["steps"]:
+                if "publication.py" in step.get("run", ""):
+                    self.assertEqual(step["env"]["EXPECTED_SOURCE_SHA"], "${{ inputs.expected_sha || '' }}")
 
     def test_native_dispatch_is_bound_to_the_published_tag_and_success(self):
         steps = workflow("releases")["jobs"]["publish-release"]["steps"]

@@ -181,6 +181,6 @@ jobs:
           VERSION_TAG: ${{ github.ref_name }}
         run: |
           python3 .github/scripts/publication.py prepare
-          gh workflow run docker.yml --repo "$GITHUB_REPOSITORY" --ref "$VERSION_TAG" -f publish=true
+          gh workflow run docker.yml --repo "$GITHUB_REPOSITORY" --ref "$VERSION_TAG" -f publish=true -f expected_sha="$GITHUB_SHA"
 
 

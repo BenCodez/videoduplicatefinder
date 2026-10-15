@@ -86,7 +86,10 @@ workflow does not publish a `latest` tag.
 
 Releases published by **Build releases** explicitly dispatch the same Docker
 workflow after native publication succeeds, because GitHub suppresses release
-events created with `GITHUB_TOKEN`. Only the native publication job receives
+events created with `GITHUB_TOKEN`. The dispatch includes the native release's
+validated commit as `expected_sha`; Docker rejects a different checkout even if
+the version tag moves between validation and dispatch. The expected commit is
+checked again before registry writes and manifest creation. Only the native publication job receives
 permission to dispatch workflows. A dispatch failure leaves the published
 release intact and fails that step; use the manual Docker fallback for that tag
 instead of trying to recreate the native release.

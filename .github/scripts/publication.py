@@ -53,6 +53,9 @@ def prepare(*, allow_release=False):
         raise ValueError("Invalid repository owner")
     if not re.fullmatch(r"[0-9a-f]{40}", sha):
         raise ValueError("Expected a full source commit SHA")
+    expected_sha = os.environ.get("EXPECTED_SOURCE_SHA", "")
+    if expected_sha and (not re.fullmatch(r"[0-9a-f]{40}", expected_sha) or expected_sha != sha):
+        raise ValueError("Workflow commit does not match the expected source commit")
     if publish:
         if os.environ["GITHUB_REPOSITORY"].lower() != "bencodez/videoduplicatefinder":
             raise ValueError("Publication is restricted to the canonical repository")
