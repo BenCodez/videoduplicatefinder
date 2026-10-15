@@ -2,11 +2,19 @@
 
 @if (_visible) {
     <div class="folder-overlay" @onclick="Close"></div>
-    <div class="folder-browser">
+    <div class="folder-browser" role="dialog" aria-label="Select folder">
         <div class="folder-header">
             <h3>Select Folder</h3>
             <button class="compare-close" @onclick="Close">&#x2715;</button>
         </div>
+        @if (StartPaths.Count > 0) {
+            <div class="folder-start-paths">
+                <span>Scan paths</span>
+                @foreach (var path in StartPaths) {
+                    <button type="button" @onclick="() => OpenFolder(path)">@path</button>
+                }
+            </div>
+        }
         <div class="folder-path-bar">
             <button @onclick="GoUp" disabled="@(string.IsNullOrEmpty(_currentPath))" title="Go up">&#x2191;</button>
             <input type="text" @bind="_currentPath" @bind:event="oninput" @onkeydown="OnPathKeyDown"
@@ -19,18 +27,18 @@
         <div class="folder-list">
             @if (_drives != null && string.IsNullOrEmpty(_currentPath)) {
                 @foreach (var drive in _drives) {
-                    <div class="folder-item" @ondblclick="() => OpenFolder(drive)">
+                    <button type="button" class="folder-item" @onclick="() => OpenFolder(drive)">
                         <span class="folder-icon">&#x1F4BD;</span>
                         <span>@drive</span>
-                    </div>
+                    </button>
                 }
             }
             else if (_directories != null) {
                 @foreach (var dir in _directories) {
-                    <div class="folder-item" @ondblclick="() => OpenFolder(dir)">
+                    <button type="button" class="folder-item" @onclick="() => OpenFolder(dir)">
                         <span class="folder-icon">&#x1F4C1;</span>
                         <span>@System.IO.Path.GetFileName(dir)</span>
-                    </div>
+                    </button>
                 }
                 @if (_directories.Length == 0) {
                     <div class="folder-empty">No subdirectories</div>
@@ -47,6 +55,7 @@
 
 @code {
     [Parameter] public EventCallback<string> OnFolderSelected { get; set; }
+    [Parameter] public IReadOnlyList<string> StartPaths { get; set; } = Array.Empty<string>();
 
     bool _visible;
     string? _currentPath;
@@ -63,7 +72,8 @@
             LoadDirectory(_currentPath);
         }
         else {
-            LoadDrives();
+            if (StartPaths.Count > 0) LoadDirectory(StartPaths[0]);
+            else LoadDrives();
         }
         StateHasChanged();
     }
@@ -98,10 +108,12 @@
             _error = null;
         }
         catch (UnauthorizedAccessException) {
+            _currentPath = path;
             _error = "Access denied.";
             _directories = Array.Empty<string>();
         }
         catch (Exception ex) {
+            _currentPath = path;
             _error = ex.Message;
             _directories = Array.Empty<string>();
         }
@@ -138,7 +150,9 @@
     }
 
     async Task SelectCurrent() {
-        if (!string.IsNullOrEmpty(_currentPath)) {
+        // The path can be typed without pressing Go, or disappear while open.
+        NavigateTo();
+        if (!string.IsNullOrEmpty(_currentPath) && _error is null) {
             await OnFolderSelected.InvokeAsync(_currentPath);
             Close();
         }

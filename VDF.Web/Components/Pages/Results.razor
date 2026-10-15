@@ -49,6 +49,8 @@ else {
         </span>
 
         @* Auto-select dropdown *@
+        <button class="primary" @onclick="() => PlanSelectionAsync()" disabled="@AutomationBusy"
+                title="Use saved automation rules to select removal candidates; review before cleanup">Apply automation rules</button>
         <div class="dropdown-wrap">
             <button @onclick="() => _autoSelectOpen = !_autoSelectOpen" disabled="@AutomationBusy">Select &#x25BE;</button>
             @if (_autoSelectOpen) {

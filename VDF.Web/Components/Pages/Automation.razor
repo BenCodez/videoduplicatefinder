@@ -56,10 +56,12 @@ else {
             <p>This scope applies to manual previews; choose preview groups below. Automatic previews after background scans cover all newly scanned groups.</p>
 
             <h3>Folder rules</h3>
+            <p>Browse live folders from your scan paths, or enter a directory manually. Folder choices update the draft; save automation settings to apply them.</p>
             @foreach (var rule in _draft.Selection.FolderRules) {
                 <fieldset @key="rule" style="margin:0.5rem 0;padding:0.75rem;border:1px solid var(--border-default);">
                     <legend>Folder rule @(_draft.Selection.FolderRules.IndexOf(rule) + 1)</legend>
                     <label>Directory <input type="text" @bind="rule.Directory" @bind:after="MarkDraftChanged" /></label>
+                    <button type="button" @onclick="() => BrowseFolderRule(rule)">Browse folder…</button>
                     <label>Priority (higher wins) <input type="number" @bind="rule.Priority" @bind:after="MarkDraftChanged" /></label>
                     <label>Relative path wildcard (optional) <input type="text" @bind="rule.Pattern" @bind:after="MarkDraftChanged" /></label>
                     <label><input type="checkbox" @bind="rule.Enabled" @bind:after="MarkDraftChanged" /> Enabled</label>
@@ -69,6 +71,7 @@ else {
                 </fieldset>
             }
             <button @onclick="AddFolderRule">Add folder rule</button>
+            <FolderBrowser @ref="_ruleBrowser" StartPaths="Scan.Settings.IncludeList.ToArray()" OnFolderSelected="SelectRuleFolder" />
 
             <h3>Quality criteria</h3>
             @foreach (var criterion in _draft.Selection.Criteria) {

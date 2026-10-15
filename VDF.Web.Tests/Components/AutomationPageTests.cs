@@ -52,6 +52,63 @@ public sealed class AutomationPageTests : BunitContext {
     }
 
     [Fact]
+    public async Task FolderRuleBrowserUsesLiveScanPathsAndSavesOnlyOnRequest() {
+        var root = Directory.CreateDirectory(Path.Combine(folder, "media")).FullName;
+        var other = Directory.CreateDirectory(Path.Combine(folder, "other-media")).FullName;
+        scan.Settings.IncludeList.Add(root);
+        scan.Settings.IncludeList.Add(other);
+        var page = await RenderPageAsync();
+        await ClickAsync(page, "Add folder rule");
+        await ClickAsync(page, "Browse folder…");
+        Assert.Equal(root, page.Find(".folder-path-bar input").GetAttribute("value"));
+        // Created after opening: reopening a root reads the live filesystem.
+        var child = Directory.CreateDirectory(Path.Combine(root, "new-folder")).FullName;
+        await page.FindAll(".folder-start-paths button").Single(b => b.TextContent == root).ClickAsync(new MouseEventArgs());
+        await page.FindAll(".folder-item").Single(b => b.TextContent.Contains("new-folder")).ClickAsync(new MouseEventArgs());
+        await ClickAsync(page, "Select");
+        Assert.Equal(child, Input(page, "Directory").GetAttribute("value"));
+        Assert.Empty((await store.LoadAsync()).Selection.FolderRules);
+        await ClickAsync(page, "Save automation settings");
+        Assert.Equal(child, Assert.Single((await store.LoadAsync()).Selection.FolderRules).Directory);
+        await ClickAsync(page, "Browse folder…");
+        await page.FindAll(".folder-start-paths button").Single(b => b.TextContent == other).ClickAsync(new MouseEventArgs());
+        await ClickAsync(page, "Cancel");
+        Assert.Equal(child, Input(page, "Directory").GetAttribute("value"));
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task ApplyAutomationRulesOnResultsUsesSavedFolderProtectionWithoutChangingFiles(bool highlightedOnly) {
+        await ScanEngine.LoadDatabase(folder);
+        DatabaseUtils.Database.Clear();
+        scan.Settings.IncludeList.Add(folder);
+        Assert.True(scan.SaveSettings());
+        await scan.LoadAutomationAsync();
+        var group = Guid.NewGuid(); Seed("protected.mp4", group); Seed("candidate.mp4", group);
+        foreach (var item in scan.Duplicates) {
+            item.Duration = TimeSpan.FromSeconds(60);
+            DatabaseUtils.Database.Add(new FileEntry(item.Path));
+        }
+        ScanEngine.SaveDatabase(); scan.CaptureCleanupSnapshots(folder); await scan.RemoveFromResultsAsync([]);
+        var config = await scan.LoadAutomationAsync();
+        config.Selection.HighlightedGroupsOnly = highlightedOnly;
+        config.Selection.FolderRules.Add(new() { Directory = folder, Pattern = "protected.mp4", ProtectAll = true });
+        await scan.SaveAutomationAsync(config);
+        var page = Render<Results>();
+        if (highlightedOnly)
+            await page.Find(".group-select-all input").ChangeAsync(true);
+        await page.FindAll("button").Single(b => b.TextContent.Trim() == "Apply automation rules").ClickAsync(new MouseEventArgs());
+        await page.WaitForAssertionAsync(() => {
+            Assert.NotNull(scan.LastSelectionPlan);
+            Assert.DoesNotContain(scan.LastSelectionPlan.Decisions, d => d.Path.EndsWith("protected.mp4") && d.RemoveCandidate);
+            Assert.Equal("candidate.mp4", Assert.Single(page.FindAll(".dup-card.selected")).QuerySelector(".card-filename")!.TextContent);
+        }, JournalIoTimeout);
+        Assert.All(scan.Duplicates, item => Assert.Equal(new byte[] { 1, 2, 3, 4 }, File.ReadAllBytes(item.Path)));
+        Assert.DoesNotContain(page.FindAll("button"), b => b.TextContent.StartsWith("Confirm quarantine", StringComparison.Ordinal));
+    }
+
+    [Fact]
     public async Task LocalDraftDoesNotChangeDurableSelectionOrProtectionUntilSaved() {
         var page = await RenderPageAsync();
         await ChangeCheckboxAsync(page, "Automatically prepare selection after scans", true);

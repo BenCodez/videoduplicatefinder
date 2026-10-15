@@ -5,12 +5,18 @@ on:
     branches: [master]
     tags: ['v*.*.*']
   pull_request:
+  release:
+    types: [published]
   workflow_dispatch:
     inputs:
       publish:
         description: Publish versioned images from the selected version tag
         type: boolean
         default: false
+      expected_sha:
+        description: Expected source commit (set automatically by native release publication)
+        type: string
+        default: ''
 
 permissions:
   contents: read
@@ -31,7 +37,9 @@ jobs:
         id: prepare
         env:
           REQUEST_PUBLISH: ${{ inputs.publish || false }}
-        run: python3 .github/scripts/publication.py prepare
+          EXPECTED_SOURCE_SHA: ${{ inputs.expected_sha || '' }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python3 .github/scripts/publication.py prepare --allow-release
 
   build:
     needs: prepare
@@ -88,7 +96,7 @@ jobs:
 
   publish:
     needs: [prepare, build]
-    if: github.event_name == 'workflow_dispatch' && inputs.publish && needs.prepare.outputs.publish == 'true'
+    if: needs.prepare.outputs.publish == 'true'
     runs-on: ubuntu-latest
     concurrency:
       group: web-publication-${{ github.ref }}
@@ -103,7 +111,9 @@ jobs:
       - name: Revalidate the source tag
         env:
           REQUEST_PUBLISH: ${{ inputs.publish || false }}
-        run: python3 .github/scripts/publication.py prepare
+          EXPECTED_SOURCE_SHA: ${{ inputs.expected_sha || '' }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python3 .github/scripts/publication.py prepare --allow-release
       - uses: actions/download-artifact@v5
         with:
           pattern: web-*
@@ -120,6 +130,8 @@ jobs:
           VERSION: ${{ needs.prepare.outputs.version }}
           SOURCE_SHA: ${{ needs.prepare.outputs.sha }}
           REQUEST_PUBLISH: ${{ inputs.publish || false }}
+          EXPECTED_SOURCE_SHA: ${{ inputs.expected_sha || '' }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         shell: bash
         run: |
           set -euo pipefail
@@ -129,11 +141,11 @@ jobs:
             docker tag vdf-web:validation "$IMAGE:$SOURCE_SHA-$arch"
           done
           # Load and verify both artifacts before making any registry write.
-          python3 .github/scripts/publication.py prepare
+          python3 .github/scripts/publication.py prepare --allow-release
           for arch in amd64 arm64; do
             docker push "$IMAGE:$SOURCE_SHA-$arch"
           done
           # Uploads can take minutes; validate again at the manifest boundary.
-          python3 .github/scripts/publication.py prepare
+          python3 .github/scripts/publication.py prepare --allow-release
           docker buildx imagetools create --tag "$IMAGE:$VERSION" --tag "$IMAGE:$SOURCE_SHA" \
             "$IMAGE:$SOURCE_SHA-amd64" "$IMAGE:$SOURCE_SHA-arm64"

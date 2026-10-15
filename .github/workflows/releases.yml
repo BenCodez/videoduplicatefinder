@@ -157,6 +157,7 @@ jobs:
       cancel-in-progress: false
     permissions:
       contents: write
+      actions: write
     steps:
       - uses: actions/checkout@v5
         with:
@@ -171,5 +172,15 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REQUEST_PUBLISH: ${{ inputs.publish || false }}
         run: python3 .github/scripts/publication.py publish-native
+      # GITHUB_TOKEN release events do not start other workflows. Dispatch is
+      # explicitly supported and runs only after native publication succeeds.
+      - name: Dispatch Docker publication
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REQUEST_PUBLISH: ${{ inputs.publish || false }}
+          VERSION_TAG: ${{ github.ref_name }}
+        run: |
+          python3 .github/scripts/publication.py prepare
+          gh workflow run docker.yml --repo "$GITHUB_REPOSITORY" --ref "$VERSION_TAG" -f publish=true -f expected_sha="$GITHUB_SHA"
 
 
