@@ -50,8 +50,14 @@ public sealed partial class ScanService {
                 try {
                     // Take the lifetime lease before the durable claim. A restart
                     // can then distinguish an abandoned claim from a live process.
-                    runLease = JournalWriteLease.Acquire(Path.Combine(folder, ScheduledRunLeaseFileName));
                     string path = Path.Combine(folder, "WebSchedule.json");
+                    try { runLease = JournalWriteLease.Acquire(Path.Combine(folder, ScheduledRunLeaseFileName)); }
+                    catch (IOException ex) when ((ex.HResult & 0xffff) is 11 or 32 or 33) {
+                        // Another process can own the run before its claim is
+                        // visible. Leave unclaimed startup work eligible to retry.
+                        ScheduleState = await ReadScheduleStateAsync(path);
+                        return false;
+                    }
                     WebScheduleState state;
                     using (JournalWriteLease.Acquire(path)) {
                         state = await ReadScheduleStateAsync(path);

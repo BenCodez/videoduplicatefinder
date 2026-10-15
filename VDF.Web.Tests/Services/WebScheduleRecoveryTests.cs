@@ -197,6 +197,76 @@ public sealed class WebScheduleRecoveryTests : IAsyncLifetime {
     }
 
     [Theory]
+    [InlineData(false, false, false)]
+    [InlineData(false, true, false)]
+    [InlineData(true, false, false)]
+    [InlineData(true, true, false)]
+    [InlineData(false, false, true)]
+    [InlineData(false, true, true)]
+    [InlineData(true, false, true)]
+    [InlineData(true, true, true)]
+    public async Task HeldScheduledRunLeaseSkipsWithoutErrorAndRetainsUnclaimedEligibility(bool startupOnly, bool existingResults, bool previousClaim) {
+        var config = await scan.LoadAutomationAsync(); config.ScanAtStartup = startupOnly;
+        config.Schedule = config.Schedule with { Enabled = !startupOnly }; await scan.SaveAutomationAsync(config);
+        if (existingResults) {
+            var group = Guid.NewGuid();
+            foreach (string name in new[] { "old-a.mp4", "old-b.mp4" }) {
+                string path = Path.Combine(folder, name); File.WriteAllBytes(path, [1, 2, 3, 4]);
+                var entry = new FileEntry(path); DatabaseUtils.Database.Add(entry);
+                scan.Engine.Duplicates.Add(new VDF.Core.ViewModels.DuplicateItem(entry, .01f, group, DuplicateFlags.None));
+            }
+            ScanEngine.SaveDatabase(); scan.CaptureCleanupSnapshots(folder); await scan.RemoveFromResultsAsync([]);
+        }
+        if (previousClaim) await WriteStateAsync(new() { Status = "Completed", LastClaimedSlotUtc = Started.AddMinutes(-6),
+            LastStartedUtc = Started.AddMinutes(-5), LastCompletedUtc = Started.AddMinutes(-4), DurationSeconds = 60 });
+        byte[]? journalBefore = File.Exists(JournalPath) ? File.ReadAllBytes(JournalPath) : null;
+        string resultsPath = Path.Combine(folder, "WebResults.json");
+        byte[]? resultsBefore = File.Exists(resultsPath) ? File.ReadAllBytes(resultsPath) : null;
+        int prepared = 0, searches = 0;
+        scan.PrepareScanAsync = (_, _) => { prepared++; return Task.CompletedTask; };
+        scan.StartSearchOverride = () => searches++;
+        using (JournalWriteLease.Acquire(RunLeasePath)) {
+            for (int retry = 0; retry < 2; retry++) {
+                Assert.Null(await scan.CheckScheduleAsync(Started.AddSeconds(retry)));
+                Assert.Equal(existingResults ? ScanState.Done : ScanState.Idle, scan.State); Assert.Null(scan.ErrorMessage); Assert.False(scan.IsBusy);
+                Assert.Equal(0, searches); Assert.Equal(0, prepared); Assert.Equal(existingResults ? 2 : 0, scan.Duplicates.Count);
+                Assert.Equal(journalBefore, File.Exists(JournalPath) ? File.ReadAllBytes(JournalPath) : null);
+                Assert.Equal(resultsBefore, File.Exists(resultsPath) ? File.ReadAllBytes(resultsPath) : null);
+                Assert.Throws<IOException>(() => JournalWriteLease.Acquire(RunLeasePath));
+            }
+        }
+        await scan.CheckScheduleAsync(Started.AddSeconds(15));
+        Assert.True(scan.IsBusy); Assert.Equal(1, prepared); Assert.Equal(1, searches);
+        await scan.CompleteWebScanAsync(false);
+        await scan.CheckScheduleAsync(Started.AddSeconds(30));
+        Assert.False(scan.IsBusy); Assert.Equal(1, searches);
+        using var released = JournalWriteLease.Acquire(RunLeasePath);
+    }
+
+    [Theory]
+    [InlineData(false, false)]
+    [InlineData(true, false)]
+    [InlineData(false, true)]
+    [InlineData(true, true)]
+    public async Task HeldScheduledRunLeasePreservesAnotherOwnersCommittedGeneration(bool startupOnly, bool completed) {
+        var config = await scan.LoadAutomationAsync(); config.ScanAtStartup = startupOnly;
+        config.Schedule = config.Schedule with { Enabled = !startupOnly }; await scan.SaveAutomationAsync(config);
+        var state = StartingState();
+        if (completed) { state.Status = "Completed"; state.LastCompletedUtc = Started.AddMinutes(1); }
+        await WriteStateAsync(state); byte[] before = File.ReadAllBytes(JournalPath);
+        scan.PrepareScanAsync = (_, _) => throw new InvalidOperationException("A held run must not prepare another scan");
+        scan.StartSearchOverride = () => throw new InvalidOperationException("A held run must not start another scan");
+        using (JournalWriteLease.Acquire(RunLeasePath)) {
+            Assert.Null(await scan.CheckScheduleAsync(Started.AddMinutes(6)));
+            Assert.Equal(ScanState.Idle, scan.State); Assert.Null(scan.ErrorMessage); Assert.False(scan.IsBusy);
+            Assert.Equal(state.Status, scan.ScheduleState?.Status); Assert.Equal(state.LastStartedUtc, scan.ScheduleState?.LastStartedUtc);
+            Assert.Equal(state.LastCompletedUtc, scan.ScheduleState?.LastCompletedUtc);
+            Assert.Equal(before, File.ReadAllBytes(JournalPath));
+            Assert.Throws<IOException>(() => JournalWriteLease.Acquire(RunLeasePath));
+        }
+    }
+
+    [Theory]
     [InlineData(false, false)]
     [InlineData(true, false)]
     [InlineData(false, true)]
@@ -372,6 +442,8 @@ public sealed class WebScheduleRecoveryTests : IAsyncLifetime {
         }
         else Directory.CreateDirectory(unsafePath);
         await Assert.ThrowsAnyAsync<IOException>(() => ScanService.ReconcileScheduledRunAtStartupAsync(folder));
+        Assert.NotNull(await scan.CheckScheduleAsync(Started.AddMinutes(6)));
+        Assert.Equal(ScanState.Error, scan.State); Assert.False(scan.IsBusy);
         Assert.Equal(before, await File.ReadAllBytesAsync(JournalPath));
         if (symbolicLink) Assert.Equal("preserve", await File.ReadAllTextAsync(target));
         if (!runLease) {

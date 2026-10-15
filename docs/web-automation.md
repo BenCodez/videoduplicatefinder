@@ -89,6 +89,10 @@ After a restart, an abandoned scheduled run is marked **Interrupted** while its
 claimed slot remains recorded, so that slot is not repeated. A live cooperating
 process keeps its run status. Preserve the persistent lock files, including
 `WebSchedule.run.lock`; do not remove them while an instance is running.
+If another process holds the run lease before publishing its claim, a schedule
+check skips without reporting a scan failure. Unclaimed startup work remains
+eligible after the lease is released; unsafe lock paths and journal errors still
+require repair.
 Saved results record whether the scan completed, including scans with no
 duplicates. A reset or an interrupted replacement scan restores the Scan page
 as idle. Older empty snapshots without completion metadata also restore as idle;

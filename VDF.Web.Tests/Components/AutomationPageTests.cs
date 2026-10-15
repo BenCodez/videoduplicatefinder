@@ -226,6 +226,30 @@ public sealed class AutomationPageTests : BunitContext {
     }
 
     [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task ManualScheduleCheckTreatsHeldRunLeaseAsBenignContention(bool startupOnly) {
+        await ScanEngine.LoadDatabase(folder); DatabaseUtils.Database.Clear();
+        scan.Settings.IncludeList.Add(folder); Assert.True(scan.SaveSettings());
+        var config = await scan.LoadAutomationAsync(); config.ScanAtStartup = startupOnly;
+        config.Schedule = new() { Enabled = !startupOnly, Kind = ScanScheduleKind.Interval, IntervalMinutes = 5 };
+        await scan.SaveAutomationAsync(config);
+        scan.PrepareScanAsync = (_, _) => Task.CompletedTask;
+        int started = 0; scan.StartSearchOverride = () => started++;
+        var page = await RenderPageAsync();
+        using (VDF.Core.Review.JournalWriteLease.Acquire(Path.Combine(folder, ScanService.ScheduledRunLeaseFileName))) {
+            await ClickAsync(page, "Check saved schedule now");
+            Assert.Equal(0, started); Assert.False(scan.IsBusy); Assert.Null(scan.ErrorMessage);
+            await page.WaitForAssertionAsync(() => {
+                Assert.Empty(page.FindAll("[role='alert']")); Assert.Contains("Saved schedule checked.", page.Markup);
+                Assert.False(Button(page, "Check saved schedule now").HasAttribute("disabled"));
+            }, JournalIoTimeout);
+        }
+        try { await ClickAsync(page, "Check saved schedule now"); Assert.Equal(1, started); }
+        finally { if (scan.IsBusy) await scan.CompleteWebScanAsync(true); }
+    }
+
+    [Theory]
     [InlineData(false, "include")]
     [InlineData(true, "include")]
     [InlineData(false, "concurrency")]
