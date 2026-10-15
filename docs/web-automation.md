@@ -12,6 +12,17 @@ generation; use **Reload saved settings** before reapplying a conflicting edit.
 Selection supports newest/oldest, quality, strict or weighted folder priorities,
 overlapping rules, protected folders, custom criteria and named selection
 profiles. Dates retain their stored precision; ties use deterministic path order.
+For folder rules, choose **Browse folder…** to navigate the live filesystem.
+The browser starts at the rule's existing directory or your first scan path;
+scan-path shortcuts let you switch roots. Click a folder to open it, then
+**Select** to update the draft. Save automation settings to retain the rule.
+In Docker, these are paths inside the container.
+
+On Results, **Apply automation rules** previews the saved selection rules and
+checks removal candidates, including after a manual scan. Save draft changes
+on Automation first. The saved highlighted-group scope and protections apply;
+file operations still require a separate action and confirmation.
+
 The Results selection menu and per-group Keep Best use the shared planner.
 Explanations are available in Results and Automation. A selected checkbox is a
 candidate for an explicit action, never permission for unattended removal.

@@ -1107,6 +1107,11 @@ input.input-invalid:focus { box-shadow: 0 0 0 2px rgba(220, 38, 38, 0.2); }
 	max-height: 400px;
 }
 .folder-item {
+	width: 100%;
+	border: 0;
+	border-radius: 0;
+	background: transparent;
+	text-align: left;
 	display: flex;
 	align-items: center;
 	gap: 0.5rem;
@@ -1116,6 +1121,8 @@ input.input-invalid:focus { box-shadow: 0 0 0 2px rgba(220, 38, 38, 0.2); }
 	transition: background 0.1s;
 }
 .folder-item:hover { background: var(--bg-hover); }
+.folder-start-paths { display: flex; flex-wrap: wrap; gap: 0.4rem; padding: 0.5rem 1rem; align-items: center; }
+.folder-start-paths button { overflow-wrap: anywhere; text-align: left; }
 .folder-icon { font-size: 16px; flex-shrink: 0; }
 .folder-empty {
 	padding: 2rem 1rem;

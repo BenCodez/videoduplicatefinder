@@ -3,6 +3,7 @@ using VDF.Core.Nfo;
 using VDF.Core.Scheduling;
 using VDF.Core.Selection;
 using VDF.Web.Services;
+using VDF.Web.Components.Layout;
 
 namespace VDF.Web.Components.Pages;
 
@@ -27,6 +28,8 @@ public partial class Automation {
     bool _refreshAgain;
     bool _draftDirty;
     bool _disposed;
+    FolderBrowser? _ruleBrowser;
+    FolderPriorityRule? _browsedRule;
     long _refreshedGeneration = -1;
 
     bool Busy => _working || _refreshing || Scan.IsBusy;
@@ -182,6 +185,17 @@ public partial class Automation {
 
     void AddFolderRule() {
         _draft!.Selection.FolderRules.Add(new());
+        MarkDraftChanged();
+    }
+    void BrowseFolderRule(FolderPriorityRule rule) {
+        _browsedRule = rule;
+        _ruleBrowser?.Open(rule.Directory);
+    }
+    void SelectRuleFolder(string path) {
+        // Reloading settings or profiles can replace the rule while browsing.
+        if (Busy || _browsedRule is null || _draft?.Selection.FolderRules.Contains(_browsedRule) != true) return;
+        _browsedRule.Directory = path;
+        _browsedRule = null;
         MarkDraftChanged();
     }
     void RemoveFolderRule(FolderPriorityRule rule) {
