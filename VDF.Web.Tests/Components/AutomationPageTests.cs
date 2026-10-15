@@ -226,6 +226,47 @@ public sealed class AutomationPageTests : BunitContext {
     }
 
     [Theory]
+    [InlineData(false, "include")]
+    [InlineData(true, "include")]
+    [InlineData(false, "concurrency")]
+    [InlineData(true, "concurrency")]
+    [InlineData(false, "prepare")]
+    [InlineData(true, "prepare")]
+    public async Task ManualScheduleCheckShowsCurrentStartupFailureAndAllowsRecovery(bool recurring, string fault) {
+        await ScanEngine.LoadDatabase(folder); DatabaseUtils.Database.Clear();
+        scan.Settings.IncludeList.Add(folder);
+        string missing = Path.Combine(folder, "unavailable-media");
+        if (fault == "include") scan.Settings.IncludeList.Add(missing);
+        int concurrency = scan.Settings.MaxDegreeOfParallelism;
+        if (fault == "concurrency") scan.Settings.MaxDegreeOfParallelism = 0;
+        Assert.True(scan.SaveSettings());
+        var config = await scan.LoadAutomationAsync(); config.ScanAtStartup = true;
+        config.Schedule = new() { Enabled = recurring, Kind = ScanScheduleKind.Interval, IntervalMinutes = 5 };
+        await scan.SaveAutomationAsync(config);
+        scan.PrepareScanAsync = (_, _) => fault == "prepare" ? Task.FromException(new IOException("Synthetic preparation failure")) : Task.CompletedTask;
+        int started = 0; scan.StartSearchOverride = () => started++;
+        var page = await RenderPageAsync();
+        try {
+            await ClickAsync(page, "Check saved schedule now");
+            Assert.Equal(ScanState.Error, scan.State); Assert.False(scan.IsBusy); Assert.Equal(0, started);
+            await page.WaitForAssertionAsync(() => {
+                Assert.Contains(scan.ErrorMessage!, page.Find("[role='alert']").TextContent);
+                Assert.DoesNotContain("Saved schedule checked.", page.Markup);
+                Assert.False(Button(page, "Check saved schedule now").HasAttribute("disabled"));
+            }, JournalIoTimeout);
+            if (fault == "include") Directory.CreateDirectory(missing);
+            scan.Settings.MaxDegreeOfParallelism = concurrency;
+            Assert.True(scan.SaveSettings()); scan.PrepareScanAsync = (_, _) => Task.CompletedTask;
+            await ClickAsync(page, "Check saved schedule now");
+            await page.WaitForAssertionAsync(() => {
+                Assert.Empty(page.FindAll("[role='alert']")); Assert.Contains("Saved schedule checked.", page.Markup);
+            }, JournalIoTimeout);
+            Assert.Equal(fault == "prepare" ? 0 : 1, started);
+        }
+        finally { if (scan.IsBusy) await scan.CompleteWebScanAsync(true); }
+    }
+
+    [Theory]
     [InlineData("review")]
     [InlineData("service")]
     [InlineData("button-plan")]

@@ -82,7 +82,8 @@ public partial class Automation {
 
     async Task CheckScheduleAsync() {
         await RunAsync(async () => {
-            await Scan.CheckScheduleAsync(DateTimeOffset.UtcNow);
+            if (await Scan.CheckScheduleAsync(DateTimeOffset.UtcNow) is { } error)
+                throw new InvalidOperationException(error);
             // A due check returns once scanning starts. Its completion notification
             // will refresh the view after the scan releases its data reservation.
             if (!Scan.IsBusy) await RefreshDataAsync();

@@ -115,9 +115,9 @@ namespace VDF.Web.Services {
 
 		public Task StartScanAndCompare() => StartWebScanAsync(false, DateTimeOffset.UtcNow);
 
-		async Task StartWebScanAsync(bool scheduled, DateTimeOffset now) {
+		async Task<string?> StartWebScanAsync(bool scheduled, DateTimeOffset now) {
 			lock (_operationSync) {
-				if (_disposed || WorkActiveLocked) return;
+				if (_disposed || WorkActiveLocked) return null;
 				_scanStarting = true;
 				_scanRunActive = true;
 				_cts.Dispose();
@@ -135,7 +135,7 @@ namespace VDF.Web.Services {
 				_cts.Token.ThrowIfCancellationRequested();
 				if (!await PrepareWebScanAsync(scheduled, now)) {
 					lock (_operationSync) { _scanRunActive = false; State = _engine.Duplicates.Count > 0 ? ScanState.Done : ScanState.Idle; }
-					return;
+					return null;
 				}
 				await InvalidatePersistedResultsForScanAsync();
 				_engine.Duplicates.Clear();
@@ -159,6 +159,7 @@ namespace VDF.Web.Services {
 				await FinishScheduledStateAsync("Failed: " + ex.Message);
 				lock (_operationSync) _scanRunActive = false;
 				SetError(ex);
+				return ex.Message;
 			}
 			finally {
 				lock (_operationSync) {
@@ -167,6 +168,7 @@ namespace VDF.Web.Services {
 				}
 				Notify();
 			}
+			return State == ScanState.Error ? ErrorMessage : null;
 		}
 
 		static async Task DownloadRequiredAiComponentsAsync(Settings settings, CancellationToken ct) {

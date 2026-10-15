@@ -15,23 +15,24 @@ public sealed partial class ScanService {
     readonly SemaphoreSlim _scheduledFinishGate = new(1, 1);
     internal const string ScheduledRunLeaseFileName = "WebSchedule.run";
     internal Action? ScheduledRunClaimed { get; set; }
-    public async Task CheckScheduleAsync(DateTimeOffset now) {
-        if (IsBusy) return;
+    /// <summary>Returns a startup error from this check, never an error from an earlier scan.</summary>
+    public async Task<string?> CheckScheduleAsync(DateTimeOffset now) {
+        if (IsBusy) return null;
         // Idle polling must not reset an error, replace a preview or flash the
         // scanning state when no scheduled work is due.
         var config = await AutomationStore.LoadAsync();
-        if (config.Revision.Length == 0) return;
-        if (!config.Schedule.Enabled && (_startupChecked || !config.ScanAtStartup)) { _startupChecked = true; return; }
+        if (config.Revision.Length == 0) return null;
+        if (!config.Schedule.Enabled && (_startupChecked || !config.ScanAtStartup)) { _startupChecked = true; return null; }
         string folder = ConfiguredStateFolder(ReadScheduledSettings());
         var state = await ReadScheduleStateAsync(Path.Combine(folder, "WebSchedule.json"));
         ScheduleState = state;
         var evaluation = ScanSchedulePolicy.Evaluate(config.Schedule, now, state.LastClaimedSlotUtc, TimeZoneInfo.Local);
-        if (evaluation.Error is not null) { AutomationStatus = evaluation.Error; return; }
+        if (evaluation.Error is not null) { AutomationStatus = evaluation.Error; return evaluation.Error; }
         if (evaluation.DueSlotUtc is null && (_startupChecked || !config.ScanAtStartup)) {
             _startupChecked = true;
-            return;
+            return null;
         }
-        await StartWebScanAsync(true, now.ToUniversalTime());
+        return await StartWebScanAsync(true, now.ToUniversalTime());
     }
 
     async Task<bool> PrepareWebScanAsync(bool scheduled, DateTimeOffset now) {

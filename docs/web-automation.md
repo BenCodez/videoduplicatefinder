@@ -39,6 +39,8 @@ for a later server tick after the prerequisite recovers. A claimed run stays
 consumed for that service instance even if preparation later fails or is aborted.
 Unexpected engine errors are reported as failed scans, including their error
 message. Explicit cancellation remains an aborted run.
+**Check saved schedule now** displays a failure from that check instead of a
+success notice. Checking an idle schedule does not repeat an earlier scan error.
 AI schedules require installing the AI components with a manual scan first.
 
 Automatic selection after a scan previews all newly scanned groups. The
