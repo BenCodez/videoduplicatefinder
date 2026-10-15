@@ -69,7 +69,18 @@ an ephemeral loopback port mapped to container port 8080, and removes its contai
 and files on completion. Run it with a local Docker daemon, since bind mounts must
 refer to the same filesystem as the Python process.
 
-Publishing a GitHub release for a numeric version tag (for example `v4.1.1`)
+Before publishing a new version, enable **Settings → General → Releases →
+Enable release immutability** in the repository. This applies to future releases;
+existing mutable releases cannot be used for this Docker publication flow.
+GitHub locks an immutable release's tag to its commit, and the tag name cannot
+be reused even if the release is later deleted. Docker publication verifies the
+live release is published and immutable before validating the tag and before
+registry writes. This prevents a tag move in the gap between validation and
+manifest creation; repeated checks alone cannot make a Git ref and a registry
+write atomic. Missing, mutable or unverifiable releases stop publication.
+See [GitHub release immutability](https://docs.github.com/en/code-security/concepts/supply-chain-security/immutable-releases).
+
+Publishing an immutable GitHub release for a numeric version tag (for example `v4.1.1`)
 automatically runs the Docker workflow and publishes
 `ghcr.io/bencodez/vdf-web:4.1.1`. The tag's major/minor version must match
 `VersionPrefix` in `Directory.Build.props`. Branch pushes, tag pushes and pull
@@ -78,7 +89,8 @@ trigger publication. The release
 tag must include this workflow change, so publishing an older tag does not add
 the new behavior to that tag.
 
-The manual fallback remains **Actions → Docker (Web UI) → Run workflow**:
+For an already published immutable release, the manual fallback remains
+**Actions → Docker (Web UI) → Run workflow**:
 select the version tag and enable **Publish versioned images**. Runtime
 validation must pass for both architectures before the publication job can
 publish the validated images. Ordinary validation runs never push images, and the

@@ -61,6 +61,16 @@ def prepare(*, allow_release=False):
             raise ValueError("Publication is restricted to the canonical repository")
         if not tag:
             raise ValueError("Publication requires a version tag, not a branch")
+        if allow_release:
+            # Docker's final registry write cannot atomically compare a Git ref.
+            # GitHub immutable releases lock the version tag even if the release
+            # is later deleted (that tag name cannot be reused).
+            release = api(f"repos/BenCodez/videoduplicatefinder/releases/tags/{tag}")
+            if (not isinstance(release, dict) or type(release.get("id")) is not int or release["id"] <= 0
+                    or release.get("tag_name") != tag or release.get("draft") is not False
+                    or release.get("immutable") is not True):
+                raise ValueError("Docker publication requires a published immutable release. "
+                                 "Enable release immutability in repository Settings before publishing a new version.")
         if git("rev-parse", "HEAD") != sha or git("rev-parse", f"refs/tags/{tag}^{{commit}}") != sha:
             raise ValueError("The selected tag and checkout must match the workflow commit")
         # Checkout can restore a moved tag locally to the original workflow SHA.

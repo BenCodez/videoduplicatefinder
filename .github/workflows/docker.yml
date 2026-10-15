@@ -38,6 +38,7 @@ jobs:
         env:
           REQUEST_PUBLISH: ${{ inputs.publish || false }}
           EXPECTED_SOURCE_SHA: ${{ inputs.expected_sha || '' }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: python3 .github/scripts/publication.py prepare --allow-release
 
   build:
@@ -111,6 +112,7 @@ jobs:
         env:
           REQUEST_PUBLISH: ${{ inputs.publish || false }}
           EXPECTED_SOURCE_SHA: ${{ inputs.expected_sha || '' }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: python3 .github/scripts/publication.py prepare --allow-release
       - uses: actions/download-artifact@v5
         with:
@@ -129,6 +131,7 @@ jobs:
           SOURCE_SHA: ${{ needs.prepare.outputs.sha }}
           REQUEST_PUBLISH: ${{ inputs.publish || false }}
           EXPECTED_SOURCE_SHA: ${{ inputs.expected_sha || '' }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         shell: bash
         run: |
           set -euo pipefail

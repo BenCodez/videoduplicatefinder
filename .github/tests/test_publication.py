@@ -186,7 +186,7 @@ class PublicationTests(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0)
             result, _ = self.run_helper("publish-native", allow_release=True, **event)
             self.assertNotEqual(result.returncode, 0)
-            self.assertEqual(self.commands(), [])
+            self.assertTrue(all(row == ["api", f"repos/BenCodez/videoduplicatefinder/releases/tags/{TAG}"] for row in self.commands()))
 
     def test_draft_mismatched_or_nonversion_release_cannot_publish(self):
         for release in ({"draft": True}, {"draft": None}, {"tag_name": "different"}):
@@ -198,7 +198,7 @@ class PublicationTests(unittest.TestCase):
             result, values = self.run_helper(allow_release=True, **(self.release_publication() | changes))
             self.assertNotEqual(result.returncode, 0)
             self.assertEqual(values, {})
-        self.assertEqual(self.commands(), [])
+        self.assertTrue(all(row == ["api", f"repos/BenCodez/videoduplicatefinder/releases/tags/{TAG}"] for row in self.commands()))
 
     def test_other_release_events_and_malformed_payload_do_not_publish(self):
         event = self.release_publication()
@@ -214,6 +214,29 @@ class PublicationTests(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0)
             self.assertEqual(values, {})
         self.assertEqual(self.commands(), [])
+
+    def test_docker_requires_live_immutable_release_for_manual_and_release_publication(self):
+        invalid = [None, [], {}, {"id": True}, {"id": 753, "tag_name": TAG, "draft": False, "immutable": False},
+                   {"id": 753, "tag_name": TAG, "draft": True, "immutable": True},
+                   {"id": 753, "tag_name": "another", "draft": False, "immutable": True},
+                   {"id": 753, "tag_name": TAG, "draft": False, "immutable": "true"}]
+        for event in (self.publication(), self.release_publication()):
+            for state in invalid:
+                with self.subTest(event=event["GITHUB_EVENT_NAME"], release=state):
+                    result, values = self.run_helper(allow_release=True, **event, IMMUTABLE_RELEASE=json.dumps(state))
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertEqual(values, {})
+            result, values = self.run_helper(allow_release=True, **event, FAIL_RELEASE_LOOKUP="1")
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(values, {})
+        self.assertTrue(all(row == ["api", f"repos/BenCodez/videoduplicatefinder/releases/tags/{TAG}"] for row in self.commands()))
+
+    def test_release_event_payload_does_not_substitute_for_live_tag_lock(self):
+        event = self.release_publication(immutable=True)
+        mutable = {"id": 753, "tag_name": TAG, "draft": False, "immutable": False}
+        result, values = self.run_helper(allow_release=True, **event, IMMUTABLE_RELEASE=json.dumps(mutable))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(values, {})
 
     def test_annotated_tag_is_accepted(self):
         self.git("tag", "-d", TAG)
@@ -427,6 +450,16 @@ class PublicationTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertFalse(any(row[:2] == ["buildx", "imagetools"] for row in self.commands()))
 
+    def test_final_docker_consumer_rejects_mutable_or_unavailable_release_before_registry_writes(self):
+        self.web_artifacts()
+        for changes in ({"IMMUTABLE_RELEASE": json.dumps({"id": 753, "tag_name": TAG, "draft": False, "immutable": False})},
+                        {"FAIL_RELEASE_LOOKUP": "1"}):
+            with self.subTest(changes=changes):
+                self.log.unlink(missing_ok=True)
+                result = self.run_web_consumer(**changes)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertFalse(any(row[0] == "push" or row[:2] == ["buildx", "imagetools"] for row in self.commands()))
+
     def test_web_final_consumer_publishes_both_validated_images_with_lowercase_tags(self):
         self.web_artifacts()
         result = self.run_web_consumer()
@@ -508,6 +541,7 @@ class WorkflowAuthorizationTests(unittest.TestCase):
             for step in data["jobs"][job]["steps"]:
                 if "publication.py" in step.get("run", ""):
                     self.assertEqual(step["env"]["EXPECTED_SOURCE_SHA"], "${{ inputs.expected_sha || '' }}")
+                    self.assertEqual(step["env"]["GH_TOKEN"], "${{ secrets.GITHUB_TOKEN }}")
 
     def test_native_dispatch_is_bound_to_the_published_tag_and_success(self):
         steps = workflow("releases")["jobs"]["publish-release"]["steps"]

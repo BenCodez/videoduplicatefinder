@@ -12,7 +12,12 @@ with open(os.environ["COMMAND_LOG"], "a") as log:
     log.write(json.dumps(args) + "\n")
 with open(os.environ["COMMAND_LOG"] + ".bodies", "a") as log:
     log.write(json.dumps(body) + "\n")
-if args[:3] == ["workflow", "run", "docker.yml"]:
+if len(args) == 2 and args[0] == "api" and "/releases/tags/" in args[1]:
+    if os.environ.get("FAIL_RELEASE_LOOKUP"):
+        sys.exit(1)
+    default = json.dumps({"id": 753, "tag_name": os.environ["GITHUB_REF_NAME"], "draft": False, "immutable": True})
+    print(os.environ.get("IMMUTABLE_RELEASE", default))
+elif args[:3] == ["workflow", "run", "docker.yml"]:
     if os.environ.get("FAIL_DISPATCH"):
         sys.exit(1)
 elif "--paginate" in args:
