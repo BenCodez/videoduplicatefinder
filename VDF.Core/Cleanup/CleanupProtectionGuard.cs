@@ -80,7 +80,9 @@ public sealed class CleanupProtectionGuard {
 		await GetReviewsAsync(ct).ConfigureAwait(false);
 		await RequireNoPendingRecoveryAsync(target, claimPath, ct).ConfigureAwait(false);
 		FileIdentity? currentClaim = claimPath is null ? null :
-			await Task.Run(() => IdentityReader.Capture(claimPath, true, ct), ct).ConfigureAwait(false);
+			// Removal already force-hashed this claim. Reuse its digest only when
+			// the native snapshot is unchanged; absent/unreliable stamps rehash.
+			await Task.Run(() => IdentityReader.Capture(claimPath, false, ct), ct).ConfigureAwait(false);
 		if (claimPath is not null && !target.MatchesRelocated(currentClaim))
 			throw new IOException("The claimed source cannot currently be validated for protection checks.");
 		if (_retainedFiles.Contains(RetentionKey(target)) ||

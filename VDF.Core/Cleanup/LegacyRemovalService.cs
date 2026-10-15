@@ -175,12 +175,21 @@ public sealed class LegacyRemovalService {
 			throw new IOException("The removal journal cannot be used as media.");
 		SafePaths.RequireRegularFile(target.Path);
 		SafePaths.RequireRegularFile(keeper.Path);
-		if (!keeper.Matches(IdentityReader.Capture(keeper.Path, true, ct)))
+		if (!MatchesPreclaim(keeper, ct))
 			throw new IOException("The remaining keeper is unavailable or has changed since review.");
-		if (!target.Matches(IdentityReader.Capture(target.Path, true, ct)))
+		if (!MatchesPreclaim(target, ct))
 			throw new IOException("The removal target is unavailable or has changed since review.");
 		if (!IdentityReader.MatchesCurrentSnapshot(keeper) || !IdentityReader.MatchesCurrentSnapshot(target))
 			throw new IOException("The reviewed media changed or lacks reliable current filesystem snapshots.");
+	}
+
+	static bool MatchesPreclaim(FileIdentity identity, CancellationToken ct) {
+		ct.ThrowIfCancellationRequested();
+		// Reuse only a trusted in-process content proof anchored to unchanged
+		// native metadata. The post-claim keeper and source hashes remain forced
+		// before the destructive callback, regardless of this early fast path.
+		return IdentityReader.MatchesTrustedSnapshot(identity) ??
+			identity.Matches(IdentityReader.Capture(identity.Path, true, ct));
 	}
 
 	bool ReservedJournalPath(string path) => SafePaths.Same(path, _journalPath) ||

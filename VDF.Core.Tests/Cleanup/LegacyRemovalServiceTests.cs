@@ -44,6 +44,22 @@ public sealed class LegacyRemovalServiceTests : IDisposable {
 	void AssertNoClaims() => Assert.Empty(Directory.EnumerateFiles(_directory, ".vdf-*.holding", SearchOption.AllDirectories));
 
 	[Fact]
+	public async Task UntrustedIdentityStillForcesPreclaimAndFinalContentVerification() {
+		var (target, keeper) = Pair();
+		target = target with { };
+		keeper = keeper with { };
+		var reads = new List<string>();
+		IdentityReader.HashStartedObserver.Value = reads.Add;
+		try { await Service.RemoveAsync(target, keeper, File.Delete); }
+		finally { IdentityReader.HashStartedObserver.Value = null; }
+		Assert.Equal(4, reads.Count);
+		Assert.Equal(2, reads.Count(path => SafePaths.Same(path, keeper.Path)));
+		Assert.Single(reads, path => SafePaths.Same(path, target.Path));
+		Assert.Single(reads, path => path.EndsWith(".holding", StringComparison.Ordinal));
+		Assert.False(File.Exists(target.Path));
+	}
+
+	[Fact]
 	public async Task SuccessfulRemoval_DeletesVerifiedClaimAndKeepsIndependentCopy() {
 		var (target, keeper) = Pair();
 		string? removedPath = null;

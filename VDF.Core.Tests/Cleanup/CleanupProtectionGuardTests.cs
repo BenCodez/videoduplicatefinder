@@ -38,6 +38,33 @@ public sealed class CleanupProtectionGuardTests : IDisposable {
 		Assert.Empty(Directory.EnumerateFiles(_directory, ".vdf-*.holding", SearchOption.AllDirectories));
 	}
 
+	[Theory]
+	[InlineData(false)]
+	[InlineData(true)]
+	public async Task VerifiedRemovalReusesOnlyTrustedUnchangedContentAndRehashesAfterCacheEviction(bool evictClaimDigest) {
+		var (target, keeper) = Pair();
+		if (target.ChangeStamp.Length == 0 || keeper.ChangeStamp.Length == 0) return;
+		await Policy();
+		IdentityReader.ClearMemoizedDigests();
+		var reads = new List<string>();
+		IdentityReader.HashStartedObserver.Value = path => {
+			if (SafePaths.Same(path, target.Path) || SafePaths.Same(path, keeper.Path) || path.EndsWith(".holding", StringComparison.Ordinal))
+				reads.Add(path);
+		};
+		var guard = new CleanupProtectionGuard(State);
+		guard.BeforeLiveCheckAsync = (claim, _) => {
+			if (claim is not null && evictClaimDigest) IdentityReader.ClearMemoizedDigests();
+			return Task.CompletedTask;
+		};
+		try { await guard.RemoveAsync(target, keeper, File.Delete); }
+		finally { IdentityReader.HashStartedObserver.Value = null; }
+		Assert.Equal(evictClaimDigest ? 3 : 2, reads.Count);
+		Assert.True(SafePaths.Same(reads[0], keeper.Path));
+		Assert.EndsWith(".holding", reads[1]);
+		Assert.False(File.Exists(target.Path));
+		Assert.True(File.Exists(keeper.Path));
+	}
+
 	[Fact]
 	public async Task MissingPolicy_BlocksMutation() {
 		var (target, keeper) = Pair();
