@@ -136,6 +136,7 @@ namespace VDF.Web.Services {
 					lock (_operationSync) { _scanRunActive = false; State = _engine.Duplicates.Count > 0 ? ScanState.Done : ScanState.Idle; }
 					return;
 				}
+				await InvalidatePersistedResultsForScanAsync();
 				_engine.Duplicates.Clear();
 				ClearCleanupSnapshots();
 				ClearThumbnailCaches();

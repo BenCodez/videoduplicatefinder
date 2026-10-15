@@ -277,6 +277,127 @@ public sealed class WebAutomationTests : IAsyncLifetime {
     }
 
     [Theory]
+    [InlineData(false, "prepare")]
+    [InlineData(true, "prepare")]
+    [InlineData(false, "abort")]
+    [InlineData(true, "abort")]
+    [InlineData(false, "interrupted")]
+    [InlineData(true, "interrupted")]
+    public async Task ReplacingScanDurablyDiscardsPreviousResultsBeforePreparation(bool scheduled, string outcome) {
+        Seed("previous-a.mp4"); Seed("previous-b.mp4");
+        var previousPaths = scan.Duplicates.Select(item => item.Path).ToArray();
+        ScanEngine.SaveDatabase();
+        await scan.CompleteWebScanAsync(false);
+        await scan.RemoveFromResultsAsync([]);
+        Assert.Equal(2, scan.Duplicates.Count);
+        var config = await scan.LoadAutomationAsync();
+        config.Schedule = new() { Enabled = scheduled, Kind = ScanScheduleKind.Interval, IntervalMinutes = 5 };
+        await scan.SaveAutomationAsync(config);
+        int prepared = 0, started = 0;
+        scan.PrepareScanAsync = (_, _) => {
+            prepared++;
+            AssertEmptySavedResults(folder);
+            return outcome == "prepare" ? Task.FromException(new IOException("Synthetic preparation failure")) : Task.CompletedTask;
+        };
+        scan.StartSearchOverride = () => {
+            started++;
+            AssertEmptySavedResults(folder);
+            DatabaseUtils.Database.Clear();
+            ScanEngine.SaveDatabase();
+        };
+        try {
+            if (scheduled) await scan.CheckScheduleAsync(DateTimeOffset.UtcNow);
+            else await scan.StartScanAndCompare();
+            Assert.Equal(1, prepared);
+            Assert.Equal(outcome == "prepare" ? 0 : 1, started);
+            if (outcome == "abort") await scan.CompleteWebScanAsync(true);
+            Assert.Empty(scan.Duplicates);
+            AssertEmptySavedResults(folder);
+            using var restarted = NewService();
+            await restarted.InitializeWebAutomationAsync();
+            Assert.Empty(restarted.Duplicates);
+            Assert.All(previousPaths, path => Assert.True(File.Exists(path)));
+        }
+        finally {
+            if (scan.IsBusy) await scan.CompleteWebScanAsync(true);
+        }
+    }
+
+    static void AssertEmptySavedResults(string stateFolder) {
+        foreach (var suffix in new[] { "", ".bak" }) {
+            var value = JsonNode.Parse(File.ReadAllText(Path.Combine(stateFolder, "WebResults.json" + suffix)))!;
+            Assert.Empty(value["rows"]!.AsArray());
+        }
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task UnwritableResultsSnapshotRefusesScanBeforeDiscardingVisibleResults(bool corrupt) {
+        Seed("preserved-a.mp4"); Seed("preserved-b.mp4");
+        ScanEngine.SaveDatabase();
+        await scan.CompleteWebScanAsync(false);
+        await scan.RemoveFromResultsAsync([]);
+        string path = Path.Combine(folder, "WebResults.json");
+        if (corrupt) {
+            File.WriteAllText(path, "{");
+            File.WriteAllText(path + ".bak", "{");
+        }
+        byte[] before = File.ReadAllBytes(path);
+        using var lease = corrupt ? null : new FileStream(path + ".lock", FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None);
+        int prepared = 0, started = 0;
+        scan.PrepareScanAsync = (_, _) => { prepared++; return Task.CompletedTask; };
+        scan.StartSearchOverride = () => started++;
+        try {
+            await scan.StartScanAndCompare();
+            Assert.Equal(0, prepared);
+            Assert.Equal(0, started);
+            Assert.Equal(ScanState.Error, scan.State);
+            Assert.False(scan.IsBusy);
+            Assert.Equal(2, scan.Duplicates.Count);
+            Assert.Equal(before, File.ReadAllBytes(path));
+        }
+        finally {
+            if (scan.IsBusy) await scan.CompleteWebScanAsync(true);
+        }
+    }
+
+    [Fact]
+    public async Task SwitchingScanFoldersInvalidatesBothOldAndDestinationSnapshots() {
+        Seed("old-folder-a.mp4"); Seed("old-folder-b.mp4");
+        ScanEngine.SaveDatabase();
+        await scan.CompleteWebScanAsync(false);
+        await scan.RemoveFromResultsAsync([]);
+        string destination = Path.Combine(folder, "other-state");
+        Directory.CreateDirectory(destination);
+        foreach (var name in new[] { "WebResults.json", "WebResults.json.bak", "ScannedFiles.db" })
+            File.Copy(Path.Combine(folder, name), Path.Combine(destination, name));
+        scan.Settings.CustomDatabaseFolder = destination;
+        Assert.True(scan.SaveSettings());
+        scan.PrepareScanAsync = (_, _) => Task.CompletedTask;
+        int started = 0;
+        scan.StartSearchOverride = () => {
+            started++;
+            AssertEmptySavedResults(folder);
+            AssertEmptySavedResults(destination);
+        };
+        try {
+            await scan.StartScanAndCompare();
+            Assert.Equal(1, started);
+            await scan.CompleteWebScanAsync(true);
+            foreach (var stateFolder in new[] { folder, destination }) {
+                using var restarted = NewService();
+                restarted.Settings.CustomDatabaseFolder = stateFolder;
+                await restarted.InitializeWebAutomationAsync();
+                Assert.Empty(restarted.Duplicates);
+            }
+        }
+        finally {
+            if (scan.IsBusy) await scan.CompleteWebScanAsync(true);
+        }
+    }
+
+    [Theory]
     [InlineData("clear")]
     [InlineData("reset")]
     [InlineData("remove")]

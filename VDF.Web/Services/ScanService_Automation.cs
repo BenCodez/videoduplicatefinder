@@ -305,6 +305,19 @@ public sealed partial class ScanService {
         return result;
     }
 
+    async Task InvalidatePersistedResultsForScanAsync() {
+        if (_runAutomation is null) return;
+        // Commit the discarded generation before preparation or the engine can
+        // fail, be interrupted, or change its database. Both journal copies must
+        // be empty so restart cannot resurrect results this scan replaced.
+        string nextFolder = ConfiguredStateFolder(_engine.Settings);
+        await SaveResultsAsync(nextFolder, new());
+        if (_resultStateFolder is { } previous && !PathComparer.ForCurrentPlatform.Equals(
+            NormalizeDatabaseFolder(previous), NormalizeDatabaseFolder(nextFolder))) {
+            SafePaths.RequireDirectory(previous);
+            await SaveResultsAsync(previous, new());
+        }
+    }
     async Task PersistResultsAsync() {
         if (_resultStateFolder is null || _runAutomation is null && !File.Exists(AutomationStore.Path)) return;
         await SaveResultsAsync(_resultStateFolder, Duplicates.Select(item => new WebSavedResult {
