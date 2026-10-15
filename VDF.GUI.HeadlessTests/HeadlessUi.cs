@@ -78,6 +78,26 @@ public static class HeadlessUi {
 
 	static MainWindow? shell;
 
+	/// <summary>Keep a shared shell's delayed writes out of an isolated fixture's settings snapshot.</summary>
+	public static IDisposable IsolateSettingsWrites(string path) {
+		var timer = (DispatcherTimer)typeof(MainWindow)
+			.GetField("settingsSaveDebounce", BindingFlags.Instance | BindingFlags.NonPublic)!
+			.GetValue(Shell().Window)!;
+		var interval = timer.Interval;
+		bool enabled = timer.IsEnabled;
+		string? previousPath = (string?)typeof(SettingsFile)
+			.GetField("settingsPath", BindingFlags.Static | BindingFlags.NonPublic)!.GetValue(null);
+		timer.Stop();
+		timer.Interval = TimeSpan.FromDays(1);
+		SettingsFile.SetSettingsPath(path);
+		return System.Reactive.Disposables.Disposable.Create(() => {
+			timer.Stop();
+			SettingsFile.SetSettingsPath(previousPath);
+			timer.Interval = interval;
+			if (enabled) timer.Start();
+		});
+	}
+
 	/// <summary>
 	/// The real main window with its view model, shown once and shared: closing it would run
 	/// the app's shutdown path. Tests must put back whatever state they change on it.

@@ -30,6 +30,7 @@ public sealed class AutomationIntegrationTests : IDisposable {
 	}
 
 	async Task WithSettings(Func<Task> work) {
+		using var settingsWrites = HeadlessUi.IsolateSettingsWrites(Path.Combine(folder, "Settings.json"));
 		var settings = SettingsFile.Instance;
 		string database = settings.CustomDatabaseFolder;
 		var selection = settings.AutomationSelection;
@@ -40,7 +41,9 @@ public sealed class AutomationIntegrationTests : IDisposable {
 			settings.NfoFavourites = new();
 			await work();
 		}
-		finally { settings.CustomDatabaseFolder = database; settings.AutomationSelection = selection; settings.NfoFavourites = nfo; }
+		finally {
+			settings.CustomDatabaseFolder = database; settings.AutomationSelection = selection; settings.NfoFavourites = nfo;
+		}
 	}
 
 	[Fact]

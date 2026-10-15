@@ -17,6 +17,7 @@ public sealed class AutomationSaveAndDiscardTests : IDisposable {
 
 	async Task WithSettings(Func<Task> work) {
 		HeadlessUi.Shell();
+		using var settingsWrites = HeadlessUi.IsolateSettingsWrites(Path.Combine(folder, "Settings.json"));
 		var settings = SettingsFile.Instance;
 		string database = settings.CustomDatabaseFolder;
 		var selection = settings.AutomationSelection;
@@ -32,7 +33,6 @@ public sealed class AutomationSaveAndDiscardTests : IDisposable {
 			await work();
 		}
 		finally {
-			SettingsFile.SetSettingsPath(null);
 			settings.CustomDatabaseFolder = database;
 			settings.AutomationSelection = selection;
 			settings.SavedSelectionProfiles = profiles;

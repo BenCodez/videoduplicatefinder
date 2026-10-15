@@ -49,11 +49,11 @@ jobs:
         }
     - name: Run Integration Tests
       run: dotnet test VDF.IntegrationTests/VDF.IntegrationTests.csproj -c Release -v normal
-    - name: Repeat hardlink and final authority regressions
+    - name: Repeat hardlink, manual review and final authority regressions
       shell: pwsh
       run: |
         for ($iteration = 1; $iteration -le 10; $iteration++) {
-          Write-Host "Hardlink and final authority regression iteration $iteration of 10"
-          dotnet test VDF.GUI.HeadlessTests/VDF.GUI.HeadlessTests.csproj -c Release --no-build --no-restore --filter "FullyQualifiedName~HardLinkBatchRefreshes|FullyQualifiedName~CleanupBatchWithUncachedIdentitiesSkipsOnlyCompletedRows|FullyQualifiedName~FolderEditAcrossFinalCleanupAwaitRefusesQuarantineAndPermanentRemoval" --logger "console;verbosity=normal"
+          Write-Host "Hardlink, manual review and final authority regression iteration $iteration of 10"
+          dotnet test VDF.GUI.HeadlessTests/VDF.GUI.HeadlessTests.csproj -c Release --no-build --no-restore --filter "FullyQualifiedName~HardLinkBatchRefreshes|FullyQualifiedName~CleanupBatchWithUncachedIdentitiesSkipsOnlyCompletedRows|FullyQualifiedName~FolderEditAcrossFinalCleanupAwaitRefusesQuarantineAndPermanentRemoval|FullyQualifiedName~DeliberateCheckboxChangeOverridesManualKeeperWhileAutomaticSelectionPreservesIt" --logger "console;verbosity=normal"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
         }
