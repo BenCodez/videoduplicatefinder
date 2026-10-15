@@ -7,6 +7,8 @@
 <PageTitle>Scan — Video Duplicate Finder</PageTitle>
 
 <h1>Scan</h1>
+@if (Scan.ResultsPersistenceWarning is { } resultsWarning) { <p class="aborted-msg" role="alert">@resultsWarning</p> }
+@if (Scan.SelectionPersistenceWarning is { } selectionWarning) { <p class="aborted-msg" role="alert">@selectionWarning</p> }
 
 @* FFmpeg setup banner *@
 @if (FFmpegSetup.State == FFmpegSetupState.Checking) {
@@ -44,7 +46,7 @@
     <div class="error-box">
         <strong>Error</strong>
         <p>@Scan.ErrorMessage</p>
-        <button @onclick="Scan.Reset">Dismiss</button>
+        <button @onclick="ResetAsync" disabled="@Scan.IsBusy">Dismiss</button>
     </div>
 }
 
@@ -123,7 +125,7 @@ else {
 
         <div class="start-row">
             @if (Scan.State == ScanState.Done || Scan.State == ScanState.Aborted || Scan.State == ScanState.Error) {
-                <button @onclick="Scan.Reset">Reset</button>
+                <button @onclick="ResetAsync" disabled="@Scan.IsBusy">Reset</button>
             }
             <button @onclick="SaveSettings" title="Save current settings to disk">Save settings</button>
             <button class="primary" @onclick="Scan.StartScanAndCompare"
@@ -163,6 +165,11 @@ else {
     }
 
     void RetryFfmpegSetup() => _ = FFmpegSetup.CheckAndSetupAsync();
+
+    async Task ResetAsync() {
+        try { await Scan.ResetAsync(); }
+        catch (Exception ex) { _saveFailed = true; _saveMsg = "Reset could not be saved: " + ex.Message; }
+    }
 
     void AddInclude() {
         var path = _newInclude.Trim();

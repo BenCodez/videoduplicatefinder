@@ -23,6 +23,7 @@ public sealed class ResultsStateAuthorityTests {
         internal void Switch(string folder, bool save = true) {
             SettingsFile.Instance.CustomDatabaseFolder = folder;
             if (save) SettingsFile.SaveSettings();
+            StopShellSettingsAutosave();
         }
     }
 
@@ -50,6 +51,7 @@ public sealed class ResultsStateAuthorityTests {
             settings.BackupAfterListChanged = false;
             settings.NotifyOnScanComplete = false;
             SettingsFile.SaveSettings();
+            StopShellSettingsAutosave();
             await work(s);
         }
         finally {
@@ -70,8 +72,23 @@ public sealed class ResultsStateAuthorityTests {
             settings.BackupAfterListChanged = backups;
             settings.NotifyOnScanComplete = notify;
             SettingsFile.SetSettingsPath(null);
+            StopShellSettingsAutosave();
             try { Directory.Delete(s.Root, true); } catch { }
         }
+    }
+
+    static void StopShellSettingsAutosave() {
+        if (!Avalonia.Threading.Dispatcher.UIThread.CheckAccess()) {
+            Avalonia.Threading.Dispatcher.UIThread.Invoke(StopShellSettingsAutosave);
+            return;
+        }
+        // This fixture saves explicitly and injects its own authority changes.
+        // The shared shell's delayed policy writer must not independently take
+        // a protection lease before the intended final cleanup callback.
+        var window = HeadlessUi.Shell().Window;
+        var timer = (Avalonia.Threading.DispatcherTimer)typeof(MainWindow)
+            .GetField("settingsSaveDebounce", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(window)!;
+        timer.Stop();
     }
 
     static DuplicateItemVM Add(MainWindowVM host, string path, Guid group) {
@@ -228,6 +245,7 @@ public sealed class ResultsStateAuthorityTests {
         var (host, target, keeper) = await Pair(s);
         var original = FileIdentity.Capture(target.ItemInfo.Path)!;
         bool hookRan = false;
+        string outcome = "Permanent removal did not reach the final authority callback.";
         host.BeforeCleanupAuthorityCheckAsync = async () => {
             await Task.Yield();
             hookRan = true;
@@ -239,6 +257,7 @@ public sealed class ResultsStateAuthorityTests {
             var preview = await host.CreateQuarantinePreviewAsync();
             await preview.ExecuteCommand.Execute();
             Assert.Contains("Quarantined 0 files", preview.Status);
+            outcome = preview.Status;
         }
         else {
             var approved = await host.PrepareCleanupGuardAsync([target]);
@@ -247,7 +266,7 @@ public sealed class ResultsStateAuthorityTests {
             await Assert.ThrowsAsync<IOException>(() => guard.RemoveAsync(action.Target, action.Keeper,
                 claim => File.Delete(claim), groupMembers: host.CaptureCompleteCleanupGroup(target.ItemInfo.GroupId)));
         }
-        Assert.True(hookRan);
+        Assert.True(hookRan, outcome);
         // The verified rollback keeps the native source and bytes, but its
         // rename changes the change stamp, so the old scan cannot be reused.
         var restored = Assert.IsType<FileIdentity>(FileIdentity.Capture(target.ItemInfo.Path));

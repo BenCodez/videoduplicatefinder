@@ -47,6 +47,7 @@ namespace VDF.Web.Services {
 	public sealed partial class ScanService : IDisposable {
 		readonly ScanEngine _engine = new();
 		readonly WebSettingsService _settingsService;
+		Settings _configuredSettings;
 		CancellationTokenSource _cts = new();
 		readonly object _operationSync = new();
 		bool _scanStarting;
@@ -67,7 +68,7 @@ namespace VDF.Web.Services {
 		/// <summary>Total files hashed (captured when BuildingHashesDone fires).</summary>
 		public int FilesHashed { get; private set; }
 		public IReadOnlyCollection<DuplicateItem> Duplicates => _engine.Duplicates;
-		public Settings Settings => _engine.Settings;
+		public Settings Settings => _configuredSettings;
 		/// <summary>Test seam: lets tests seed results without driving a real scan.</summary>
 		internal ScanEngine Engine => _engine;
 		internal Func<Settings, CancellationToken, Task> PrepareScanAsync { get; set; } = DownloadRequiredAiComponentsAsync;
@@ -86,6 +87,7 @@ namespace VDF.Web.Services {
 		public ScanService(WebSettingsService settingsService) {
 			_settingsService = settingsService;
 			settingsService.Load(_engine.Settings);
+			_configuredSettings = _engine.Settings;
 
 			_engine.FilesEnumerated += (_, _) => Notify();
 			_engine.BuildingHashesDone += (_, _) => {
@@ -107,30 +109,15 @@ namespace VDF.Web.Services {
 				};
 				Notify();
 			};
-			_engine.ScanDone += (_, _) => {
-				// Skip low-res thumbnail retrieval — WebUI loads HQ thumbnails on demand
-				// via the /thumbnail/hq endpoint. This makes results available immediately.
-				CaptureCleanupSnapshots(DatabaseUtils.GetDatabaseFolderPath());
-				lock (_operationSync) {
-					_scanRunActive = false;
-					State = ScanState.Done;
-					LastProgress = null;
-				}
-				Notify();
-			};
-			_engine.ScanAborted += (_, _) => {
-				lock (_operationSync) {
-					_scanRunActive = false;
-					State = ScanState.Aborted;
-					LastProgress = null;
-				}
-				Notify();
-			};
+			_engine.ScanDone += (_, _) => CompletionTask = CompleteWebScanAsync(false);
+			_engine.ScanAborted += (_, args) => CompletionTask = CompleteWebScanAsync(true, (args as ScanAbortedEventArgs)?.Error);
 		}
 
-		public async Task StartScanAndCompare() {
+		public Task StartScanAndCompare() => StartWebScanAsync(false, DateTimeOffset.UtcNow);
+
+		async Task<string?> StartWebScanAsync(bool scheduled, DateTimeOffset now) {
 			lock (_operationSync) {
-				if (_disposed || WorkActiveLocked) return;
+				if (_disposed || WorkActiveLocked) return null;
 				_scanStarting = true;
 				_scanRunActive = true;
 				_cts.Dispose();
@@ -139,35 +126,53 @@ namespace VDF.Web.Services {
 				ErrorMessage = null;
 				LastProgress = null;
 				FilesHashed = 0;
-				_engine.Duplicates.Clear();
-				ClearCleanupSnapshots();
-				ClearThumbnailCaches();
+				_terminalProcessing = false;
 			}
 			Notify();
 			try {
+				// Reserve the whole lifecycle before configuration reads, durable
+				// schedule claims, first-use downloads or replacing visible results.
+				_cts.Token.ThrowIfCancellationRequested();
+				if (!await PrepareWebScanAsync(scheduled, now)) {
+					lock (_operationSync) { _scanRunActive = false; State = _engine.Duplicates.Count > 0 ? ScanState.Done : ScanState.Idle; }
+					return null;
+				}
+				await InvalidatePersistedResultsForScanAsync();
+				_engine.Duplicates.Clear();
+				ClearCleanupSnapshots();
+				ClearThumbnailCaches();
+				ClearSelectionPlan();
+				NotifyAutomationChanged();
 				// Reserve the lifecycle before awaiting a first-use AI download.
 				await PrepareScanAsync(_engine.Settings, _cts.Token);
 				_cts.Token.ThrowIfCancellationRequested();
-				_engine.StartSearch();
+				if (StartSearchOverride is { } start) start(); else _engine.StartSearch();
 			}
 			catch (OperationCanceledException) {
-				lock (_operationSync) {
-					_scanRunActive = false;
-					State = ScanState.Aborted;
-					LastProgress = null;
-				}
+				await CompleteWebScanAsync(true);
+				// Stop can raise an early terminal callback before a claim write
+				// returns and transfers scheduled ownership. Finish that late claim
+				// even when the callback already consumed the terminal guard.
+				await FinishScheduledStateAsync("Aborted");
 			}
 			catch (Exception ex) {
+				await FinishScheduledStateAsync("Failed: " + ex.Message);
 				lock (_operationSync) _scanRunActive = false;
 				SetError(ex);
+				return ex.Message;
 			}
 			finally {
+				IDisposable? deferred;
 				lock (_operationSync) {
 					_scanStarting = false;
+					deferred = _deferredRunLease;
+					_deferredRunLease = null;
 					if (_disposed) _cts.Dispose();
 				}
+				deferred?.Dispose();
 				Notify();
 			}
+			return State == ScanState.Error ? ErrorMessage : null;
 		}
 
 		static async Task DownloadRequiredAiComponentsAsync(Settings settings, CancellationToken ct) {
@@ -197,7 +202,21 @@ namespace VDF.Web.Services {
 			_engine.Stop();
 		}
 
-		public bool SaveSettings() => _settingsService.Save(_engine.Settings);
+		public bool SaveSettings() {
+			lock (_operationSync) {
+				if (_disposed || WorkActiveLocked) return false;
+				return _settingsService.Save(Settings);
+			}
+		}
+		public bool ReloadSettings() {
+			lock (_operationSync) {
+				if (_disposed || WorkActiveLocked) return false;
+				var loaded = new Settings();
+				if (!_settingsService.Load(loaded)) return false;
+				_configuredSettings = loaded;
+				return true;
+			}
+		}
 
 		public void Reset() {
 			lock (_operationSync) {
@@ -211,7 +230,7 @@ namespace VDF.Web.Services {
 				ClearThumbnailCaches();
 			}
 			// Keep the configured scan paths when resetting results.
-			Notify();
+			NotifyAutomationChanged();
 		}
 
 		/// <summary>Removes items from the results list without touching the files on disk.</summary>
@@ -224,7 +243,7 @@ namespace VDF.Web.Services {
 				}
 				DropSingletonGroups();
 			}
-			Notify();
+			NotifyAutomationChanged();
 		}
 
 		/// <summary>Drops groups that have shrunk to a single item — a group of one is not a duplicate.</summary>
@@ -271,7 +290,7 @@ namespace VDF.Web.Services {
 				FileOpRunning = false;
 				FileOpVerb = string.Empty;
 			}
-			Notify();
+			NotifyAutomationChanged();
 		}
 
 		bool TryBeginDataWork() {
@@ -283,9 +302,9 @@ namespace VDF.Web.Services {
 			return true;
 		}
 
-		void EndDataWork() {
+		void EndDataWork(bool automationChanged = true) {
 			lock (_operationSync) _dataWorkActive = false;
-			Notify();
+			if (automationChanged) NotifyAutomationChanged(); else Notify();
 		}
 
 		/// <summary>Deletes files from disk and removes them from results and the scan database.</summary>
@@ -303,7 +322,7 @@ namespace VDF.Web.Services {
 						throw new IOException("These results have no verified file snapshots. Rescan before moving files.");
 					if (!PathComparer.ForCurrentPlatform.Equals(Path.GetFullPath(DatabaseUtils.GetDatabaseFolderPath()),
 						Path.GetFullPath(_resultStateFolder)) && !await LoadDatabaseWithResultsAuthorityAsync(_resultStateFolder)) {
-						ClearCleanupSnapshots();
+						RevokeResultsDatabaseAuthority();
 						throw new IOException("The results database could not be loaded; files were retained.");
 					}
 					var sw = System.Diagnostics.Stopwatch.StartNew();
@@ -361,7 +380,7 @@ namespace VDF.Web.Services {
 				result.Failed = list.Count - result.Done;
 				result.Errors.Add($"Move could not complete; remaining files were retained: {ex.Message}");
 			}
-			finally { EndFileOp(); }
+			finally { await PersistFileOperationResultsAsync(result); EndFileOp(); }
 			return result;
 		}
 
@@ -395,9 +414,22 @@ namespace VDF.Web.Services {
 				if (!await LoadDatabaseWithResultsAuthorityAsync(Settings.CustomDatabaseFolder)) {
 					throw new IOException("The configured database could not be loaded; it was not cleared.");
 				}
+				string folder = DatabaseUtils.GetDatabaseFolderPath();
+				// Commit the matching empty result generation before clearing the
+				// database; a restart must not revive this folder's old rows.
+				if (File.Exists(AutomationStore.Path) || HasSavedResultsJournal(folder))
+					await SaveResultsAsync(folder, new());
+				// Visible rows can still belong to a previously selected database.
+				// Invalidate their saved generation before forgetting its authority.
+				if (_resultOriginFolder is { } producing && !PathComparer.ForCurrentPlatform.Equals(
+					NormalizeDatabaseFolder(producing), NormalizeDatabaseFolder(folder)))
+					await SaveResultsAsync(producing, new());
+				ResultsPersistenceWarning = null;
 				ScanEngine.ClearDatabase();
 				_engine.Duplicates.Clear();
 				ClearCleanupSnapshots();
+				ClearSelectionPlan();
+				_quarantinePreview = null;
 			}
 			finally { EndDataWork(); }
 		}
@@ -412,7 +444,10 @@ namespace VDF.Web.Services {
 		public async Task<string> TestFilePairAsync(string fileA, string fileB) {
 			if (!TryBeginDataWork())
 				return "A scan or another operation is running. Wait for it to finish before running the file pair test.";
-			try { return await _engine.TestFilePairAsync(fileA, fileB); }
+			try {
+				_engine.Settings = SnapshotConfiguredSettings();
+				return await _engine.TestFilePairAsync(fileA, fileB);
+			}
 			finally { EndDataWork(); }
 		}
 

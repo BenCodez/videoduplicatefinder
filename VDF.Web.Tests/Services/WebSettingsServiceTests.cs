@@ -33,6 +33,38 @@ public sealed class WebSettingsServiceTests : IDisposable {
 	public void Dispose() {
 		WebSettingsService.TestOverrideSettingsPath = null;
 		try { File.Delete(settingsPath); } catch { }
+		try { File.Delete(settingsPath + ".bak"); File.Delete(settingsPath + ".lock"); } catch { }
+	}
+
+	[Fact]
+	public void StaleSettingsSavePreservesNewerWriterUntilExplicitReload() {
+		var first = new WebSettingsService();
+		Assert.True(first.Save(new Settings { Percent = 90 }));
+		var second = new WebSettingsService();
+		var current = new Settings();
+		Assert.True(second.Load(current));
+		current.Percent = 99;
+		Assert.True(second.Save(current));
+		Assert.False(first.Save(new Settings { Percent = 80 }));
+		var reloaded = new Settings();
+		Assert.True(first.Load(reloaded));
+		Assert.Equal(99, reloaded.Percent);
+		reloaded.Percent = 95;
+		Assert.True(first.Save(reloaded));
+	}
+
+	[Fact]
+	public void MissingOrMalformedEstablishedSettingsCannotBeRecreatedBySave() {
+		var service = new WebSettingsService();
+		Assert.True(service.Save(new Settings()));
+		File.Delete(settingsPath);
+		Assert.False(service.Save(new Settings()));
+		var fresh = new WebSettingsService();
+		Assert.False(fresh.Save(new Settings()));
+		File.WriteAllText(settingsPath, "{broken");
+		Assert.False(fresh.Load(new Settings()));
+		Assert.False(fresh.Save(new Settings()));
+		Assert.Equal("{broken", File.ReadAllText(settingsPath));
 	}
 
 	[Fact]

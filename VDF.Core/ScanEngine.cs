@@ -387,7 +387,7 @@ namespace VDF.Core {
 				}
 				else {
 					isScanning = false;
-					ScanAborted?.Invoke(this, new EventArgs());
+					ScanAborted?.Invoke(this, new ScanAbortedEventArgs());
 					Logger.Instance.Info(T("Log.ScanAborted"));
 				}
 			}
@@ -463,7 +463,7 @@ namespace VDF.Core {
 			SearchTimer.Stop();
 			ElapsedTimer.Stop();
 			isScanning = false;
-			ScanAborted?.Invoke(this, new EventArgs());
+			ScanAborted?.Invoke(this, new ScanAbortedEventArgs(ex is OperationCanceledException ? null : ex));
 		}
 
 		void PrepareSearch() {
@@ -3128,7 +3128,7 @@ namespace VDF.Core {
 			if (!isScanning) {
 				// No worker is alive to acknowledge Stop. Active workers signal their own
 				// completion after cancellation; emitting early permits an overlapping scan.
-				ScanAborted?.Invoke(this, EventArgs.Empty);
+				ScanAborted?.Invoke(this, new ScanAbortedEventArgs());
 				return;
 			}
 			cancelationTokenSource.Cancel();

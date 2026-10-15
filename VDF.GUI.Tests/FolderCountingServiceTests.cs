@@ -104,14 +104,23 @@ namespace VDF.GUI.Tests {
 
 			var service = new FolderCountingService(TimeSpan.Zero);
 			var progressed = new TaskCompletionSource();
+			using var continueAfterCancel = new System.Threading.ManualResetEventSlim();
 			bool completed = false;
 			service.StartCounting(root, p => {
 				if (p.Completed) completed = true;
-				else progressed.TrySetResult();
+				else {
+					progressed.TrySetResult();
+					continueAfterCancel.Wait(TimeSpan.FromSeconds(15));
+				}
 			});
-			var progressedOrTimedOut = await Task.WhenAny(progressed.Task, Task.Delay(TimeSpan.FromSeconds(15)));
-			Assert.True(progressedOrTimedOut == progressed.Task, "no progress before cancel");
-			service.Cancel(root);
+			try {
+				var progressedOrTimedOut = await Task.WhenAny(progressed.Task, Task.Delay(TimeSpan.FromSeconds(15)));
+				Assert.True(progressedOrTimedOut == progressed.Task, "no progress before cancel");
+				// Hold progress until cancellation is requested, rather than
+				// racing a short walk that can legitimately finish first.
+				service.Cancel(root);
+			}
+			finally { continueAfterCancel.Set(); }
 
 			// Give the walk time to notice the cancellation and unwind.
 			var sw = System.Diagnostics.Stopwatch.StartNew();

@@ -1,0 +1,4 @@
+# Build inputs are source, never host-generated assets or private Git metadata.
+**/bin
+**/obj
+.git
