@@ -80,11 +80,19 @@ public partial class Automation {
         _notice = "Selection preview prepared. No files were removed.";
     });
 
-    Task CheckScheduleAsync() => RunAsync(async () => {
-        await Scan.CheckScheduleAsync(DateTimeOffset.UtcNow);
-        await RefreshDataAsync();
-        _notice = "Saved schedule checked.";
-    });
+    async Task CheckScheduleAsync() {
+        await RunAsync(async () => {
+            await Scan.CheckScheduleAsync(DateTimeOffset.UtcNow);
+            // A due check returns once scanning starts. Its completion notification
+            // will refresh the view after the scan releases its data reservation.
+            if (!Scan.IsBusy) await RefreshDataAsync();
+            _notice = "Saved schedule checked.";
+        });
+        // A fast scan can finish while RunAsync still suppresses refresh events.
+        // Recheck after releasing that flag so its final view is not missed.
+        if (!_disposed && !Scan.IsBusy && _refreshedGeneration != Scan.AutomationGeneration)
+            await RefreshFromStateAsync(true);
+    }
 
     Task RefreshAsync() => RunAsync(async () => {
         await RefreshDataAsync();

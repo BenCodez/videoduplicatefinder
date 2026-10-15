@@ -5,6 +5,8 @@ using Microsoft.Extensions.DependencyInjection;
 using Microsoft.AspNetCore.Components.Web;
 using VDF.Core;
 using VDF.Core.Selection;
+using VDF.Core.Scheduling;
+using VDF.Core.Utils;
 using VDF.Core.ViewModels;
 using VDF.Web.Components.Pages;
 using VDF.Web.Services;
@@ -104,6 +106,64 @@ public sealed class AutomationPageTests : BunitContext {
         Assert.Equal(new[] { "av1", "hevc" }, saved.Selection.PreferredCodecs);
         Assert.Empty(Assert.Single(saved.Profiles).Options.PreferredCodecs);
         Assert.Equal("Archive", saved.Profiles[0].Name);
+    }
+
+    [Theory]
+    [InlineData(false, false, false)]
+    [InlineData(true, false, false)]
+    [InlineData(true, true, false)]
+    [InlineData(true, false, true)]
+    public async Task ManualScheduleCheckRefreshesAfterScanWithoutReportingBusyAsFailure(bool due, bool aborted, bool finishDuringStart) {
+        await ScanEngine.LoadDatabase(folder);
+        DatabaseUtils.Database.Clear();
+        scan.Settings.IncludeList.Add(folder);
+        Assert.True(scan.SaveSettings());
+        var config = await scan.LoadAutomationAsync();
+        config.Schedule = new() { Enabled = due, Kind = ScanScheduleKind.Interval, IntervalMinutes = 5 };
+        await scan.SaveAutomationAsync(config);
+        scan.PrepareScanAsync = (_, _) => Task.CompletedTask;
+        int started = 0;
+        Task? completion = null;
+        void PrepareResults() {
+            var group = Guid.NewGuid();
+            Seed("scheduled-a.mp4", group);
+            Seed("scheduled-b.mp4", group);
+            foreach (var item in scan.Duplicates) DatabaseUtils.Database.Add(new FileEntry(item.Path));
+            ScanEngine.SaveDatabase();
+        }
+        scan.StartSearchOverride = () => {
+            started++;
+            if (finishDuringStart) {
+                PrepareResults();
+                completion = scan.CompleteWebScanAsync(false);
+            }
+        };
+        var page = await RenderPageAsync();
+        try {
+            await ClickAsync(page, "Check saved schedule now");
+            Assert.Equal(due ? 1 : 0, started);
+            if (!finishDuringStart) Assert.Equal(due, scan.IsBusy);
+            Assert.Empty(page.FindAll("[role='alert']"));
+            Assert.Contains("Saved schedule checked.", page.Markup);
+            if (!finishDuringStart) Assert.Equal(due, Button(page, "Check saved schedule now").HasAttribute("disabled"));
+            if (due) {
+                if (finishDuringStart) await completion!;
+                else {
+                    if (!aborted) PrepareResults();
+                    await scan.CompleteWebScanAsync(aborted);
+                }
+                await page.WaitForAssertionAsync(() => {
+                    Assert.False(Button(page, "Check saved schedule now").HasAttribute("disabled"));
+                    Assert.Contains(aborted ? "Aborted" : "Completed", page.Markup);
+                    if (!aborted) Assert.Contains("scheduled-a.mp4", page.Markup);
+                    Assert.Empty(page.FindAll("[role='alert']"));
+                }, JournalIoTimeout);
+            }
+        }
+        finally {
+            if (completion is not null) await completion;
+            if (scan.IsBusy) await scan.CompleteWebScanAsync(true);
+        }
     }
 
     [Fact]
