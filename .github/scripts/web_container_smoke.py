@@ -124,6 +124,11 @@ def run(image, arch, revision=None, source_url=None):
         assert labels["org.opencontainers.image.source"] == source_url, "Image source URL does not match checkout"
     expected_uname = {"amd64": "x86_64", "arm64": "aarch64"}[arch]
     assert docker("run", "--rm", "--entrypoint", "uname", image, "-m") == expected_uname
+    manifest = json.loads(docker("run", "--rm", "--entrypoint", "cat", image,
+                                 "/app/VDF.Web.staticwebassets.endpoints.json"))
+    routes = sorted({row["Route"] for row in manifest["Endpoints"] if "blazor" in row["Route"]})
+    files = docker("run", "--rm", "--entrypoint", "ls", image, "/app/wwwroot/_framework", check=False)
+    print(json.dumps({"packaged_framework_routes": routes, "packaged_framework_files": files.splitlines()}), flush=True)
     container = "vdf-web-smoke-" + uuid.uuid4().hex
     with tempfile.TemporaryDirectory(prefix="vdf-web-smoke-") as temporary:
         root = Path(temporary)
