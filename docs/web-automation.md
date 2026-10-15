@@ -93,6 +93,9 @@ If another process holds the run lease before publishing its claim, a schedule
 check skips without reporting a scan failure. Unclaimed startup work remains
 eligible after the lease is released; unsafe lock paths and journal errors still
 require repair.
+Manual scans use the same lifetime lease, even without automation settings, and
+report a busy database folder rather than overlapping another scan. Completion
+or cancellation during preparation retains the lease until startup unwinds.
 Saved results record whether the scan completed, including scans with no
 duplicates. A reset or an interrupted replacement scan restores the Scan page
 as idle. Older empty snapshots without completion metadata also restore as idle;

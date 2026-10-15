@@ -162,10 +162,14 @@ namespace VDF.Web.Services {
 				return ex.Message;
 			}
 			finally {
+				IDisposable? deferred;
 				lock (_operationSync) {
 					_scanStarting = false;
+					deferred = _deferredRunLease;
+					_deferredRunLease = null;
 					if (_disposed) _cts.Dispose();
 				}
+				deferred?.Dispose();
 				Notify();
 			}
 			return State == ScanState.Error ? ErrorMessage : null;

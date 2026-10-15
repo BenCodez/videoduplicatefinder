@@ -11,7 +11,8 @@ namespace VDF.Web.Services;
 public sealed partial class ScanService {
     bool _terminalProcessing;
     DateTimeOffset? _scheduledRunStarted;
-    IDisposable? _scheduledRunLease;
+    IDisposable? _scanRunLease;
+    IDisposable? _deferredRunLease;
     readonly SemaphoreSlim _scheduledFinishGate = new(1, 1);
     internal const string ScheduledRunLeaseFileName = "WebSchedule.run";
     internal Action? ScheduledRunClaimed { get; set; }
@@ -41,23 +42,24 @@ public sealed partial class ScanService {
         _scheduledStateFolder = null;
         _scheduledRunStarted = null;
         _engine.Settings = scheduled ? ReadScheduledSettings() : SnapshotConfiguredSettings();
-        if (File.Exists(AutomationStore.Path) || File.Exists(AutomationStore.Path + ".bak") || scheduled) {
-            string folder = ConfiguredStateFolder(_engine.Settings);
-            _runAutomation = await LoadAutomationCoreAsync(folder);
-            _cts.Token.ThrowIfCancellationRequested();
-            if (scheduled) {
-                IDisposable? runLease = null;
-                try {
-                    // Take the lifetime lease before the durable claim. A restart
-                    // can then distinguish an abandoned claim from a live process.
+        string folder = ConfiguredStateFolder(_engine.Settings);
+        IDisposable? runLease = null;
+        try {
+            // Manual and scheduled scans write the same database and result
+            // journals, including when optional automation settings are absent.
+            try { runLease = JournalWriteLease.Acquire(Path.Combine(folder, ScheduledRunLeaseFileName)); }
+            catch (IOException ex) when ((ex.HResult & 0xffff) is 11 or 32 or 33) {
+                if (!scheduled) throw new IOException("Another scan is running for this database folder. Wait for it to finish.", ex);
+                // Another process can own the run before its claim is visible.
+                // Leave unclaimed startup work eligible to retry.
+                ScheduleState = await ReadScheduleStateAsync(Path.Combine(folder, "WebSchedule.json"));
+                return false;
+            }
+            if (File.Exists(AutomationStore.Path) || File.Exists(AutomationStore.Path + ".bak") || scheduled) {
+                _runAutomation = await LoadAutomationCoreAsync(folder);
+                _cts.Token.ThrowIfCancellationRequested();
+                if (scheduled) {
                     string path = Path.Combine(folder, "WebSchedule.json");
-                    try { runLease = JournalWriteLease.Acquire(Path.Combine(folder, ScheduledRunLeaseFileName)); }
-                    catch (IOException ex) when ((ex.HResult & 0xffff) is 11 or 32 or 33) {
-                        // Another process can own the run before its claim is
-                        // visible. Leave unclaimed startup work eligible to retry.
-                        ScheduleState = await ReadScheduleStateAsync(path);
-                        return false;
-                    }
                     WebScheduleState state;
                     using (JournalWriteLease.Acquire(path)) {
                         state = await ReadScheduleStateAsync(path);
@@ -76,22 +78,25 @@ public sealed partial class ScanService {
                         await DurableJsonFile.WriteAsync(path, state, WebAutomationJsonContext.Default.WebScheduleState, ValidateScheduleState);
                         _startupChecked = true;
                     }
-                    // Once ownership is visible, a terminal callback can write
-                    // immediately; startup must no longer own the journal writer.
+                    // Publish ownership only after the mirrored claim commits.
                     lock (_operationSync) {
                         _scheduledStateFolder = folder;
                         _scheduledRunStarted = now;
-                        _scheduledRunLease = runLease;
+                        _scanRunLease = runLease;
                         runLease = null;
                         ScheduleState = state;
                     }
                     ScheduledRunClaimed?.Invoke();
                 }
-                finally { runLease?.Dispose(); }
+                await new CleanupProtectionGuard(folder).RecoverAsync();
             }
-            await new CleanupProtectionGuard(folder).RecoverAsync();
+            _cts.Token.ThrowIfCancellationRequested();
+            if (!scheduled) {
+                lock (_operationSync) { _scanRunLease = runLease; runLease = null; }
+            }
+            return true;
         }
-        return true;
+        finally { runLease?.Dispose(); }
     }
 
     internal async Task CompleteWebScanAsync(bool aborted, Exception? failure = null) {
@@ -180,10 +185,10 @@ public sealed partial class ScanService {
             // must not clear ownership transferred while its callback unwinds.
             folder = _scheduledStateFolder;
             started = _scheduledRunStarted;
-            runLease = _scheduledRunLease;
+            runLease = _scanRunLease;
             _scheduledStateFolder = null;
             _scheduledRunStarted = null;
-            _scheduledRunLease = null;
+            _scanRunLease = null;
         }
         try {
             if (folder is null || started is null) return;
@@ -201,6 +206,11 @@ public sealed partial class ScanService {
         }
         catch (Exception ex) { AutomationStatus = "Schedule completion could not be saved: " + ex.Message; }
         finally {
+            // A terminal callback can run while startup is still awaiting
+            // preparation. Keep its lease until that work has unwound too.
+            if (runLease is not null) lock (_operationSync) {
+                if (_scanStarting) { _deferredRunLease = runLease; runLease = null; }
+            }
             try { runLease?.Dispose(); }
             finally { _scheduledFinishGate.Release(); }
         }

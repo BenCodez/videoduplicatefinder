@@ -267,6 +267,122 @@ public sealed class WebScheduleRecoveryTests : IAsyncLifetime {
     }
 
     [Theory]
+    [InlineData(false, false, false)]
+    [InlineData(false, false, true)]
+    [InlineData(true, false, false)]
+    [InlineData(true, false, true)]
+    [InlineData(false, true, false)]
+    [InlineData(true, true, false)]
+    public async Task SharedScanLeaseSerializesManualAndScheduledOwners(bool ownerScheduled, bool contenderScheduled, bool missingConfig) {
+        using var contender = NewService(); contender.PrepareScanAsync = (_, _) => Task.CompletedTask;
+        int ownerStarts = 0, contenderStarts = 0;
+        scan.StartSearchOverride = () => ownerStarts++;
+        contender.StartSearchOverride = () => contenderStarts++;
+        if (missingConfig && !ownerScheduled) { File.Delete(Path.Combine(folder, "web-settings.automation.json")); File.Delete(Path.Combine(folder, "web-settings.automation.json.bak")); }
+        try {
+            if (ownerScheduled) await scan.CheckScheduleAsync(Started); else await scan.StartScanAndCompare();
+            Assert.True(scan.IsBusy); Assert.Equal(1, ownerStarts);
+            Assert.Throws<IOException>(() => JournalWriteLease.Acquire(RunLeasePath));
+            if (missingConfig) { File.Delete(Path.Combine(folder, "web-settings.automation.json")); File.Delete(Path.Combine(folder, "web-settings.automation.json.bak")); }
+            byte[]? before = File.Exists(JournalPath) ? File.ReadAllBytes(JournalPath) : null;
+            if (contenderScheduled) {
+                Assert.Null(await contender.CheckScheduleAsync(Started.AddMinutes(6)));
+                Assert.Equal(ScanState.Idle, contender.State); Assert.Null(contender.ErrorMessage);
+            }
+            else {
+                await contender.StartScanAndCompare();
+                Assert.Equal(ScanState.Error, contender.State); Assert.Contains("Another scan", contender.ErrorMessage);
+            }
+            Assert.False(contender.IsBusy); Assert.Equal(0, contenderStarts);
+            Assert.Equal(before, File.Exists(JournalPath) ? File.ReadAllBytes(JournalPath) : null);
+            Assert.Throws<IOException>(() => JournalWriteLease.Acquire(RunLeasePath));
+            await scan.CompleteWebScanAsync(false);
+            if (contenderScheduled) await contender.CheckScheduleAsync(Started.AddMinutes(6)); else await contender.StartScanAndCompare();
+            Assert.True(contender.IsBusy); Assert.Equal(1, contenderStarts);
+            Assert.Throws<IOException>(() => JournalWriteLease.Acquire(RunLeasePath));
+            await contender.CompleteWebScanAsync(false);
+            using var released = JournalWriteLease.Acquire(RunLeasePath);
+        }
+        finally {
+            if (scan.IsBusy) await scan.CompleteWebScanAsync(true);
+            if (contender.IsBusy) await contender.CompleteWebScanAsync(true);
+        }
+    }
+
+    public static IEnumerable<object[]> ManualLeaseOutcomes() {
+        foreach (string outcome in new[] { "complete", "abort", "prepare", "engine", "early", "stop", "dispose" })
+            foreach (bool missing in new[] { false, true }) yield return [outcome, missing];
+    }
+    [Theory]
+    [MemberData(nameof(ManualLeaseOutcomes))]
+    public async Task SharedScanLeaseManualRunOwnsLifetimeAndReleasesAfterEveryTerminalPath(string outcome, bool missingConfig) {
+        if (missingConfig) { File.Delete(Path.Combine(folder, "web-settings.automation.json")); File.Delete(Path.Combine(folder, "web-settings.automation.json.bak")); }
+        Task? completion = null;
+        bool prepareHeld = false, engineHeld = false;
+        bool IsHeld() {
+            try { using var probe = JournalWriteLease.Acquire(RunLeasePath); return false; }
+            catch (IOException) { return true; }
+        }
+        scan.PrepareScanAsync = (_, token) => {
+            prepareHeld = IsHeld();
+            if (outcome == "prepare") throw new IOException("Synthetic manual preparation failure");
+            if (outcome is "stop" or "dispose") {
+                if (outcome == "stop") scan.Stop(); else scan.Dispose();
+                return Task.FromCanceled(token);
+            }
+            return Task.CompletedTask;
+        };
+        scan.StartSearchOverride = () => {
+            engineHeld = IsHeld();
+            if (outcome == "engine") throw new IOException("Synthetic manual engine startup failure");
+            if (outcome == "early") completion = scan.CompleteWebScanAsync(false);
+        };
+        await scan.StartScanAndCompare();
+        if (completion is not null) await completion;
+        if (scan.IsBusy) {
+            Assert.Throws<IOException>(() => JournalWriteLease.Acquire(RunLeasePath));
+            await scan.CompleteWebScanAsync(outcome == "abort");
+        }
+        Assert.Equal(outcome is "prepare" or "engine" ? ScanState.Error : outcome is "abort" or "stop" or "dispose" ? ScanState.Aborted : ScanState.Done, scan.State);
+        Assert.True(prepareHeld);
+        if (outcome is not ("prepare" or "stop" or "dispose")) Assert.True(engineHeld);
+        Assert.False(scan.IsBusy); Assert.False(File.Exists(JournalPath));
+        using var released = JournalWriteLease.Acquire(RunLeasePath);
+    }
+
+    [Theory]
+    [InlineData(false, false)]
+    [InlineData(true, false)]
+    [InlineData(false, true)]
+    [InlineData(true, true)]
+    public async Task SharedScanLeaseTerminalCompletionDuringPreparationRetainsOwnershipUntilStartupUnwinds(bool scheduled, bool dispose) {
+        scan.PrepareScanAsync = async (_, token) => {
+            if (dispose) scan.Dispose(); else scan.Stop();
+            await scan.CompletionTask;
+            Assert.True(scan.IsBusy);
+            Assert.Throws<IOException>(() => JournalWriteLease.Acquire(RunLeasePath));
+            token.ThrowIfCancellationRequested();
+        };
+        if (scheduled) await scan.CheckScheduleAsync(Started); else await scan.StartScanAndCompare();
+        Assert.False(scan.IsBusy); Assert.Equal(ScanState.Aborted, scan.State);
+        using var released = JournalWriteLease.Acquire(RunLeasePath);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task SharedScanLeaseConfigurationFailureReleasesOwnershipAndPreservesJournals(bool future) {
+        string path = Path.Combine(folder, "web-settings.automation.json");
+        if (future) { var node = System.Text.Json.Nodes.JsonNode.Parse(File.ReadAllText(path))!; node["version"] = 2; File.WriteAllText(path, node.ToJsonString()); }
+        else File.WriteAllText(path, "{");
+        byte[] before = File.ReadAllBytes(path);
+        scan.StartSearchOverride = () => throw new InvalidOperationException("Invalid settings must not start a scan");
+        await scan.StartScanAndCompare();
+        Assert.Equal(ScanState.Error, scan.State); Assert.False(scan.IsBusy); Assert.False(File.Exists(JournalPath));
+        Assert.Equal(before, File.ReadAllBytes(path)); using var released = JournalWriteLease.Acquire(RunLeasePath);
+    }
+
+    [Theory]
     [InlineData(false, false)]
     [InlineData(true, false)]
     [InlineData(false, true)]

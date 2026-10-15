@@ -33,16 +33,19 @@ public sealed class AutomationIntegrationTests : IDisposable {
 		using var settingsWrites = HeadlessUi.IsolateSettingsWrites(Path.Combine(folder, "Settings.json"));
 		var settings = SettingsFile.Instance;
 		string database = settings.CustomDatabaseFolder;
+		string quarantine = settings.QuarantineFolder;
 		var selection = settings.AutomationSelection;
 		var nfo = settings.NfoFavourites;
 		try {
 			settings.CustomDatabaseFolder = folder;
+			settings.QuarantineFolder = Path.Combine(folder, "quarantine");
 			settings.AutomationSelection = new() { AutoAfterScan = true, Profile = SelectionProfile.NewestFirst };
 			settings.NfoFavourites = new();
 			await work();
 		}
 		finally {
 			settings.CustomDatabaseFolder = database; settings.AutomationSelection = selection; settings.NfoFavourites = nfo;
+			settings.QuarantineFolder = quarantine;
 		}
 	}
 
@@ -335,6 +338,8 @@ public sealed class AutomationIntegrationTests : IDisposable {
 		File.WriteAllBytes(Path.Combine(folder, "target.mp4"), [9, 9, 9, 9]);
 		var target = Add(vm, group, "target.mp4", 2020); var keeper = Add(vm, group, "keeper.mp4", 2025);
 		target.Checked = true;
+		// Finish the fixture's checkbox save before exercising quarantine journal leases.
+		await vm.PrepareAutomationRescanAsync();
 		var preview = await vm.CreateQuarantinePreviewAsync();
 		var entry = Assert.Single(preview.Items);
 		Assert.True(entry.CanQuarantine); Assert.False(entry.ByteIdentical);
@@ -352,10 +357,12 @@ public sealed class AutomationIntegrationTests : IDisposable {
 		var vm = new MainWindowVM(); var group = Guid.NewGuid();
 		var target = Add(vm, group, "recover-target.mp4", 2020); var keeper = Add(vm, group, "recover-keeper.mp4", 2025);
 		target.Checked = true;
+		// Finish the fixture's checkbox save before exercising quarantine journal leases.
+		await vm.PrepareAutomationRescanAsync();
 		var preview = await vm.CreateQuarantinePreviewAsync();
 		Assert.True(Assert.Single(preview.Items).CanQuarantine);
 		await preview.ExecuteCommand.Execute();
-		Assert.False(File.Exists(target.ItemInfo.Path)); Assert.True(File.Exists(keeper.ItemInfo.Path));
+		Assert.False(File.Exists(target.ItemInfo.Path), preview.Status); Assert.True(File.Exists(keeper.ItemInfo.Path));
 		Assert.DoesNotContain(target, vm.Duplicates);
 		var service = new QuarantineService(vm.QuarantineHistoryFile);
 		var record = Assert.Single(await service.HistoryAsync());
