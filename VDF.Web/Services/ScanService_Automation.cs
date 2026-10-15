@@ -218,7 +218,7 @@ public sealed partial class ScanService {
         var plan = SelectionPlanner.BuildPlan(candidates, options);
         // Persist explanations separately. Automatic previews never upsert manual
         // reviews: a concurrent Keep/Protect cannot be lost to an autosave.
-        await SaveSelectionPlanForSessionAsync(folder, plan);
+        await SaveSelectionPlanForSessionAsync(folder, plan, profile);
         AutomationStatus = $"{plan.Decisions.Count(d => d.RemoveCandidate)} removal candidates. Review before explicit cleanup.";
         return plan;
     }
@@ -226,28 +226,29 @@ public sealed partial class ScanService {
     // unsupported schemas, leases and IO errors must still fail visibly.
     static bool IsJournalSizeLimit(InvalidDataException ex) =>
         ex.Message == "The journal exceeds the supported size limit.";
-    internal async Task SaveSelectionPlanForSessionAsync(string folder, SelectionPlan plan) {
+    internal async Task SaveSelectionPlanForSessionAsync(string folder, SelectionPlan plan, SelectionProfile? profileOverride = null) {
         string path = Path.Combine(folder, "SelectionPlan.json");
         using var lease = JournalWriteLease.Acquire(path);
         await RequireSupportedJournalCopiesAsync(path, "selection preview");
         try {
-            await SaveWebSelectionPlanAsync(path, plan);
+            await SaveWebSelectionPlanAsync(path, plan, profileOverride);
             SelectionPersistenceWarning = null;
         }
         catch (InvalidDataException ex) when (IsJournalSizeLimit(ex)) {
             // Replace both saved copies: an older explanation must not reappear
             // after restart when this session's preview cannot be persisted.
-            await SaveWebSelectionPlanAsync(path, new SelectionPlan());
+            await SaveWebSelectionPlanAsync(path, new SelectionPlan(), profileOverride);
             SelectionPersistenceWarning = "This selection preview exceeds the 32 MiB save limit. It is available only until the service restarts; prepare the preview again after restarting.";
         }
         LastSelectionPlan = plan;
     }
-    Task SaveWebSelectionPlanAsync(string path, SelectionPlan plan) => DurableJsonFile.WriteAsync(path,
-        new WebSelectionPlanEnvelope { Plan = plan, ResultGeneration = _resultsGeneration },
+    Task SaveWebSelectionPlanAsync(string path, SelectionPlan plan, SelectionProfile? profileOverride) => DurableJsonFile.WriteAsync(path,
+        new WebSelectionPlanEnvelope { Plan = plan, ResultGeneration = _resultsGeneration, ProfileOverride = profileOverride },
         WebAutomationJsonContext.Default.WebSelectionPlanEnvelope, ValidateSelectionPlan);
     static bool ValidateSelectionPlan(WebSelectionPlanEnvelope value) {
         RequireJournalVersion(value.Version, "selection preview");
-        return ValidGeneration(value.ResultGeneration) && value.Plan is { Decisions: not null } &&
+        return ValidGeneration(value.ResultGeneration) && (value.ProfileOverride is null || Enum.IsDefined(value.ProfileOverride.Value)) &&
+            value.Plan is { Decisions: not null } &&
             value.Plan.Decisions.All(d => d is not null && d.Path is not null && d.Reason is not null);
     }
     static bool ValidGeneration(string? value) => value is null || Guid.TryParseExact(value, "N", out _);
@@ -492,10 +493,9 @@ public sealed partial class ScanService {
                     WebAutomationJsonContext.Default.WebSelectionPlanEnvelope, ValidateSelectionPlan);
                 if (saved.Rows.Count > 0 && preview is { Plan.Decisions.Count: > 0 } &&
                     preview.ResultGeneration == saved.Generation) {
-                    // An explanation saved before a later manual review is not
-                    // current permission or a current checkbox selection.
-                    config.Selection.HighlightedGroupsOnly = false;
-                    await PreviewSelectionCoreAsync(config);
+                    // Recompute current protections within the saved review scope.
+                    // Automatic post-scan plans already include every result group.
+                    await PreviewSelectionCoreAsync(config, preview.ProfileOverride, preview.Plan.Decisions.Select(d => d.GroupId));
                 }
             }
         }

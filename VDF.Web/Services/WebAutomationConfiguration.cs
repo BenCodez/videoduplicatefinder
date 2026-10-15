@@ -65,6 +65,7 @@ internal sealed class WebSelectionPlanEnvelope {
     [JsonRequired] public int Version { get; set; } = 1;
     [JsonRequired] public SelectionPlan Plan { get; set; } = new();
     public string? ResultGeneration { get; set; }
+    public SelectionProfile? ProfileOverride { get; set; }
 }
 internal sealed class WebSavedResult {
     [JsonRequired] public DuplicateItem Item { get; set; } = new();

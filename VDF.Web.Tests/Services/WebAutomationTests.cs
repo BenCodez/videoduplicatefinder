@@ -1200,6 +1200,125 @@ public sealed class WebAutomationTests : IAsyncLifetime {
         Assert.All(restarted.Duplicates, item => Assert.True(File.Exists(item.Path)));
     }
 
+    [Theory]
+    [InlineData("group", false, false)]
+    [InlineData("group", false, true)]
+    [InlineData("group", true, false)]
+    [InlineData("group", true, true)]
+    [InlineData("highlighted", false, false)]
+    [InlineData("highlighted", false, true)]
+    [InlineData("highlighted", true, false)]
+    [InlineData("highlighted", true, true)]
+    [InlineData("all", false, false)]
+    [InlineData("all", false, true)]
+    [InlineData("all", true, false)]
+    [InlineData("all", true, true)]
+    [InlineData("automatic", false, false)]
+    [InlineData("automatic", false, true)]
+    [InlineData("automatic", true, false)]
+    [InlineData("automatic", true, true)]
+    [InlineData("automatic-highlighted", false, false)]
+    [InlineData("automatic-highlighted", false, true)]
+    [InlineData("automatic-highlighted", true, false)]
+    [InlineData("automatic-highlighted", true, true)]
+    public async Task RestoredPreviewPreservesReviewedGroupsAndRecomputesCurrentProtection(string mode, bool legacy, bool missingPrimary) {
+        Guid otherGroup = Guid.NewGuid();
+        var config = await scan.LoadAutomationAsync();
+        config.Selection.HighlightedGroupsOnly = mode is "highlighted" or "automatic-highlighted";
+        config.Selection.AutoAfterScan = mode.StartsWith("automatic", StringComparison.Ordinal);
+        await scan.SaveAutomationAsync(config);
+        scan.PrepareScanAsync = (_, _) => Task.CompletedTask;
+        scan.StartSearchOverride = () => {
+            Seed("scoped-a.mp4"); Seed("scoped-b.mp4");
+            Seed("outside-a.mp4").GroupId = otherGroup; Seed("outside-b.mp4").GroupId = otherGroup;
+            ScanEngine.SaveDatabase();
+        };
+        await scan.StartScanAndCompare(); await scan.CompleteWebScanAsync(false);
+        SelectionPlan plan = mode switch {
+            "group" => (await scan.PreviewResultsSelectionAsync(null, [group], [])).Plan,
+            "highlighted" => (await scan.PreviewResultsSelectionAsync(null, null, [group])).Plan,
+            "all" => await scan.PreviewSelectionAsync(),
+            _ => scan.LastSelectionPlan!
+        };
+        bool scoped = mode is "group" or "highlighted";
+        Assert.Equal(scoped ? 2 : 4, plan.Decisions.Count);
+        string target = Assert.Single(plan.Decisions, d => d.GroupId == group && d.RemoveCandidate).Path;
+        await (await Reviews()).UpdateAsync(records => [new ReviewRecord { Identity = FileIdentity.Capture(target)!,
+            Choice = ReviewChoice.Keep, ManuallyProtected = true, Reason = "Later deliberate protection" }]);
+        string results = Path.Combine(folder, "WebResults.json"), path = Path.Combine(folder, "SelectionPlan.json");
+        if (legacy) foreach (string suffix in new[] { "", ".bak" }) {
+            var rows = JsonNode.Parse(File.ReadAllText(results + suffix))!; rows.AsObject().Remove("generation");
+            var preview = JsonNode.Parse(File.ReadAllText(path + suffix))!; preview.AsObject().Remove("resultGeneration");
+            File.WriteAllText(results + suffix, rows.ToJsonString()); File.WriteAllText(path + suffix, preview.ToJsonString());
+        }
+        if (missingPrimary) File.Delete(path);
+        for (int restart = 0; restart < 2; restart++) {
+            using var restored = NewService(); await restored.InitializeWebAutomationAsync();
+            Assert.Equal(4, restored.Duplicates.Count); Assert.NotNull(restored.LastSelectionPlan);
+            Assert.Equal(scoped ? 2 : 4, restored.LastSelectionPlan.Decisions.Count);
+            Assert.Equal(plan.Decisions.Select(d => d.GroupId).Distinct().Order(),
+                restored.LastSelectionPlan.Decisions.Select(d => d.GroupId).Distinct().Order());
+            Assert.False(restored.LastSelectionPlan.Decisions.Single(d => d.Path == target).RemoveCandidate);
+            if (scoped) Assert.DoesNotContain(restored.LastSelectionPlan.Decisions, d => d.GroupId == otherGroup);
+        }
+        Assert.All(Directory.GetFiles(folder, "*.mp4"), media => Assert.Equal(new byte[] { 1, 2, 3, 4 }, File.ReadAllBytes(media)));
+    }
+
+    [Theory]
+    [InlineData(null, false)]
+    [InlineData(null, true)]
+    [InlineData(SelectionProfile.QualityFirst, false)]
+    [InlineData(SelectionProfile.QualityFirst, true)]
+    [InlineData(SelectionProfile.NewestFirst, false)]
+    [InlineData(SelectionProfile.NewestFirst, true)]
+    [InlineData(null, false, true)]
+    [InlineData(SelectionProfile.QualityFirst, false, true)]
+    [InlineData(SelectionProfile.NewestFirst, false, true)]
+    public async Task RestoredPreviewPreservesExplicitProfileWhileReloadingCurrentSettings(SelectionProfile? profile, bool missingPrimary, bool corruptPrimary = false) {
+        var date = new DateTime(2026, 1, 1, 0, 0, 0, DateTimeKind.Utc);
+        var older = Seed("profile-older.mp4", date); older.FrameSize = "1920x1080";
+        var newer = Seed("profile-newer.mp4", date.AddDays(1)); newer.FrameSize = "640x360";
+        Anchor(); ScanEngine.SaveDatabase(); await scan.RemoveFromResultsAsync([]);
+        var config = await scan.LoadAutomationAsync(); config.Selection.Profile = SelectionProfile.OldestFirst;
+        await scan.SaveAutomationAsync(config);
+        await scan.PreviewResultsSelectionAsync(profile, [group], []);
+        config = await scan.LoadAutomationAsync(); config.Selection.Profile = SelectionProfile.FolderPriorityFirst;
+        config.Selection.FolderRules.Add(new() { Directory = folder, Pattern = "profile-newer.mp4", Priority = 10 });
+        await scan.SaveAutomationAsync(config);
+        if (missingPrimary) File.Delete(Path.Combine(folder, "SelectionPlan.json"));
+        if (corruptPrimary) {
+            string path = Path.Combine(folder, "SelectionPlan.json");
+            var damaged = JsonNode.Parse(File.ReadAllText(path))!; damaged["profileOverride"] = "unsupported-profile";
+            File.WriteAllText(path, damaged.ToJsonString());
+        }
+        for (int restart = 0; restart < 2; restart++) {
+            using var restored = NewService(); await restored.InitializeWebAutomationAsync();
+            Assert.Equal(profile ?? SelectionProfile.FolderPriorityFirst, restored.LastSelectionPlan?.Profile);
+            Assert.Equal(profile == SelectionProfile.QualityFirst ? older.Path : newer.Path,
+                Assert.Single(restored.LastSelectionPlan!.Decisions, d => d.IsKeeper).Path);
+        }
+        Assert.True(File.Exists(older.Path) && File.Exists(newer.Path));
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task InvalidSavedProfileOverridesPreserveBothCopiesAndExposeNoPreview(bool numeric) {
+        Seed("invalid-profile-a.mp4"); Seed("invalid-profile-b.mp4"); Anchor(); ScanEngine.SaveDatabase();
+        await scan.RemoveFromResultsAsync([]); await scan.PreviewSelectionAsync(SelectionProfile.QualityFirst);
+        string path = Path.Combine(folder, "SelectionPlan.json");
+        foreach (string suffix in new[] { "", ".bak" }) {
+            var damaged = JsonNode.Parse(File.ReadAllText(path + suffix))!;
+            damaged["profileOverride"] = numeric ? JsonValue.Create(999) : JsonValue.Create("unsupported-profile");
+            File.WriteAllText(path + suffix, damaged.ToJsonString());
+        }
+        byte[] primary = File.ReadAllBytes(path), backup = File.ReadAllBytes(path + ".bak");
+        using var restored = NewService();
+        await Assert.ThrowsAsync<InvalidDataException>(() => restored.InitializeWebAutomationAsync());
+        Assert.Null(restored.LastSelectionPlan); Assert.False(restored.IsBusy);
+        Assert.Equal(primary, File.ReadAllBytes(path)); Assert.Equal(backup, File.ReadAllBytes(path + ".bak"));
+    }
+
     [Fact]
     public async Task CorruptSelectionPreviewIsPreservedAndStillFails() {
         Seed("preview-a.mp4"); Seed("preview-b.mp4"); Anchor();

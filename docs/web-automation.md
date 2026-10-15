@@ -89,7 +89,11 @@ older nonempty snapshots continue to restore as completed results.
 Saved previews belong to their result generation. Replacing, resetting, clearing
 or dismissing results prevents an earlier preview from automatically selecting
 the new generation after a restart. A matching saved preview is recomputed using
-current settings and reviews. Existing version-one snapshots and previews
+current settings and reviews within its saved group scope. Per-group and
+highlighted-group previews do not expand to other groups after restarting;
+automatic post-scan previews retain all groups. An explicitly chosen preview profile
+also survives restart; previews using saved defaults follow the current saved profile.
+Existing version-one snapshots and previews
 without generation fields remain readable together; newly saved generations do
 not inherit an unbound older preview. The shared scan database format is unchanged.
 Result invalidation, completion saves and explicit resets are independent of the
