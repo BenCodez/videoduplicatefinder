@@ -11,6 +11,10 @@ namespace VDF.Web.Services;
 public sealed partial class ScanService {
     bool _terminalProcessing;
     DateTimeOffset? _scheduledRunStarted;
+    IDisposable? _scheduledRunLease;
+    readonly SemaphoreSlim _scheduledFinishGate = new(1, 1);
+    internal const string ScheduledRunLeaseFileName = "WebSchedule.run";
+    internal Action? ScheduledRunClaimed { get; set; }
     public async Task CheckScheduleAsync(DateTimeOffset now) {
         if (IsBusy) return;
         // Idle polling must not reset an error, replace a preview or flash the
@@ -39,27 +43,45 @@ public sealed partial class ScanService {
         if (File.Exists(AutomationStore.Path) || File.Exists(AutomationStore.Path + ".bak") || scheduled) {
             string folder = ConfiguredStateFolder(_engine.Settings);
             _runAutomation = await LoadAutomationCoreAsync(folder);
+            _cts.Token.ThrowIfCancellationRequested();
             if (scheduled) {
-                string path = Path.Combine(folder, "WebSchedule.json");
-                using var lease = JournalWriteLease.Acquire(path);
-                var state = await ReadScheduleStateAsync(path);
-                var evaluation = ScanSchedulePolicy.Evaluate(_runAutomation.Schedule, now, state.LastClaimedSlotUtc, TimeZoneInfo.Local);
-                if (evaluation.Error is not null) throw new InvalidDataException(evaluation.Error);
-                bool startup = !_startupChecked && _runAutomation.ScanAtStartup;
-                _startupChecked = true;
-                ScheduleState = state;
-                if (evaluation.DueSlotUtc is null && !startup) return false;
-                ApplyScheduledProfile(_engine.Settings, _runAutomation.ScheduledScanProfile);
-                ValidateScheduledPrerequisites(_engine.Settings);
-                state.LastClaimedSlotUtc = evaluation.DueSlotUtc ?? state.LastClaimedSlotUtc;
-                state.LastStartedUtc = now;
-                state.LastCompletedUtc = null;
-                state.Status = "Starting";
-                state.DurationSeconds = 0;
-                await DurableJsonFile.WriteAsync(path, state, WebAutomationJsonContext.Default.WebScheduleState, ValidateScheduleState);
-                _scheduledStateFolder = folder;
-                _scheduledRunStarted = now;
-                ScheduleState = state;
+                IDisposable? runLease = null;
+                try {
+                    // Take the lifetime lease before the durable claim. A restart
+                    // can then distinguish an abandoned claim from a live process.
+                    runLease = JournalWriteLease.Acquire(Path.Combine(folder, ScheduledRunLeaseFileName));
+                    string path = Path.Combine(folder, "WebSchedule.json");
+                    WebScheduleState state;
+                    using (JournalWriteLease.Acquire(path)) {
+                        state = await ReadScheduleStateAsync(path);
+                        var evaluation = ScanSchedulePolicy.Evaluate(_runAutomation.Schedule, now, state.LastClaimedSlotUtc, TimeZoneInfo.Local);
+                        if (evaluation.Error is not null) throw new InvalidDataException(evaluation.Error);
+                        bool startup = !_startupChecked && _runAutomation.ScanAtStartup;
+                        _startupChecked = true;
+                        ScheduleState = state;
+                        if (evaluation.DueSlotUtc is null && !startup) return false;
+                        ApplyScheduledProfile(_engine.Settings, _runAutomation.ScheduledScanProfile);
+                        ValidateScheduledPrerequisites(_engine.Settings);
+                        _cts.Token.ThrowIfCancellationRequested();
+                        state.LastClaimedSlotUtc = evaluation.DueSlotUtc ?? state.LastClaimedSlotUtc;
+                        state.LastStartedUtc = now;
+                        state.LastCompletedUtc = null;
+                        state.Status = "Starting";
+                        state.DurationSeconds = 0;
+                        await DurableJsonFile.WriteAsync(path, state, WebAutomationJsonContext.Default.WebScheduleState, ValidateScheduleState);
+                    }
+                    // Once ownership is visible, a terminal callback can write
+                    // immediately; startup must no longer own the journal writer.
+                    lock (_operationSync) {
+                        _scheduledStateFolder = folder;
+                        _scheduledRunStarted = now;
+                        _scheduledRunLease = runLease;
+                        runLease = null;
+                        ScheduleState = state;
+                    }
+                    ScheduledRunClaimed?.Invoke();
+                }
+                finally { runLease?.Dispose(); }
             }
             await new CleanupProtectionGuard(folder).RecoverAsync();
         }
@@ -109,23 +131,66 @@ public sealed partial class ScanService {
         (value.LastStartedUtc is null || value.LastStartedUtc.Value.Offset == TimeSpan.Zero) &&
         (value.LastCompletedUtc is null || value.LastCompletedUtc.Value.Offset == TimeSpan.Zero);
 
+    internal static async Task<WebScheduleState> ReconcileScheduledRunAtStartupAsync(string folder) {
+        SafePaths.RequireDirectory(folder);
+        string path = Path.Combine(folder, "WebSchedule.json");
+        IDisposable runLease;
+        try { runLease = JournalWriteLease.Acquire(Path.Combine(folder, ScheduledRunLeaseFileName)); }
+        catch (IOException ex) when ((ex.HResult & 0xffff) is 11 or 32 or 33) {
+            // A cooperating process still owns this run. Only sharing/lock
+            // contention is benign; unsafe paths and other I/O errors propagate.
+            return await ReadScheduleStateAsync(path);
+        }
+        using (runLease) {
+            using var lease = JournalWriteLease.Acquire(path);
+            // Read the current generation under both leases: a live process may
+            // have finished just before the run lease became available.
+            var state = await ReadScheduleStateAsync(path);
+            if (state.Status != "Starting" || state.LastCompletedUtc is not null) return state;
+            if (state.LastStartedUtc is null)
+                throw new InvalidDataException("The starting schedule journal has no start time; it was preserved.");
+            state.Status = "Interrupted";
+            state.LastCompletedUtc = DateTimeOffset.UtcNow;
+            state.DurationSeconds = Math.Max(0, (state.LastCompletedUtc.Value - state.LastStartedUtc.Value).TotalSeconds);
+            await DurableJsonFile.WriteAsync(path, state, WebAutomationJsonContext.Default.WebScheduleState, ValidateScheduleState);
+            return state;
+        }
+    }
+
     async Task FinishScheduledStateAsync(string status) {
-        if (_scheduledStateFolder is null || _scheduledRunStarted is null) return;
+        await _scheduledFinishGate.WaitAsync();
+        string? folder;
+        DateTimeOffset? started;
+        IDisposable? runLease;
+        lock (_operationSync) {
+            // Detach one generation atomically. An early abort with no claim
+            // must not clear ownership transferred while its callback unwinds.
+            folder = _scheduledStateFolder;
+            started = _scheduledRunStarted;
+            runLease = _scheduledRunLease;
+            _scheduledStateFolder = null;
+            _scheduledRunStarted = null;
+            _scheduledRunLease = null;
+        }
         try {
-            string path = Path.Combine(_scheduledStateFolder, "WebSchedule.json");
+            if (folder is null || started is null) return;
+            string path = Path.Combine(folder, "WebSchedule.json");
             using var lease = JournalWriteLease.Acquire(path);
             var state = await ReadScheduleStateAsync(path);
             // A different process's newer run must not be overwritten by a late
             // terminal callback from this process.
-            if (state.LastStartedUtc != _scheduledRunStarted) return;
+            if (state.LastStartedUtc != started) return;
             state.Status = status;
             state.LastCompletedUtc = DateTimeOffset.UtcNow;
-            state.DurationSeconds = Math.Max(0, (state.LastCompletedUtc.Value - _scheduledRunStarted.Value).TotalSeconds);
+            state.DurationSeconds = Math.Max(0, (state.LastCompletedUtc.Value - started.Value).TotalSeconds);
             await DurableJsonFile.WriteAsync(path, state, WebAutomationJsonContext.Default.WebScheduleState, ValidateScheduleState);
             ScheduleState = state;
         }
         catch (Exception ex) { AutomationStatus = "Schedule completion could not be saved: " + ex.Message; }
-        finally { _scheduledStateFolder = null; _scheduledRunStarted = null; }
+        finally {
+            try { runLease?.Dispose(); }
+            finally { _scheduledFinishGate.Release(); }
+        }
     }
 
     static void ApplyScheduledProfile(Settings s, WebScanProfile profile) {

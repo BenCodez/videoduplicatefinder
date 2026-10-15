@@ -373,7 +373,7 @@ public sealed partial class ScanService {
             string folder = ConfiguredStateFolder();
             var config = await LoadAutomationCoreAsync(folder);
             await new CleanupProtectionGuard(folder).RecoverAsync();
-            ScheduleState = await ReadScheduleStateAsync(Path.Combine(folder, "WebSchedule.json"));
+            ScheduleState = await ReconcileScheduledRunAtStartupAsync(folder);
             // A fresh process can report the default folder before its global
             // database wrapper has ever been loaded. Path equality alone cannot
             // authorize saving restored results back into that database.

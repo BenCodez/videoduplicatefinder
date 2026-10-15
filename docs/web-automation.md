@@ -62,6 +62,11 @@ changing the scan database schema. Preserve all state, backups and quarantine
 destinations together. See [the shared recovery guidance](review-cleanup.md) and
 [container setup and validation](web-container.md).
 
+After a restart, an abandoned scheduled run is marked **Interrupted** while its
+claimed slot remains recorded, so that slot is not repeated. A live cooperating
+process keeps its run status. Preserve the persistent lock files, including
+`WebSchedule.run.lock`; do not remove them while an instance is running.
+
 For an upgrade, stop the old container and make copies of both persistent mounts.
 Test the new image with those copies, another port and read-only media. Keep the
 old image and untouched original state for rollback. Restore the entire matching

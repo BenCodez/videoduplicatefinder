@@ -132,6 +132,7 @@ namespace VDF.Web.Services {
 			try {
 				// Reserve the whole lifecycle before configuration reads, durable
 				// schedule claims, first-use downloads or replacing visible results.
+				_cts.Token.ThrowIfCancellationRequested();
 				if (!await PrepareWebScanAsync(scheduled, now)) {
 					lock (_operationSync) { _scanRunActive = false; State = _engine.Duplicates.Count > 0 ? ScanState.Done : ScanState.Idle; }
 					return;
@@ -141,6 +142,7 @@ namespace VDF.Web.Services {
 				ClearCleanupSnapshots();
 				ClearThumbnailCaches();
 				LastSelectionPlan = null;
+				NotifyAutomationChanged();
 				// Reserve the lifecycle before awaiting a first-use AI download.
 				await PrepareScanAsync(_engine.Settings, _cts.Token);
 				_cts.Token.ThrowIfCancellationRequested();
@@ -148,6 +150,10 @@ namespace VDF.Web.Services {
 			}
 			catch (OperationCanceledException) {
 				await CompleteWebScanAsync(true);
+				// Stop can raise an early terminal callback before a claim write
+				// returns and transfers scheduled ownership. Finish that late claim
+				// even when the callback already consumed the terminal guard.
+				await FinishScheduledStateAsync("Aborted");
 			}
 			catch (Exception ex) {
 				await FinishScheduledStateAsync("Failed: " + ex.Message);

@@ -195,6 +195,39 @@ public sealed class AutomationPageTests : BunitContext {
         Assert.All(scan.Duplicates, item => Assert.True(File.Exists(item.Path)));
     }
 
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task PreparationFailureInAnotherCircuitRemovesDiscardedReviewRows(bool scheduled) {
+        await ScanEngine.LoadDatabase(folder);
+        DatabaseUtils.Database.Clear();
+        scan.Settings.IncludeList.Add(folder);
+        Assert.True(scan.SaveSettings());
+        var config = await scan.LoadAutomationAsync();
+        config.Schedule = new() { Enabled = scheduled, Kind = ScanScheduleKind.Interval, IntervalMinutes = 5 };
+        await scan.SaveAutomationAsync(config);
+        var group = Guid.NewGuid();
+        Seed("discarded-a.mp4", group); Seed("discarded-b.mp4", group);
+        foreach (var item in scan.Duplicates) DatabaseUtils.Database.Add(new FileEntry(item.Path));
+        ScanEngine.SaveDatabase();
+        await scan.CompleteWebScanAsync(false);
+        await scan.RemoveFromResultsAsync([]);
+        await scan.PreviewSelectionAsync();
+        var page = await RenderPageAsync();
+        Assert.Equal(2, page.FindAll(".action-panel").Count(panel => panel.TextContent.Contains("Review:")));
+        Assert.Contains("discarded-a.mp4", page.Markup);
+        scan.PrepareScanAsync = (_, _) => Task.FromException(new IOException("Synthetic preparation failure"));
+        if (scheduled) await scan.CheckScheduleAsync(DateTimeOffset.UtcNow);
+        else await scan.StartScanAndCompare();
+        Assert.Equal(ScanState.Error, scan.State);
+        Assert.Empty(scan.Duplicates);
+        await page.WaitForAssertionAsync(() => {
+            Assert.DoesNotContain(page.FindAll(".action-panel"), panel => panel.TextContent.Contains("discarded-"));
+            Assert.DoesNotContain("discarded-a.mp4", page.Markup);
+            Assert.Empty(page.FindAll("[role='alert']"));
+        }, JournalIoTimeout);
+    }
+
     void Seed(string name, Guid group) {
         var path = Path.Combine(folder, name);
         File.WriteAllBytes(path, [1, 2, 3, 4]);
