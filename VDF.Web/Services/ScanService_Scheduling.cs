@@ -57,9 +57,7 @@ public sealed partial class ScanService {
                         var evaluation = ScanSchedulePolicy.Evaluate(_runAutomation.Schedule, now, state.LastClaimedSlotUtc, TimeZoneInfo.Local);
                         if (evaluation.Error is not null) throw new InvalidDataException(evaluation.Error);
                         bool startup = !_startupChecked && _runAutomation.ScanAtStartup;
-                        _startupChecked = true;
-                        ScheduleState = state;
-                        if (evaluation.DueSlotUtc is null && !startup) return false;
+                        if (evaluation.DueSlotUtc is null && !startup) { _startupChecked = true; ScheduleState = state; return false; }
                         ApplyScheduledProfile(_engine.Settings, _runAutomation.ScheduledScanProfile);
                         ValidateScheduledPrerequisites(_engine.Settings);
                         _cts.Token.ThrowIfCancellationRequested();
@@ -69,6 +67,7 @@ public sealed partial class ScanService {
                         state.Status = "Starting";
                         state.DurationSeconds = 0;
                         await DurableJsonFile.WriteAsync(path, state, WebAutomationJsonContext.Default.WebScheduleState, ValidateScheduleState);
+                        _startupChecked = true;
                     }
                     // Once ownership is visible, a terminal callback can write
                     // immediately; startup must no longer own the journal writer.

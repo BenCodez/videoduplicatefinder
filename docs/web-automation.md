@@ -34,6 +34,9 @@ timezone. Intervals use UTC. Scheduling uses saved scan settings, validates the
 required folders/tools, durably claims a slot before starting and collapses missed
 slots to at most one recent run. Restarting does not repeat an already claimed
 slot. **Scan when the web service starts** is a separate opt-in startup scan.
+If prerequisites fail before its durable claim, the startup scan remains eligible
+for a later server tick after the prerequisite recovers. A claimed run stays
+consumed for that service instance even if preparation later fails or is aborted.
 AI schedules require installing the AI components with a manual scan first.
 
 Automatic selection after a scan previews all newly scanned groups. The

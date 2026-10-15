@@ -58,6 +58,88 @@ public sealed class WebScheduleRecoveryTests : IAsyncLifetime {
     async Task<WebScheduleState> ReadStateAsync() => JsonSerializer.Deserialize(await File.ReadAllTextAsync(JournalPath),
         WebAutomationJsonContext.Default.WebScheduleState)!;
 
+    [Theory]
+    [InlineData(false, "include")]
+    [InlineData(true, "include")]
+    [InlineData(false, "concurrency")]
+    [InlineData(true, "concurrency")]
+    [InlineData(false, "filters")]
+    [InlineData(true, "filters")]
+    [InlineData(false, "claim")]
+    [InlineData(true, "claim")]
+    public async Task UnclaimedStartupScanRetriesAfterPrerequisitesOrClaimStorageRecover(bool recurring, string fault) {
+        var config = await scan.LoadAutomationAsync(); config.ScanAtStartup = true;
+        config.Schedule = new() { Enabled = recurring, Kind = ScanScheduleKind.Interval, IntervalMinutes = 5 };
+        await scan.SaveAutomationAsync(config);
+        string included = Path.Combine(folder, "temporarily-unavailable");
+        if (fault == "include") scan.Settings.IncludeList.Add(included);
+        if (fault == "concurrency") scan.Settings.MaxDegreeOfParallelism = 0;
+        if (fault == "filters") {
+            scan.Settings.FilterByFileSize = true; scan.Settings.MinimumFileSize = 10; scan.Settings.MaximumFileSize = 10;
+        }
+        Assert.True(scan.SaveSettings());
+        if (fault == "claim") {
+            await WriteStateAsync(new());
+        }
+        string media = Path.Combine(folder, "preserved.mp4"); await File.WriteAllBytesAsync(media, [1, 2, 3, 4]);
+        int prepared = 0, searches = 0;
+        scan.PrepareScanAsync = (_, _) => { prepared++; return Task.CompletedTask; };
+        scan.StartSearchOverride = () => searches++;
+        var previousObserver = DurableFileOperations.FileMovedObserver.Value;
+        if (fault == "claim") DurableFileOperations.FileMovedObserver.Value = (_, destination) => {
+            if (PathComparer.ForCurrentPlatform.Equals(destination, JournalPath + ".bak"))
+                throw new IOException("Synthetic failure before the mirrored claim completes");
+        };
+        try { await scan.CheckScheduleAsync(Started); }
+        finally { DurableFileOperations.FileMovedObserver.Value = previousObserver; }
+        Assert.Equal(ScanState.Error, scan.State); Assert.False(scan.IsBusy);
+        Assert.Equal(0, prepared); Assert.Equal(0, searches);
+        Assert.Null(scan.ScheduleState?.LastStartedUtc);
+        if (File.Exists(JournalPath)) Assert.Null((await ReadStateAsync()).LastStartedUtc);
+        using (JournalWriteLease.Acquire(RunLeasePath)) { }
+        if (fault == "include") Directory.CreateDirectory(included);
+        if (fault == "concurrency") scan.Settings.MaxDegreeOfParallelism = 1;
+        if (fault == "filters") scan.Settings.MaximumFileSize = 20;
+        Assert.True(scan.SaveSettings());
+        await scan.CheckScheduleAsync(Started.AddSeconds(15));
+        Assert.Equal(1, prepared); Assert.Equal(1, searches); Assert.True(scan.IsBusy);
+        Assert.Equal(Started.AddSeconds(15), (await ReadStateAsync()).LastStartedUtc);
+        await scan.CompleteWebScanAsync(false);
+        await scan.CheckScheduleAsync(Started.AddSeconds(30));
+        Assert.Equal(1, searches); Assert.False(scan.IsBusy);
+        Assert.Equal(new byte[] { 1, 2, 3, 4 }, await File.ReadAllBytesAsync(media));
+    }
+
+    [Theory]
+    [InlineData(false, "prepare")]
+    [InlineData(true, "prepare")]
+    [InlineData(false, "callback")]
+    [InlineData(true, "callback")]
+    [InlineData(false, "abort")]
+    [InlineData(true, "abort")]
+    public async Task ClaimedStartupScanDoesNotRetryAfterPostClaimFailureOrAbort(bool recurring, string fault) {
+        var config = await scan.LoadAutomationAsync(); config.ScanAtStartup = true;
+        config.Schedule = new() { Enabled = recurring, Kind = ScanScheduleKind.Interval, IntervalMinutes = 5 };
+        await scan.SaveAutomationAsync(config);
+        int claims = 0, searches = 0;
+        scan.ScheduledRunClaimed = () => {
+            claims++;
+            if (fault == "callback") throw new IOException("Synthetic post-claim failure");
+            if (fault == "abort") scan.Stop();
+        };
+        scan.PrepareScanAsync = (_, _) => fault == "prepare" ? Task.FromException(new IOException("Synthetic preparation failure")) : Task.CompletedTask;
+        scan.StartSearchOverride = () => searches++;
+        await scan.CheckScheduleAsync(Started);
+        Assert.Equal(1, claims); Assert.Equal(0, searches); Assert.False(scan.IsBusy);
+        Assert.Equal(fault == "abort" ? ScanState.Aborted : ScanState.Error, scan.State);
+        var before = await ReadStateAsync(); Assert.Equal(Started, before.LastStartedUtc);
+        Assert.NotNull(before.LastCompletedUtc);
+        await scan.CheckScheduleAsync(Started.AddSeconds(15));
+        Assert.Equal(1, claims); Assert.Equal(0, searches); Assert.False(scan.IsBusy);
+        Assert.Equal(before.LastStartedUtc, (await ReadStateAsync()).LastStartedUtc);
+        using var lease = JournalWriteLease.Acquire(RunLeasePath);
+    }
+
     [Fact]
     public async Task StartupTerminatesOrphanAndPreservesClaimWithoutRepeatingItsSlot() {
         string media = Path.Combine(folder, "preserved.mp4");
