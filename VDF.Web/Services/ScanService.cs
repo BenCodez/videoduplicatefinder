@@ -411,7 +411,7 @@ namespace VDF.Web.Services {
 				string folder = DatabaseUtils.GetDatabaseFolderPath();
 				// Commit the matching empty result generation before clearing the
 				// database; a restart must not revive this folder's old rows.
-				if (File.Exists(AutomationStore.Path) || File.Exists(Path.Combine(folder, "WebResults.json")))
+				if (File.Exists(AutomationStore.Path) || HasSavedResultsJournal(folder))
 					await SaveResultsAsync(folder, new());
 				ResultsPersistenceWarning = null;
 				ScanEngine.ClearDatabase();

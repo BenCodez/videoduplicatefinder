@@ -330,12 +330,15 @@ public sealed partial class ScanService {
         return result;
     }
 
+    static bool HasSavedResultsJournal(string folder) => SafePaths.Exists(Path.Combine(folder, "WebResults.json")) ||
+        SafePaths.Exists(Path.Combine(folder, "WebResults.json.bak"));
     async Task InvalidatePersistedResultsForScanAsync() {
-        if (_runAutomation is null) return;
+        string nextFolder = CoreUtils.ResolveDatabaseFolder(_engine.Settings.CustomDatabaseFolder);
+        if (_runAutomation is null && _resultStateFolder is null && !HasSavedResultsJournal(nextFolder)) return;
         // Commit the discarded generation before preparation or the engine can
         // fail, be interrupted, or change its database. Both journal copies must
         // be empty so restart cannot resurrect results this scan replaced.
-        string nextFolder = ConfiguredStateFolder(_engine.Settings);
+        nextFolder = ConfiguredStateFolder(_engine.Settings);
         await SaveResultsAsync(nextFolder, new());
         if (_resultStateFolder is { } previous && !PathComparer.ForCurrentPlatform.Equals(
             NormalizeDatabaseFolder(previous), NormalizeDatabaseFolder(nextFolder))) {
@@ -345,12 +348,13 @@ public sealed partial class ScanService {
         ResultsPersistenceWarning = null;
     }
     async Task PersistResultsAsync() {
-        if (_resultStateFolder is null || _runAutomation is null && !File.Exists(AutomationStore.Path)) return;
+        if (_resultStateFolder is null) return;
         bool saved = await SaveResultsAsync(_resultStateFolder, Duplicates.Select(item => new WebSavedResult {
             Item = item, Snapshot = _resultSnapshots.GetValueOrDefault(item) }).ToList(), allowSizeFallback: true, completed: true);
         ResultsPersistenceWarning = saved ? null : "These results exceed the 32 MiB save limit. They are available only until the service restarts; run a new scan after restarting to recreate the results.";
     }
     static async Task<bool> SaveResultsAsync(string folder, List<WebSavedResult> rows, bool allowSizeFallback = false, bool completed = false) {
+        SafePaths.RequireDirectory(folder);
         string path = Path.Combine(folder, "WebResults.json");
         using var lease = JournalWriteLease.Acquire(path);
         await RequireSupportedJournalCopiesAsync(path);
@@ -370,7 +374,7 @@ public sealed partial class ScanService {
     public async Task ResetAsync() {
         ReserveAutomationWork();
         try {
-            if (_resultStateFolder is { } folder && File.Exists(AutomationStore.Path)) await SaveResultsAsync(folder, new());
+            if (_resultStateFolder is { } folder) await SaveResultsAsync(folder, new());
             ResultsPersistenceWarning = null;
             _engine.Duplicates.Clear();
             ClearCleanupSnapshots();

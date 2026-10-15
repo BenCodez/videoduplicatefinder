@@ -96,6 +96,9 @@ public sealed partial class ScanService {
         try {
             if (!aborted) {
                 CaptureCleanupSnapshots(DatabaseUtils.GetDatabaseFolderPath());
+                // Preserve completed scan output even if optional settings or
+                // selection processing subsequently require restoration.
+                await PersistResultsAsync();
                 if (_runAutomation is not null) {
                     var current = await LoadAutomationCoreAsync(ResultsStateFolder());
                     if (current.Selection.AutoAfterScan) {
@@ -103,7 +106,6 @@ public sealed partial class ScanService {
                         current.Selection.HighlightedGroupsOnly = false;
                         await PreviewSelectionCoreAsync(current);
                     }
-                    await PersistResultsAsync();
                 }
             }
             await FinishScheduledStateAsync(aborted ? "Aborted" : "Completed");

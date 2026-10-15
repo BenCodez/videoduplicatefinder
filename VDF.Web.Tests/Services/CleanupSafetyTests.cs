@@ -909,13 +909,16 @@ public sealed class CleanupSafetyTests : IAsyncLifetime {
 	public async Task StartupReservationSurvivesErrorDisplayAndBlocksOtherOperations() {
 		var (target, keeper) = SeedPair();
 		var wait = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+		var preparing = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
 		int starts = 0;
 		scan.PrepareScanAsync = (_, ct) => {
 			starts++;
+			preparing.TrySetResult();
 			return wait.Task.WaitAsync(ct);
 		};
 		var start = scan.StartScanAndCompare();
 		try {
+			await preparing.Task.WaitAsync(TimeSpan.FromSeconds(10));
 			Assert.True(scan.IsBusy);
 			scan.SetError(new IOException("Background error while startup is still reserved."));
 			Assert.True(scan.IsBusy);

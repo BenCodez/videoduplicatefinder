@@ -79,6 +79,12 @@ Saved results record whether the scan completed, including scans with no
 duplicates. A reset or an interrupted replacement scan restores the Scan page
 as idle. Older empty snapshots without completion metadata also restore as idle;
 older nonempty snapshots continue to restore as completed results.
+Result invalidation, completion saves and explicit resets are independent of the
+optional automation configuration. Missing established protection settings still
+require restoration; scanning does not replace them with permissive defaults.
+Completed results are saved before optional settings reload or selection
+processing, so restoring settings after a reported configuration error retains
+the completed scan output.
 
 For an upgrade, stop the old container and make copies of both persistent mounts.
 Test the new image with those copies, another port and read-only media. Keep the

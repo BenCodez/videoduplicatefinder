@@ -331,6 +331,264 @@ public sealed class WebAutomationTests : IAsyncLifetime {
         }
     }
 
+    Action RemoveAutomationConfigCopies() {
+        string path = configStore.Path;
+        byte[] primary = File.ReadAllBytes(path), backup = File.ReadAllBytes(path + ".bak");
+        File.Delete(path); File.Delete(path + ".bak");
+        return () => { File.WriteAllBytes(path, primary); File.WriteAllBytes(path + ".bak", backup); };
+    }
+
+    [Theory]
+    [InlineData(false, false, "complete")]
+    [InlineData(true, false, "complete")]
+    [InlineData(false, true, "complete")]
+    [InlineData(true, true, "complete")]
+    [InlineData(false, false, "prepare")]
+    [InlineData(true, false, "prepare")]
+    [InlineData(false, true, "prepare")]
+    [InlineData(true, true, "prepare")]
+    [InlineData(false, false, "abort")]
+    [InlineData(true, false, "abort")]
+    [InlineData(false, true, "abort")]
+    [InlineData(true, true, "abort")]
+    [InlineData(false, false, "interrupted")]
+    [InlineData(true, false, "interrupted")]
+    [InlineData(false, true, "interrupted")]
+    [InlineData(true, true, "interrupted")]
+    public async Task MissingAutomationConfigCannotReviveReplacedResults(bool freshService, bool switchFolder, string outcome) {
+        Seed("previous-a.mp4"); Seed("previous-b.mp4"); Anchor();
+        ScanEngine.SaveDatabase();
+        await scan.RemoveFromResultsAsync([]);
+        string target = switchFolder ? Path.Combine(folder, "next-state") : folder;
+        if (switchFolder) {
+            Directory.CreateDirectory(target);
+            foreach (string name in new[] { "WebResults.json", "WebResults.json.bak", "ScannedFiles.db" })
+                File.Copy(Path.Combine(folder, name), Path.Combine(target, name));
+        }
+        var actor = freshService ? NewService() : scan;
+        actor.Settings.CustomDatabaseFolder = target;
+        var restore = RemoveAutomationConfigCopies();
+        int prepared = 0, started = 0;
+        actor.PrepareScanAsync = async (_, _) => {
+            prepared++;
+            AssertEmptySavedResults(target);
+            if (!freshService) AssertEmptySavedResults(folder);
+            if (outcome == "prepare") throw new IOException("Synthetic preparation failure");
+            Assert.True(await ScanEngine.LoadDatabase(target));
+        };
+        actor.StartSearchOverride = () => {
+            started++;
+            foreach (string name in new[] { "replacement-a.mp4", "replacement-b.mp4" }) {
+                string path = Path.Combine(folder, name);
+                File.WriteAllBytes(path, [1, 2, 3, 4]);
+                var entry = new FileEntry(path);
+                actor.Engine.Duplicates.Add(new DuplicateItem(entry, .01f, group, DuplicateFlags.None));
+                DatabaseUtils.Database.Add(entry);
+            }
+            ScanEngine.SaveDatabase();
+        };
+        try {
+            await actor.StartScanAndCompare();
+            Assert.Equal(1, prepared);
+            Assert.Equal(outcome == "prepare" ? 0 : 1, started);
+            if (outcome == "complete") await actor.CompleteWebScanAsync(false);
+            if (outcome == "abort") await actor.CompleteWebScanAsync(true);
+            if (outcome == "prepare") Assert.Equal(ScanState.Error, actor.State);
+            if (outcome == "complete") Assert.Equal(ScanState.Done, actor.State);
+            if (outcome != "complete") AssertEmptySavedResults(target);
+            // Missing established protection settings must still be restored;
+            // result persistence must not recreate permissive defaults.
+            Assert.False(File.Exists(configStore.Path));
+            restore();
+            using var restarted = NewService();
+            restarted.Settings.CustomDatabaseFolder = target;
+            await restarted.InitializeWebAutomationAsync();
+            Assert.Equal(outcome == "complete" ? ScanState.Done : ScanState.Idle, restarted.State);
+            Assert.Equal(outcome == "complete" ? 2 : 0, restarted.Duplicates.Count);
+            Assert.All(restarted.Duplicates, item => Assert.Contains("replacement-", item.Path));
+            if (switchFolder && !freshService) AssertEmptySavedResults(folder);
+            Assert.Equal(outcome == "prepare" ? 2 : 4, Directory.GetFiles(folder, "*.mp4", SearchOption.AllDirectories).Length);
+            Assert.All(Directory.GetFiles(folder, "*.mp4", SearchOption.AllDirectories),
+                path => Assert.Equal(new byte[] { 1, 2, 3, 4 }, File.ReadAllBytes(path)));
+        }
+        finally {
+            restore();
+            if (actor.IsBusy) await actor.CompleteWebScanAsync(true);
+            if (freshService) actor.Dispose();
+        }
+    }
+
+    [Theory]
+    [InlineData("reset")]
+    [InlineData("remove")]
+    [InlineData("clear")]
+    public async Task MissingAutomationConfigCannotReviveExplicitlyClearedResults(string action) {
+        var a = Seed("previous-a.mp4"); Seed("previous-b.mp4"); Anchor();
+        ScanEngine.SaveDatabase();
+        await scan.RemoveFromResultsAsync([]);
+        var restore = RemoveAutomationConfigCopies();
+        try {
+            if (action == "reset") await scan.ResetAsync();
+            else if (action == "remove") await scan.RemoveFromResultsAsync([a]);
+            else await scan.ClearDatabaseAsync();
+            AssertEmptySavedResults(folder);
+            Assert.False(File.Exists(configStore.Path));
+            restore();
+            using var restarted = NewService();
+            await restarted.InitializeWebAutomationAsync();
+            Assert.Empty(restarted.Duplicates);
+            Assert.Equal(action == "remove" ? ScanState.Done : ScanState.Idle, restarted.State);
+            Assert.Equal(2, Directory.GetFiles(folder, "*.mp4").Length);
+            Assert.All(Directory.GetFiles(folder, "*.mp4"), path => Assert.Equal(new byte[] { 1, 2, 3, 4 }, File.ReadAllBytes(path)));
+        }
+        finally { restore(); }
+    }
+
+    [Theory]
+    [InlineData(false, false)]
+    [InlineData(true, false)]
+    [InlineData(false, true)]
+    [InlineData(true, true)]
+    public async Task MissingAutomationConfigStillRefusesUnwritableResultGeneration(bool freshService, bool corrupt) {
+        Seed("retained-a.mp4"); Seed("retained-b.mp4"); Anchor();
+        ScanEngine.SaveDatabase();
+        await scan.RemoveFromResultsAsync([]);
+        var restore = RemoveAutomationConfigCopies();
+        string path = Path.Combine(folder, "WebResults.json");
+        if (corrupt) { File.WriteAllText(path, "{"); File.WriteAllText(path + ".bak", "{"); }
+        byte[] primary = File.ReadAllBytes(path), backup = File.ReadAllBytes(path + ".bak");
+        using var lease = corrupt ? null : JournalWriteLease.Acquire(path);
+        var actor = freshService ? NewService() : scan;
+        int prepared = 0, started = 0;
+        actor.PrepareScanAsync = (_, _) => { prepared++; return Task.CompletedTask; };
+        actor.StartSearchOverride = () => started++;
+        try {
+            await actor.StartScanAndCompare();
+            Assert.Equal(ScanState.Error, actor.State);
+            Assert.False(actor.IsBusy);
+            Assert.Equal(0, prepared); Assert.Equal(0, started);
+            Assert.Equal(freshService ? 0 : 2, actor.Duplicates.Count);
+            Assert.Equal(primary, File.ReadAllBytes(path));
+            Assert.Equal(backup, File.ReadAllBytes(path + ".bak"));
+            Assert.False(File.Exists(configStore.Path));
+        }
+        finally { restore(); if (freshService) actor.Dispose(); }
+    }
+
+    [Theory]
+    [InlineData(false, false)]
+    [InlineData(true, false)]
+    [InlineData(false, true)]
+    [InlineData(true, true)]
+    public async Task MissingAutomationConfigPersistsCurrentResultsWithOnlyBackupOrInMemoryHint(bool freshService, bool retainBackup) {
+        Seed("previous-a.mp4"); Seed("previous-b.mp4"); Anchor();
+        ScanEngine.SaveDatabase();
+        await scan.RemoveFromResultsAsync([]);
+        File.Delete(Path.Combine(folder, "WebResults.json"));
+        if (!retainBackup) File.Delete(Path.Combine(folder, "WebResults.json.bak"));
+        var restore = RemoveAutomationConfigCopies();
+        var actor = freshService ? NewService() : scan;
+        actor.PrepareScanAsync = (_, _) => Task.CompletedTask;
+        actor.StartSearchOverride = () => {
+            foreach (string name in new[] { "current-a.mp4", "current-b.mp4" }) {
+                string path = Path.Combine(folder, name);
+                File.WriteAllBytes(path, [1, 2, 3, 4]);
+                var entry = new FileEntry(path);
+                actor.Engine.Duplicates.Add(new DuplicateItem(entry, .01f, group, DuplicateFlags.None));
+                DatabaseUtils.Database.Add(entry);
+            }
+            ScanEngine.SaveDatabase();
+        };
+        try {
+            await actor.StartScanAndCompare();
+            await actor.CompleteWebScanAsync(false);
+            Assert.Equal(ScanState.Done, actor.State);
+            Assert.False(File.Exists(configStore.Path));
+            restore();
+            using var restarted = NewService();
+            await restarted.InitializeWebAutomationAsync();
+            Assert.Equal(2, restarted.Duplicates.Count);
+            Assert.All(restarted.Duplicates, item => Assert.Contains("current-", item.Path));
+            Assert.Equal(4, Directory.GetFiles(folder, "*.mp4").Length);
+        }
+        finally { restore(); if (actor.IsBusy) await actor.CompleteWebScanAsync(true); if (freshService) actor.Dispose(); }
+    }
+
+    [Theory]
+    [InlineData(false, false, "both-missing")]
+    [InlineData(true, false, "both-missing")]
+    [InlineData(false, true, "both-missing")]
+    [InlineData(true, true, "both-missing")]
+    [InlineData(false, false, "primary-missing")]
+    [InlineData(true, false, "primary-missing")]
+    [InlineData(false, true, "primary-missing")]
+    [InlineData(true, true, "primary-missing")]
+    [InlineData(false, false, "corrupt")]
+    [InlineData(true, false, "corrupt")]
+    [InlineData(false, true, "corrupt")]
+    [InlineData(true, true, "corrupt")]
+    [InlineData(false, false, "future")]
+    [InlineData(true, false, "future")]
+    [InlineData(false, true, "future")]
+    [InlineData(true, true, "future")]
+    public async Task AutomationConfigFaultDuringCompletionPreservesResultsAndRequiresSettingsRestoration(bool scheduled, bool autoPreview, string fault) {
+        var config = await scan.LoadAutomationAsync();
+        config.Schedule = new() { Enabled = scheduled, Kind = ScanScheduleKind.Interval, IntervalMinutes = 5 };
+        config.Selection.AutoAfterScan = autoPreview;
+        await scan.SaveAutomationAsync(config);
+        scan.PrepareScanAsync = (_, _) => Task.CompletedTask;
+        int starts = 0;
+        scan.StartSearchOverride = () => { starts++; Seed("completed-a.mp4"); Seed("completed-b.mp4"); ScanEngine.SaveDatabase(); };
+        var now = DateTimeOffset.UtcNow;
+        if (scheduled) await scan.CheckScheduleAsync(now);
+        else await scan.StartScanAndCompare();
+        Assert.True(scan.IsBusy);
+        Assert.Equal(1, starts);
+        byte[] original = File.ReadAllBytes(configStore.Path);
+        var restore = RemoveAutomationConfigCopies();
+        if (fault == "primary-missing") File.WriteAllBytes(configStore.Path + ".bak", original);
+        if (fault == "corrupt") { File.WriteAllText(configStore.Path, "{"); File.WriteAllText(configStore.Path + ".bak", "{"); }
+        if (fault == "future") {
+            var future = JsonNode.Parse(original)!; future["version"] = 2;
+            File.WriteAllText(configStore.Path, future.ToJsonString());
+            File.WriteAllBytes(configStore.Path + ".bak", original);
+        }
+        byte[]? faultPrimary = File.Exists(configStore.Path) ? File.ReadAllBytes(configStore.Path) : null;
+        byte[]? faultBackup = File.Exists(configStore.Path + ".bak") ? File.ReadAllBytes(configStore.Path + ".bak") : null;
+        try {
+            await scan.CompleteWebScanAsync(false);
+            Assert.Equal(ScanState.Error, scan.State);
+            Assert.NotNull(scan.ErrorMessage);
+            Assert.False(scan.IsBusy);
+            Assert.Equal(2, scan.Duplicates.Count);
+            foreach (string suffix in new[] { "", ".bak" }) {
+                var saved = JsonNode.Parse(File.ReadAllText(Path.Combine(folder, "WebResults.json" + suffix)))!;
+                Assert.Equal(2, saved["rows"]!.AsArray().Count);
+                Assert.True(saved["completed"]!.GetValue<bool>());
+            }
+            Assert.Equal(faultPrimary is not null, File.Exists(configStore.Path));
+            Assert.Equal(faultBackup is not null, File.Exists(configStore.Path + ".bak"));
+            if (faultPrimary is not null) Assert.Equal(faultPrimary, File.ReadAllBytes(configStore.Path));
+            if (faultBackup is not null) Assert.Equal(faultBackup, File.ReadAllBytes(configStore.Path + ".bak"));
+            restore();
+            using var restarted = NewService();
+            await restarted.InitializeWebAutomationAsync();
+            Assert.Equal(ScanState.Done, restarted.State);
+            Assert.Equal(2, restarted.Duplicates.Count);
+            Assert.All(restarted.Duplicates, item => {
+                Assert.Contains("completed-", item.Path);
+                Assert.Equal(new byte[] { 1, 2, 3, 4 }, File.ReadAllBytes(item.Path));
+            });
+            if (scheduled) {
+                Assert.StartsWith("Failed:", restarted.ScheduleState?.Status);
+                await restarted.CheckScheduleAsync(now);
+                Assert.False(restarted.IsBusy);
+                using var lease = JournalWriteLease.Acquire(Path.Combine(folder, ScanService.ScheduledRunLeaseFileName));
+            }
+        }
+        finally { restore(); if (scan.IsBusy) await scan.CompleteWebScanAsync(true); }
+    }
+
     [Theory]
     [InlineData(false)]
     [InlineData(true)]
