@@ -55,6 +55,12 @@ public partial class Automation {
     }
 
     Task ReloadAsync() => RunAsync(async () => {
+        if (Scan.IsBusy) {
+            _notice = _draft is null
+                ? "A scan or operation is running. Settings will load when it finishes."
+                : "Wait for the current operation to finish before reloading settings. Your draft has been kept.";
+            return;
+        }
         var loaded = await Scan.LoadAutomationAsync();
         _draft = Clone(loaded);
         _draftDirty = false;
@@ -167,7 +173,10 @@ public partial class Automation {
                 // Read operations also emit StateChanged. Do not recursively
                 // refresh in response to our own reads or in-flight actions.
                 if (refresh && !_working && !_refreshing && !Scan.IsBusy && _refreshedGeneration != Scan.AutomationGeneration) {
-                    try { await RefreshDataAsync(); }
+                    try {
+                        if (_draft is null) await ReloadAsync();
+                        else await RefreshDataAsync();
+                    }
                     catch (Exception ex) { _error = "Unable to refresh automation data: " + ex.Message; }
                 }
                 if (!_disposed) StateHasChanged();
