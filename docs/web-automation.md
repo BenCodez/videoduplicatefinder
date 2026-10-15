@@ -14,7 +14,10 @@ During a scan the action is **Stop scan and discard results…**. Confirm it to
 request cancellation, wait for scan processing to finish, then clear the current
 and saved result list. Media files, the scan cache, saved reviews and settings
 are kept. **Cancel pending discard** cancels the queued clear; it does not resume
-the scan. Other file or review operations must finish before results can be cleared.
+the scan. A confirmed discard belongs to the server and survives navigation;
+its status and cancel control are shared across pages. Finish or cancel the
+pending discard before starting another operation. Other file or review
+operations must finish before results can be cleared.
 If Automation is opened during a scan or operation, its settings load automatically
 when that operation finishes. Existing unsaved Automation drafts are retained.
 

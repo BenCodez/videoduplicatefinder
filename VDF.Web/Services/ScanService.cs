@@ -55,8 +55,9 @@ namespace VDF.Web.Services {
 		bool _dataWorkActive;
 		bool _disposed;
 
-		bool WorkActiveLocked => FileOpRunning || _scanStarting || _scanRunActive || _dataWorkActive ||
+		bool OperationActiveLocked => FileOpRunning || _scanStarting || _scanRunActive || _dataWorkActive ||
 			State is ScanState.Scanning or ScanState.Comparing;
+		bool WorkActiveLocked => _pendingDiscard is not null || OperationActiveLocked;
 
 		/// <summary>Includes startup and terminal scan processing, even when an error is displayed.</summary>
 		public bool IsBusy { get { lock (_operationSync) return WorkActiveLocked; } }
@@ -452,7 +453,10 @@ namespace VDF.Web.Services {
 			finally { EndDataWork(); }
 		}
 
-		void Notify() => StateChanged?.Invoke();
+		void Notify() {
+			StateChanged?.Invoke();
+			TryCompletePendingDiscard();
+		}
 
 		public void Dispose() {
 			lock (_operationSync) {

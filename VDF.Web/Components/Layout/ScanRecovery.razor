@@ -4,31 +4,32 @@
 <section class="settings-section" aria-label="Scan recovery">
     @if (Scan.IsScanActive) {
         <p>A scan is running or finishing. Stop it to return to your settings.</p>
-        <button @onclick="StopScan" disabled="@(_waiting || _working)">Stop scan</button>
+        <button @onclick="StopScan" disabled="@Scan.IsDiscardingResults">Stop scan</button>
     }
     else if (Scan.IsBusy) {
         <p>An operation is finishing. Results can be discarded when it finishes.</p>
     }
-    <button @onclick="() => _confirm = true" disabled="@(_working || _waiting || (Scan.IsBusy && !Scan.IsScanActive))">
+    <button @onclick="() => _confirm = true" disabled="@(Scan.IsDiscardingResults || (Scan.IsBusy && !Scan.IsScanActive))">
         @(Scan.IsScanActive ? "Stop scan and discard results…" : "Discard scan results…")
     </button>
     @if (_confirm) {
         <div role="group" aria-label="Confirm discard scan results">
             <p>Stop any current scan and discard its result list? Media files, settings, saved reviews and the scan cache are kept.</p>
-            <button @onclick="ConfirmAsync" disabled="@(_working || _waiting)">Confirm discard results</button>
+            <button @onclick="Confirm" disabled="@Scan.IsDiscardingResults">Confirm discard results</button>
             <button @onclick="() => _confirm = false">Cancel discard</button>
         </div>
     }
-    @if (_waiting) {
-        <p role="status">Stopping scan. Results will be discarded after the operation finishes.</p>
-        <button @onclick="() => _waiting = false">Cancel pending discard</button>
+    @if (Scan.IsDiscardPending) {
+        <button @onclick="Scan.CancelPendingDiscard">Cancel pending discard</button>
     }
+    @if (Scan.RecoveryStatus is { } status) { <p role="status">@status</p> }
+    @if (Scan.RecoveryError is { } error) { <p role="alert">@error</p> }
     @if (_notice is not null) { <p role="status">@_notice</p> }
     @if (_error is not null) { <p role="alert">@_error</p> }
 </section>
 
 @code {
-    bool _confirm, _waiting, _working, _disposed;
+    bool _confirm, _disposed;
     string? _notice, _error;
 
     protected override void OnInitialized() => Scan.StateChanged += OnStateChanged;
@@ -39,39 +40,19 @@
         _notice = "Stop requested. Waiting for the scan to finish.";
     }
 
-    async Task ConfirmAsync() {
-        if (_working || _waiting) return;
+    void Confirm() {
+        if (Scan.IsDiscardingResults) return;
         _confirm = false;
         _error = _notice = null;
-        if (Scan.IsBusy && !Scan.IsScanActive) {
-            _error = "Wait for the current operation to finish, then discard results.";
-            return;
-        }
-        _waiting = true;
-        Scan.Stop();
-        await DiscardWhenIdleAsync();
-    }
-
-    async Task DiscardWhenIdleAsync() {
-        if (!_waiting || _working || _disposed || Scan.IsBusy) return;
-        _working = true;
-        _waiting = false;
-        try {
-            // ResetAsync owns the service reservation and durable result clearing.
-            // Never clear rows while scan startup or terminal work still owns them.
-            await Scan.ResetAsync();
-            _notice = "Scan results discarded. Media files and saved settings were kept.";
-        }
+        try { Scan.RequestDiscardResults(); }
         catch (Exception ex) { _error = "Results could not be discarded: " + ex.Message; }
-        finally { _working = false; }
     }
 
     void OnStateChanged() => _ = UpdateAsync();
     async Task UpdateAsync() {
         try {
-            await InvokeAsync(async () => {
+            await InvokeAsync(() => {
                 if (_disposed) return;
-                await DiscardWhenIdleAsync();
                 StateHasChanged();
             });
         }
@@ -80,7 +61,6 @@
     }
     public void Dispose() {
         _disposed = true;
-        _waiting = false;
         Scan.StateChanged -= OnStateChanged;
     }
 }
