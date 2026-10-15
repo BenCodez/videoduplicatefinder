@@ -18,7 +18,7 @@ def api(*args, body=None):
                                              input=json.dumps(body) if body is not None else None))
 
 
-def prepare():
+def prepare(*, allow_release=False):
     prefix = ET.parse("Directory.Build.props").findtext(".//VersionPrefix")
     if not prefix or not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", prefix):
         raise ValueError("VersionPrefix must be MAJOR.MINOR.PATCH")
@@ -26,9 +26,18 @@ def prepare():
     if request not in ("true", "false"):
         raise ValueError("Publication request must be a boolean")
     event = os.environ["GITHUB_EVENT_NAME"]
-    publish = event == "workflow_dispatch" and request == "true"
-    if request == "true" and not publish:
+    manual = event == "workflow_dispatch" and request == "true"
+    if request == "true" and not manual:
         raise ValueError("Only a manual run can request publication")
+    released = False
+    if allow_release and event == "release":
+        payload = json.loads(Path(os.environ["GITHUB_EVENT_PATH"]).read_text())
+        if payload.get("action") == "published":
+            release = payload.get("release", {})
+            if release.get("draft") is not False or release.get("tag_name") != os.environ["GITHUB_REF_NAME"]:
+                raise ValueError("Published release must match the selected version tag")
+            released = True
+    publish = manual or released
     version = prefix
     tag = ""
     if os.environ["GITHUB_REF_TYPE"] == "tag":
@@ -110,8 +119,12 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("command", choices=("prepare", "publish-native"))
     parser.add_argument("--assets", default="release-assets")
+    parser.add_argument("--allow-release", action="store_true",
+                        help="Allow published GitHub releases to publish Docker images")
     args = parser.parse_args()
-    values = prepare()
+    if args.allow_release and args.command != "prepare":
+        raise ValueError("Automatic release publication is only supported for Docker images")
+    values = prepare(allow_release=args.allow_release)
     if args.command == "publish-native":
         publish_native(values, args.assets)
     else:

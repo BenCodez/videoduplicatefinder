@@ -70,9 +70,12 @@ class PublicationTests(unittest.TestCase):
     def git(self, *args):
         return subprocess.check_output(["git", *args], cwd=self.root, text=True)
 
-    def run_helper(self, command="prepare", **changes):
+    def run_helper(self, command="prepare", allow_release=False, **changes):
         self.output.unlink(missing_ok=True)
-        result = subprocess.run([sys.executable, str(SCRIPT), command], cwd=self.root,
+        args = [sys.executable, str(SCRIPT), command]
+        if allow_release:
+            args.append("--allow-release")
+        result = subprocess.run(args, cwd=self.root,
                                 env=dict(self.env, **changes), capture_output=True, text=True)
         values = dict(line.split("=", 1) for line in self.output.read_text().splitlines()) if self.output.exists() else {}
         return result, values
@@ -80,6 +83,13 @@ class PublicationTests(unittest.TestCase):
     def publication(self):
         return dict(GITHUB_EVENT_NAME="workflow_dispatch", GITHUB_REF_TYPE="tag",
                     GITHUB_REF_NAME=TAG, REQUEST_PUBLISH="true")
+
+    def release_publication(self, **release_changes):
+        payload = self.root / "release-event.json"
+        payload.write_text(json.dumps({"action": "published", "release": {
+            "tag_name": TAG, "draft": False, "prerelease": False, **release_changes}}))
+        return dict(GITHUB_EVENT_NAME="release", GITHUB_EVENT_PATH=str(payload),
+                    GITHUB_REF_TYPE="tag", GITHUB_REF_NAME=TAG, REQUEST_PUBLISH="false")
 
     def commands(self):
         return [json.loads(line) for line in self.log.read_text().splitlines()] if self.log.exists() else []
@@ -109,7 +119,7 @@ class PublicationTests(unittest.TestCase):
         for event in ("push", "pull_request", "workflow_dispatch"):
             for ref_type, ref_name in (("branch", "master"), ("tag", TAG)):
                 with self.subTest(event=event, ref=ref_type):
-                    result, values = self.run_helper(GITHUB_EVENT_NAME=event, GITHUB_REF_TYPE=ref_type, GITHUB_REF_NAME=ref_name)
+                    result, values = self.run_helper(allow_release=True, GITHUB_EVENT_NAME=event, GITHUB_REF_TYPE=ref_type, GITHUB_REF_NAME=ref_name)
                     self.assertEqual(result.returncode, 0, result.stderr)
                     self.assertEqual(values["publish"], "false")
                     self.assertEqual(values["image"], "ghcr.io/bencodez/vdf-web")
@@ -124,6 +134,50 @@ class PublicationTests(unittest.TestCase):
         self.assertEqual(values["publish"], "true")
         self.assertEqual(values["tag"], TAG)
         self.assertEqual(values["sha"], self.sha)
+
+    def test_published_release_requires_docker_opt_in_and_matches_exact_source(self):
+        for prerelease in (False, True):
+            event = self.release_publication(prerelease=prerelease)
+            result, values = self.run_helper(**event)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(values["publish"], "false")
+            result, values = self.run_helper(allow_release=True, **event)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(values["publish"], "true")
+            self.assertEqual(values["sha"], self.sha)
+            self.assertEqual(values["version"], VERSION)
+            result, _ = self.run_helper("publish-native", **event)
+            self.assertNotEqual(result.returncode, 0)
+            result, _ = self.run_helper("publish-native", allow_release=True, **event)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(self.commands(), [])
+
+    def test_draft_mismatched_or_nonversion_release_cannot_publish(self):
+        for release in ({"draft": True}, {"draft": None}, {"tag_name": "different"}):
+            result, values = self.run_helper(allow_release=True, **self.release_publication(**release))
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(values, {})
+        for changes in ({"GITHUB_REF_TYPE": "branch"}, {"GITHUB_REF_NAME": "latest"},
+                        {"GITHUB_REPOSITORY": "example/fork"}, {"GITHUB_SHA": "0" * 40}):
+            result, values = self.run_helper(allow_release=True, **(self.release_publication() | changes))
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(values, {})
+        self.assertEqual(self.commands(), [])
+
+    def test_other_release_events_and_malformed_payload_do_not_publish(self):
+        event = self.release_publication()
+        payload = Path(event["GITHUB_EVENT_PATH"])
+        for action in ("created", "edited", "deleted", "unpublished"):
+            payload.write_text(json.dumps({"action": action}))
+            result, values = self.run_helper(allow_release=True, **event)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(values["publish"], "false")
+        for content in ("invalid", "[]", '{"action":"published"}', '{"action":"published","release":null}'):
+            payload.write_text(content)
+            result, values = self.run_helper(allow_release=True, **event)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(values, {})
+        self.assertEqual(self.commands(), [])
 
     def test_annotated_tag_is_accepted(self):
         self.git("tag", "-d", TAG)
@@ -261,12 +315,31 @@ class PublicationTests(unittest.TestCase):
             artifact.parent.mkdir(parents=True, exist_ok=True)
             artifact.write_bytes(gzip.compress(f"synthetic image:{arch}".encode()))
 
-    def run_web_consumer(self, **changes):
-        result, values = self.run_helper(**self.publication())
+    def run_web_consumer(self, publication=None, **changes):
+        event_context = self.publication() if publication is None else publication
+        result, values = self.run_helper(allow_release=True, **event_context)
         self.assertEqual(result.returncode, 0, result.stderr)
         step = workflow("docker")["jobs"]["publish"]["steps"][-1]
         return subprocess.run(["bash", "-c", step["run"]], cwd=self.root, capture_output=True,
-                              env=dict(self.env | self.publication() | changes, IMAGE=values["image"], VERSION=values["version"], SOURCE_SHA=values["sha"]))
+                              env=dict(self.env | event_context | changes, IMAGE=values["image"], VERSION=values["version"], SOURCE_SHA=values["sha"]))
+
+    def test_published_release_runs_real_web_consumer_for_both_architectures(self):
+        self.web_artifacts()
+        result = self.run_web_consumer(publication=self.release_publication())
+        self.assertEqual(result.returncode, 0, result.stderr)
+        commands = self.commands()
+        self.assertEqual(sum(row[0] == "push" for row in commands), 2)
+        self.assertEqual(commands[-1][0:3], ["buildx", "imagetools", "create"])
+        self.assertIn(f"ghcr.io/bencodez/vdf-web:{VERSION}", commands[-1])
+        self.assertFalse(any("latest" in arg for row in commands for arg in row))
+
+    def test_release_tag_move_during_upload_blocks_manifest(self):
+        origin, next_sha = self.independent_origin()
+        self.web_artifacts()
+        result = self.run_web_consumer(publication=self.release_publication(), CHANGE_TAG_AFTER_PUSH="arm64",
+                                       FIXTURE_ORIGIN=str(origin), FIXTURE_TAG=TAG, FIXTURE_NEXT_SHA=next_sha)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(any(row[:2] == ["buildx", "imagetools"] for row in self.commands()))
 
     def test_web_final_consumer_publishes_both_validated_images_with_lowercase_tags(self):
         self.web_artifacts()
@@ -310,7 +383,7 @@ class PublicationTests(unittest.TestCase):
 
 
 class WorkflowAuthorizationTests(unittest.TestCase):
-    def test_only_manual_publisher_jobs_have_write_permission(self):
+    def test_only_authorized_publisher_jobs_have_write_permission(self):
         for name, publisher, permission in (("releases", "publish-release", "contents"), ("docker", "publish", "packages")):
             with self.subTest(workflow=name):
                 data = workflow(name)
@@ -323,11 +396,23 @@ class WorkflowAuthorizationTests(unittest.TestCase):
                     self.assertEqual(writes, [permission] if key == publisher else [])
                 job = data["jobs"][publisher]
                 self.assertEqual(job["needs"], ["prepare", "build"])
-                self.assertEqual(job["if"], "github.event_name == 'workflow_dispatch' && inputs.publish && needs.prepare.outputs.publish == 'true'")
+                expected = "needs.prepare.outputs.publish == 'true'" if name == "docker" else "github.event_name == 'workflow_dispatch' && inputs.publish && needs.prepare.outputs.publish == 'true'"
+                self.assertEqual(job["if"], expected)
                 # No always()/failure() override: Actions' implicit success() blocks
                 # publication when any architecture is failed, skipped or cancelled.
                 self.assertNotIn("always(", job["if"])
                 self.assertNotIn("failure(", job["if"])
+
+    def test_only_docker_opts_into_published_release_events(self):
+        data = workflow("docker")
+        self.assertEqual(data["on"]["release"]["types"], ["published"])
+        self.assertNotIn("release", workflow("releases")["on"])
+        for job in ("prepare", "publish"):
+            helpers = [s["run"] for s in data["jobs"][job]["steps"] if "publication.py" in s.get("run", "")]
+            self.assertTrue(helpers)
+            for script in helpers:
+                calls = [line for line in script.splitlines() if "publication.py" in line]
+                self.assertTrue(all(line.endswith("prepare --allow-release") for line in calls))
 
     def test_builders_do_not_log_in_or_publish(self):
         for name in ("releases", "docker"):

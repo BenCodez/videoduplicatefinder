@@ -69,9 +69,19 @@ an ephemeral loopback port mapped to container port 8080, and removes its contai
 and files on completion. Run it with a local Docker daemon, since bind mounts must
 refer to the same filesystem as the Python process.
 
-Publication remains a separate, manually requested version-tag operation. Runtime
-validation must pass for both architectures before an existing publication job can
-export/publish the validated images. Automatic checks never push images, and the
+Publishing a GitHub release for a numeric version tag (for example `v4.1.1`)
+automatically runs the Docker workflow and publishes
+`ghcr.io/bencodez/vdf-web:4.1.1`. The tag's major/minor version must match
+`VersionPrefix` in `Directory.Build.props`. Branch pushes, tag pushes and pull
+requests only validate; they do not publish images. Draft releases do not
+trigger publication. The release
+tag must include this workflow change, so publishing an older tag does not add
+the new behavior to that tag.
+
+The manual fallback remains **Actions → Docker (Web UI) → Run workflow**:
+select the version tag and enable **Publish versioned images**. Runtime
+validation must pass for both architectures before the publication job can
+publish the validated images. Ordinary validation runs never push images, and the
 workflow does not publish a `latest` tag.
 
 CI supplies the exact checkout SHA and repository URL as OCI image labels and
