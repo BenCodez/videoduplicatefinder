@@ -36,9 +36,11 @@ public sealed class AutomationPageTests : BunitContext {
         Directory.Delete(folder, recursive: true);
     }
 
-    IRenderedComponent<Automation> RenderPage() {
+    async Task<IRenderedComponent<Automation>> RenderPageAsync() {
         var page = Render<Automation>();
-        page.WaitForAssertion(() => {
+        // Initialization performs durable journal IO. Yield the test thread
+        // while the renderer completes it, rather than blocking its continuations.
+        await page.WaitForAssertionAsync(() => {
             Assert.Contains("Saved automation settings loaded", page.Markup);
             Assert.False(Button(page, "Save automation settings").HasAttribute("disabled"));
         });
@@ -47,7 +49,7 @@ public sealed class AutomationPageTests : BunitContext {
 
     [Fact]
     public async Task LocalDraftDoesNotChangeDurableSelectionOrProtectionUntilSaved() {
-        var page = RenderPage();
+        var page = await RenderPageAsync();
         await ChangeCheckboxAsync(page, "Automatically prepare selection after scans", true);
         await ChangeCheckboxAsync(page, "Enable local NFO protection", true);
 
@@ -58,7 +60,7 @@ public sealed class AutomationPageTests : BunitContext {
         Assert.True(Button(page, "Preview saved selection").HasAttribute("disabled"));
 
         await ClickAsync(page, "Save automation settings");
-        page.WaitForAssertion(() => Assert.Contains("Automation settings saved.", page.Markup));
+        await page.WaitForAssertionAsync(() => Assert.Contains("Automation settings saved.", page.Markup));
         var saved = await store.LoadAsync();
         Assert.True(saved.Selection.AutoAfterScan);
         Assert.True(saved.Nfo.Enabled);
@@ -66,20 +68,20 @@ public sealed class AutomationPageTests : BunitContext {
 
     [Fact]
     public async Task StaleSaveKeepsDraftAndShowsConflictUntilExplicitReload() {
-        var page = RenderPage();
+        var page = await RenderPageAsync();
         await ChangeCheckboxAsync(page, "Automatically prepare selection after scans", true);
         var concurrent = await store.LoadAsync();
         concurrent.Nfo.Enabled = true;
         await store.SaveAsync(concurrent, folder);
 
         await ClickAsync(page, "Save automation settings");
-        page.WaitForAssertion(() => Assert.Contains("Newer Web automation settings were saved", page.Find("[role='alert']").TextContent));
+        await page.WaitForAssertionAsync(() => Assert.Contains("Newer Web automation settings were saved", page.Find("[role='alert']").TextContent));
         Assert.True(Input(page, "Automatically prepare selection after scans").IsChecked());
         Assert.False(Input(page, "Enable local NFO protection").IsChecked());
         Assert.False((await store.LoadAsync()).Selection.AutoAfterScan);
 
         await ClickAsync(page, "Reload saved settings");
-        page.WaitForAssertion(() => {
+        await page.WaitForAssertionAsync(() => {
             Assert.Empty(page.FindAll("[role='alert']"));
             Assert.False(Input(page, "Automatically prepare selection after scans").IsChecked());
             Assert.True(Input(page, "Enable local NFO protection").IsChecked());
@@ -88,13 +90,13 @@ public sealed class AutomationPageTests : BunitContext {
 
     [Fact]
     public async Task NamedProfilePreservesSelectionSnapshotWhileDraftChanges() {
-        var page = RenderPage();
+        var page = await RenderPageAsync();
         await page.InvokeAsync(() => Input(page, "Profile name").ChangeAsync("Archive"));
         await ClickAsync(page, "Save current selection as named profile");
         var preferences = page.FindAll("label").Single(label => label.TextContent.Contains("Preferred codecs"));
         await page.InvokeAsync(() => preferences.QuerySelector("textarea")!.ChangeAsync("av1\nhevc"));
         await ClickAsync(page, "Save automation settings");
-        page.WaitForAssertion(() => Assert.Contains("Automation settings saved.", page.Markup));
+        await page.WaitForAssertionAsync(() => Assert.Contains("Automation settings saved.", page.Markup));
 
         var saved = await store.LoadAsync();
         Assert.Equal(new[] { "av1", "hevc" }, saved.Selection.PreferredCodecs);
@@ -114,17 +116,17 @@ public sealed class AutomationPageTests : BunitContext {
         var candidateA = plan.Decisions.Single(decision => decision.GroupId == groupA && decision.RemoveCandidate).Path;
         var candidateB = plan.Decisions.Single(decision => decision.GroupId == groupB && decision.RemoveCandidate).Path;
         var page = Render<Results>();
-        page.WaitForAssertion(() => Assert.Equal(2, page.FindAll(".dup-card.selected").Count));
+        await page.WaitForAssertionAsync(() => Assert.Equal(2, page.FindAll(".dup-card.selected").Count));
 
         // Deliberately deselect/reselect B so its checkbox belongs to the user.
         await page.InvokeAsync(() => Card(page, candidateB).QuerySelector(".card-check input")!.ChangeAsync(false));
-        page.WaitForAssertion(() => Assert.False(Card(page, candidateB).ClassList.Contains("selected")));
+        await page.WaitForAssertionAsync(() => Assert.False(Card(page, candidateB).ClassList.Contains("selected")));
         await page.InvokeAsync(() => Card(page, candidateB).QuerySelector(".card-check input")!.ChangeAsync(true));
-        page.WaitForAssertion(() => Assert.True(Card(page, candidateB).ClassList.Contains("selected")));
+        await page.WaitForAssertionAsync(() => Assert.True(Card(page, candidateB).ClassList.Contains("selected")));
 
         var row = (await scan.GetReviewRowsAsync()).Single(row => row.Item.Path == candidateA);
         await scan.SetReviewAsync(row.Item, ReviewChoice.Keep, true, row.Revision);
-        page.WaitForAssertion(() => {
+        await page.WaitForAssertionAsync(() => {
             Assert.False(Card(page, candidateA).ClassList.Contains("selected"));
             Assert.True(Card(page, candidateB).ClassList.Contains("selected"));
         });
@@ -150,7 +152,7 @@ public sealed class AutomationPageTests : BunitContext {
         // bUnit's synchronous event helpers can return while dispatch is still
         // queued. Await the renderer event before querying/sending the next one.
         await page.InvokeAsync(() => Input(page, labelText).ChangeAsync(value));
-        page.WaitForAssertion(() => Assert.Equal(value, Input(page, labelText).IsChecked()));
+        await page.WaitForAssertionAsync(() => Assert.Equal(value, Input(page, labelText).IsChecked()));
     }
 
     [Fact]
@@ -165,17 +167,17 @@ public sealed class AutomationPageTests : BunitContext {
             scan.Engine.Duplicates.Add(item);
         }
         scan.CaptureCleanupSnapshots(folder);
-        var first = RenderPage();
-        var second = RenderPage();
+        var first = await RenderPageAsync();
+        var second = await RenderPageAsync();
         var panel = first.FindAll(".action-panel").Single(element => element.TextContent.Contains(rows[0].Path));
         var keep = panel.QuerySelectorAll("button").Single(element => element.TextContent.Trim() == "Keep");
         await first.InvokeAsync(() => keep.ClickAsync(new MouseEventArgs()));
-        first.WaitForAssertion(() => Assert.Contains("Review decision saved.", first.Markup));
-        first.WaitForAssertion(() => Assert.Contains("Review: Keep.", first.Markup));
-        second.WaitForAssertion(() => Assert.Contains("Review: Keep.", second.Markup));
+        await first.WaitForAssertionAsync(() => Assert.Contains("Review decision saved.", first.Markup));
+        await first.WaitForAssertionAsync(() => Assert.Contains("Review: Keep.", first.Markup));
+        await second.WaitForAssertionAsync(() => Assert.Contains("Review: Keep.", second.Markup));
         Assert.Empty(first.FindAll("[role='alert']"));
         Assert.Empty(second.FindAll("[role='alert']"));
-        first.WaitForAssertion(() => Assert.False(scan.IsBusy));
+        await first.WaitForAssertionAsync(() => Assert.False(scan.IsBusy));
         int notifications = 0;
         scan.StateChanged += Count;
         try {

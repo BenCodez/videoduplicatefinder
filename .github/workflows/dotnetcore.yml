@@ -39,6 +39,14 @@ jobs:
       run: dotnet test VDF.GUI.HeadlessTests/VDF.GUI.HeadlessTests.csproj -c Release -v q --logger "console;verbosity=normal"
     - name: Run Web Tests
       run: dotnet test VDF.Web.Tests/VDF.Web.Tests.csproj -c Release -v q --logger "console;verbosity=normal"
+    - name: Repeat asynchronous Web automation controls
+      shell: pwsh
+      run: |
+        for ($iteration = 1; $iteration -le 10; $iteration++) {
+          Write-Host "Web automation controls iteration $iteration of 10"
+          dotnet test VDF.Web.Tests/VDF.Web.Tests.csproj -c Release --no-build --no-restore --filter "FullyQualifiedName~AutomationPageTests" --logger "console;verbosity=normal"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+        }
     - name: Run Integration Tests
       run: dotnet test VDF.IntegrationTests/VDF.IntegrationTests.csproj -c Release -v normal
     - name: Repeat hardlink and final authority regressions
