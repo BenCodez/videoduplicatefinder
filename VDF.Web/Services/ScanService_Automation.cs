@@ -211,6 +211,7 @@ public sealed partial class ScanService {
     internal async Task SaveSelectionPlanForSessionAsync(string folder, SelectionPlan plan) {
         string path = Path.Combine(folder, "SelectionPlan.json");
         using var lease = JournalWriteLease.Acquire(path);
+        await RequireSupportedJournalCopiesAsync(path, "selection preview");
         try {
             await SelectionPlanStore.SaveAsync(path, plan);
             SelectionPersistenceWarning = null;
@@ -346,21 +347,22 @@ public sealed partial class ScanService {
     async Task PersistResultsAsync() {
         if (_resultStateFolder is null || _runAutomation is null && !File.Exists(AutomationStore.Path)) return;
         bool saved = await SaveResultsAsync(_resultStateFolder, Duplicates.Select(item => new WebSavedResult {
-            Item = item, Snapshot = _resultSnapshots.GetValueOrDefault(item) }).ToList(), allowSizeFallback: true);
+            Item = item, Snapshot = _resultSnapshots.GetValueOrDefault(item) }).ToList(), allowSizeFallback: true, completed: true);
         ResultsPersistenceWarning = saved ? null : "These results exceed the 32 MiB save limit. They are available only until the service restarts; run a new scan after restarting to recreate the results.";
     }
-    static async Task<bool> SaveResultsAsync(string folder, List<WebSavedResult> rows, bool allowSizeFallback = false) {
+    static async Task<bool> SaveResultsAsync(string folder, List<WebSavedResult> rows, bool allowSizeFallback = false, bool completed = false) {
         string path = Path.Combine(folder, "WebResults.json");
         using var lease = JournalWriteLease.Acquire(path);
+        await RequireSupportedJournalCopiesAsync(path);
         try {
-            await DurableJsonFile.WriteAsync(path, new WebResultsEnvelope { Rows = rows },
+            await DurableJsonFile.WriteAsync(path, new WebResultsEnvelope { Rows = rows, Completed = completed },
                 WebAutomationJsonContext.Default.WebResultsEnvelope, ValidateResults);
             return true;
         }
         catch (InvalidDataException ex) when (allowSizeFallback && IsJournalSizeLimit(ex)) {
             // Keep the writer lease through the fallback. Preserve complete
             // in-memory results; restart must not revive an older generation.
-            await DurableJsonFile.WriteAsync(path, new WebResultsEnvelope(),
+            await DurableJsonFile.WriteAsync(path, new WebResultsEnvelope { Completed = false },
                 WebAutomationJsonContext.Default.WebResultsEnvelope, ValidateResults);
             return false;
         }
@@ -398,11 +400,30 @@ public sealed partial class ScanService {
         try { await PersistResultsAsync(); }
         catch (Exception ex) { result.Errors.Add("File operations completed, but saving the results failed: " + ex.Message); }
     }
-    static bool ValidateResults(WebResultsEnvelope value) => value.Version == 1 && value.Rows is not null &&
-        value.Rows.Count <= 1_000_000 && value.Rows.All(r => r is not null && r.Item is not null &&
+    static void RequireJournalVersion(int version, string journal = "Web results") {
+        if (version != 1) throw new NotSupportedException($"The {journal} schema is unsupported; the files were preserved.");
+    }
+    static async Task RequireSupportedJournalCopiesAsync(string path, string journal = "Web results") {
+        // Check both copies before typed row parsing can mistake a future
+        // payload for recoverable corruption. Unreadable version headers are preserved
+        // for explicit recovery rather than overwritten during a new scan.
+        foreach (string suffix in new[] { "", ".bak" }) {
+            try {
+                await DurableJsonFile.ReadPrimaryAsync(path + suffix, WebAutomationJsonContext.Default.WebJournalVersion,
+                    version => { RequireJournalVersion(version.Version, journal); return true; });
+            }
+            catch (JsonException ex) {
+                throw new InvalidDataException("The journal version header is unreadable; the files were preserved.", ex);
+            }
+        }
+    }
+    static bool ValidateResults(WebResultsEnvelope value) {
+        RequireJournalVersion(value.Version);
+        return value.Rows is not null && value.Rows.Count <= 1_000_000 && value.Rows.All(r => r is not null && r.Item is not null &&
             Path.IsPathFullyQualified(r.Item.Path) && r.Item.GroupId != Guid.Empty &&
             (r.Snapshot is null || PathComparer.ForCurrentPlatform.Equals(r.Snapshot.Path, r.Item.Path))) &&
         value.Rows.Select(r => r.Item.Path).Distinct(PathComparer.ForCurrentPlatform).Count() == value.Rows.Count;
+    }
 
     public async Task InitializeWebAutomationAsync() {
         ReserveAutomationWork();
@@ -416,13 +437,15 @@ public sealed partial class ScanService {
             // authorize saving restored results back into that database.
             if (!await LoadDatabaseWithResultsAuthorityAsync(folder))
                 throw new IOException("The saved results database could not be loaded. Restore it before using saved results.");
-            var saved = await DurableJsonFile.ReadPrimaryAsync(Path.Combine(folder, "WebResults.json"),
+            string resultsPath = Path.Combine(folder, "WebResults.json");
+            await RequireSupportedJournalCopiesAsync(resultsPath);
+            var saved = await DurableJsonFile.ReadPrimaryAsync(resultsPath,
                 WebAutomationJsonContext.Default.WebResultsEnvelope, ValidateResults);
             if (saved is not null) {
                 _engine.Duplicates = saved.Rows.Select(r => r.Item).ToHashSet();
                 _resultSnapshots = saved.Rows.Where(r => r.Snapshot is not null).ToDictionary(r => r.Item, r => r.Snapshot!);
                 _resultStateFolder = folder;
-                State = ScanState.Done;
+                State = saved.Completed == true || saved.Completed is null && saved.Rows.Count > 0 ? ScanState.Done : ScanState.Idle;
                 LastSelectionPlan = await SelectionPlanStore.LoadAsync(Path.Combine(folder, "SelectionPlan.json"));
                 if (LastSelectionPlan is not null) {
                     // An explanation saved before a later manual review is not

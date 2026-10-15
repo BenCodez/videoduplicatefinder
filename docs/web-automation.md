@@ -75,6 +75,10 @@ After a restart, an abandoned scheduled run is marked **Interrupted** while its
 claimed slot remains recorded, so that slot is not repeated. A live cooperating
 process keeps its run status. Preserve the persistent lock files, including
 `WebSchedule.run.lock`; do not remove them while an instance is running.
+Saved results record whether the scan completed, including scans with no
+duplicates. A reset or an interrupted replacement scan restores the Scan page
+as idle. Older empty snapshots without completion metadata also restore as idle;
+older nonempty snapshots continue to restore as completed results.
 
 For an upgrade, stop the old container and make copies of both persistent mounts.
 Test the new image with those copies, another port and read-only media. Keep the

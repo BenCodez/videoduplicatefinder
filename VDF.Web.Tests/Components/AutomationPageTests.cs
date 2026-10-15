@@ -104,7 +104,13 @@ public sealed class AutomationPageTests : BunitContext {
             Assert.Contains("role=\"alert\"", markup);
         }
         await scan.RemoveFromResultsAsync([]);
-        await automation.WaitForAssertionAsync(() => Assert.DoesNotContain("32 MiB save limit", automation.Markup), JournalIoTimeout);
+        await automation.WaitForAssertionAsync(() => {
+            Assert.DoesNotContain("32 MiB save limit", automation.Markup);
+            // Warning rendering can precede the asynchronous view refresh.
+            // Let its journal IO finish before fixture teardown removes state.
+            Assert.False(Button(automation, "Save automation settings").HasAttribute("disabled"));
+            Assert.False(scan.IsBusy);
+        }, JournalIoTimeout);
         await results.WaitForAssertionAsync(() => Assert.DoesNotContain("32 MiB save limit", results.Markup), JournalIoTimeout);
         await index.WaitForAssertionAsync(() => Assert.DoesNotContain("32 MiB save limit", index.Markup), JournalIoTimeout);
     }

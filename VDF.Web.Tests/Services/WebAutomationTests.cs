@@ -316,6 +316,7 @@ public sealed class WebAutomationTests : IAsyncLifetime {
             using var restarted = NewService();
             await restarted.InitializeWebAutomationAsync();
             Assert.Empty(restarted.Duplicates);
+            Assert.Equal(ScanState.Idle, restarted.State);
             Assert.All(previousPaths, path => Assert.True(File.Exists(path)));
         }
         finally {
@@ -470,6 +471,136 @@ public sealed class WebAutomationTests : IAsyncLifetime {
         Assert.All(scan.Duplicates, item => Assert.True(File.Exists(item.Path)));
     }
 
+    [Theory]
+    [InlineData(false, false, "same")]
+    [InlineData(true, false, "same")]
+    [InlineData(false, true, "same")]
+    [InlineData(true, true, "same")]
+    [InlineData(false, false, "renamed")]
+    [InlineData(true, false, "renamed")]
+    [InlineData(false, true, "renamed")]
+    [InlineData(true, true, "renamed")]
+    [InlineData(false, false, "changed")]
+    [InlineData(true, false, "changed")]
+    [InlineData(false, true, "changed")]
+    [InlineData(true, true, "changed")]
+    public async Task FutureResultsSchemaIsPreservedEvenWithValidOlderCopy(bool duringCompletion, bool futureBackup, string shape) {
+        Seed("future-a.mp4"); Seed("future-b.mp4"); Anchor();
+        ScanEngine.SaveDatabase();
+        await scan.RemoveFromResultsAsync([]);
+        scan.PrepareScanAsync = (_, _) => Task.CompletedTask;
+        int started = 0;
+        scan.StartSearchOverride = () => { started++; Seed("new-a.mp4"); Seed("new-b.mp4"); };
+        if (duringCompletion) await scan.StartScanAndCompare();
+        string path = Path.Combine(folder, "WebResults.json");
+        WriteFutureResultsCopy(path, futureBackup, shape);
+        byte[] primary = File.ReadAllBytes(path), backup = File.ReadAllBytes(path + ".bak");
+        if (duringCompletion) await scan.CompleteWebScanAsync(false);
+        else await scan.StartScanAndCompare();
+        Assert.Equal(ScanState.Error, scan.State);
+        Assert.Contains("unsupported", scan.ErrorMessage);
+        Assert.Equal(duringCompletion ? 1 : 0, started);
+        Assert.Equal(2, scan.Duplicates.Count);
+        Assert.Equal(primary, File.ReadAllBytes(path));
+        Assert.Equal(backup, File.ReadAllBytes(path + ".bak"));
+        Assert.Null(scan.ResultsPersistenceWarning);
+        Assert.All(scan.Duplicates, item => Assert.True(File.Exists(item.Path)));
+    }
+
+    static void WriteFutureResultsCopy(string path, bool backup, string shape) {
+        var future = JsonNode.Parse(File.ReadAllText(path))!;
+        future["version"] = 2;
+        if (shape == "renamed") { future["results"] = future["rows"]!.DeepClone(); future.AsObject().Remove("rows"); }
+        if (shape == "changed") future["rows"] = "a future payload format";
+        File.WriteAllText(path + (backup ? ".bak" : ""), future.ToJsonString());
+    }
+
+    [Theory]
+    [InlineData(false, "same")]
+    [InlineData(true, "same")]
+    [InlineData(false, "renamed")]
+    [InlineData(true, "renamed")]
+    [InlineData(false, "changed")]
+    [InlineData(true, "changed")]
+    public async Task FutureResultsCopiesRefuseInitialization(bool backup, string shape) {
+        Seed("future-a.mp4"); Seed("future-b.mp4"); Anchor();
+        ScanEngine.SaveDatabase();
+        await scan.RemoveFromResultsAsync([]);
+        string path = Path.Combine(folder, "WebResults.json");
+        WriteFutureResultsCopy(path, backup, shape);
+        byte[] primary = File.ReadAllBytes(path), previousBackup = File.ReadAllBytes(path + ".bak");
+        using var restarted = NewService();
+        await Assert.ThrowsAsync<NotSupportedException>(() => restarted.InitializeWebAutomationAsync());
+        Assert.Empty(restarted.Duplicates);
+        Assert.Equal(primary, File.ReadAllBytes(path));
+        Assert.Equal(previousBackup, File.ReadAllBytes(path + ".bak"));
+    }
+
+    [Theory]
+    [InlineData(false, "same")]
+    [InlineData(true, "same")]
+    [InlineData(false, "renamed")]
+    [InlineData(true, "renamed")]
+    [InlineData(false, "changed")]
+    [InlineData(true, "changed")]
+    public async Task FuturePreviewCopyIsPreservedBeforeVersionOnePayloadParsing(bool backup, string shape) {
+        Seed("future-a.mp4"); Seed("future-b.mp4"); Anchor();
+        await scan.PreviewSelectionAsync();
+        string path = Path.Combine(folder, "SelectionPlan.json");
+        var future = JsonNode.Parse(File.ReadAllText(path))!;
+        future["version"] = 2;
+        if (shape == "renamed") { future["preview"] = future["plan"]!.DeepClone(); future.AsObject().Remove("plan"); }
+        if (shape == "changed") future["plan"] = "a future payload format";
+        File.WriteAllText(path + (backup ? ".bak" : ""), future.ToJsonString());
+        byte[] primary = File.ReadAllBytes(path), previousBackup = File.ReadAllBytes(path + ".bak");
+        await Assert.ThrowsAsync<NotSupportedException>(() => scan.PreviewSelectionAsync());
+        Assert.Equal(primary, File.ReadAllBytes(path));
+        Assert.Equal(previousBackup, File.ReadAllBytes(path + ".bak"));
+        Assert.Null(scan.SelectionPersistenceWarning);
+        Assert.All(scan.Duplicates, item => Assert.True(File.Exists(item.Path)));
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task CompletedEmptyScanRestoresAsDone(bool scheduled) {
+        var config = await scan.LoadAutomationAsync();
+        config.Schedule = new() { Enabled = scheduled, Kind = ScanScheduleKind.Interval, IntervalMinutes = 5 };
+        await scan.SaveAutomationAsync(config);
+        scan.PrepareScanAsync = (_, _) => Task.CompletedTask;
+        scan.StartSearchOverride = () => ScanEngine.SaveDatabase();
+        if (scheduled) await scan.CheckScheduleAsync(DateTimeOffset.UtcNow);
+        else await scan.StartScanAndCompare();
+        await scan.CompleteWebScanAsync(false);
+        Assert.Equal(ScanState.Done, scan.State);
+        using var restarted = NewService();
+        await restarted.InitializeWebAutomationAsync();
+        Assert.Equal(ScanState.Done, restarted.State);
+        Assert.Empty(restarted.Duplicates);
+        foreach (string suffix in new[] { "", ".bak" })
+            Assert.True(JsonNode.Parse(File.ReadAllText(Path.Combine(folder, "WebResults.json" + suffix)))!["completed"]!.GetValue<bool>());
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task LegacyResultsRestoreConservativelyWithoutCompletionMetadata(bool populated) {
+        Seed("legacy-a.mp4"); Seed("legacy-b.mp4"); Anchor();
+        ScanEngine.SaveDatabase();
+        await scan.RemoveFromResultsAsync([]);
+        foreach (string suffix in new[] { "", ".bak" }) {
+            string path = Path.Combine(folder, "WebResults.json" + suffix);
+            var saved = JsonNode.Parse(File.ReadAllText(path))!.AsObject();
+            saved.Remove("completed");
+            if (!populated) saved["rows"] = new JsonArray();
+            File.WriteAllText(path, saved.ToJsonString());
+        }
+        using var restarted = NewService();
+        await restarted.InitializeWebAutomationAsync();
+        Assert.Equal(populated ? ScanState.Done : ScanState.Idle, restarted.State);
+        Assert.Equal(populated ? 2 : 0, restarted.Duplicates.Count);
+    }
+
     [Fact]
     public async Task CorruptSelectionPreviewIsPreservedAndStillFails() {
         Seed("preview-a.mp4"); Seed("preview-b.mp4"); Anchor();
@@ -570,6 +701,7 @@ public sealed class WebAutomationTests : IAsyncLifetime {
         using var restarted = NewService();
         await restarted.InitializeWebAutomationAsync();
         Assert.Empty(restarted.Duplicates);
+        Assert.Equal(action == "remove" ? ScanState.Done : ScanState.Idle, restarted.State);
         Assert.Equal(action == "clear" ? 0 : 2, restarted.DatabaseEntryCount);
         Assert.True(File.Exists(a.Path)); Assert.True(File.Exists(b.Path));
     }
