@@ -12,11 +12,19 @@ with open(os.environ["COMMAND_LOG"], "a") as log:
     log.write(json.dumps(args) + "\n")
 with open(os.environ["COMMAND_LOG"] + ".bodies", "a") as log:
     log.write(json.dumps(body) + "\n")
-if "--paginate" in args:
+if args[:3] == ["workflow", "run", "docker.yml"]:
+    if os.environ.get("FAIL_DISPATCH"):
+        sys.exit(1)
+elif "--paginate" in args:
     if os.environ.get("FAIL_LIST"):
         sys.exit(1)
     print(os.environ.get("EXISTING_RELEASES", "[[]]"))
 elif "--method" in args and args[args.index("--method") + 1] == "PATCH":
+    if os.environ.get("FAIL_PUBLISH"):
+        sys.exit(1)
+    if os.environ.get("MOVE_TAG_AFTER_PUBLISH"):
+        subprocess.run(["git", "-C", os.environ["FIXTURE_ORIGIN"], "update-ref",
+                        "refs/tags/" + os.environ["FIXTURE_TAG"], os.environ["FIXTURE_NEXT_SHA"]], check=True)
     print(json.dumps({"id": 753, "draft": False}))
 elif any(arg.startswith("https://uploads.github.com/") for arg in args):
     asset = Path(args[args.index("--input") + 1])

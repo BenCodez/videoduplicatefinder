@@ -309,6 +309,55 @@ class PublicationTests(unittest.TestCase):
         self.assertEqual(len(self.commands()), 20)
         self.assertFalse(any("PATCH" in command or "DELETE" in command for command in self.commands()))
 
+    def run_native_publication_steps(self, **changes):
+        # Run the actual workflow's publish/dispatch shell in order. Like Actions,
+        # stop after a failed step; the external gh boundary alone is simulated.
+        result = None
+        for step in workflow("releases")["jobs"]["publish-release"]["steps"]:
+            if "run" not in step:
+                continue
+            result = subprocess.run(["bash", "-e", "-c", step["run"]], cwd=self.root,
+                                    capture_output=True, text=True,
+                                    env=self.env | self.publication() | {"VERSION_TAG": TAG} | changes)
+            if result.returncode:
+                break
+        return result
+
+    def test_native_workflow_dispatches_exact_version_only_after_publishing(self):
+        self.packages()
+        result = self.run_native_publication_steps()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        commands = self.commands()
+        self.assertEqual(commands[-2], ["api", "--method", "PATCH",
+                                        "repos/BenCodez/videoduplicatefinder/releases/753", "--input", "-"])
+        self.assertEqual(commands[-1], ["workflow", "run", "docker.yml", "--repo",
+                                        "BenCodez/videoduplicatefinder", "--ref", TAG, "-f", "publish=true"])
+
+    def test_failed_native_publication_never_dispatches_docker(self):
+        self.packages()
+        for failure in ({"FAIL_CREATE": "1"}, {"FAIL_UPLOAD": "Web-osx-arm64.tar.gz"}, {"FAIL_PUBLISH": "1"}):
+            with self.subTest(failure=failure):
+                self.log.unlink(missing_ok=True)
+                result = self.run_native_publication_steps(**failure)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertFalse(any(row[:2] == ["workflow", "run"] for row in self.commands()))
+
+    def test_tag_move_after_native_publication_blocks_dispatch(self):
+        origin, next_sha = self.independent_origin()
+        self.packages()
+        result = self.run_native_publication_steps(MOVE_TAG_AFTER_PUBLISH="1", FIXTURE_ORIGIN=str(origin),
+                                                   FIXTURE_TAG=TAG, FIXTURE_NEXT_SHA=next_sha)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertTrue(any("PATCH" in row for row in self.commands()))
+        self.assertFalse(any(row[:2] == ["workflow", "run"] for row in self.commands()))
+
+    def test_failed_docker_dispatch_is_reported_without_republishing_native_release(self):
+        self.packages()
+        result = self.run_native_publication_steps(FAIL_DISPATCH="1")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(sum(row[:2] == ["workflow", "run"] for row in self.commands()), 1)
+        self.assertEqual(sum("PATCH" in row for row in self.commands()), 1)
+
     def web_artifacts(self):
         for arch in ("amd64", "arm64"):
             artifact = self.root / f"web-images/web-{arch}/web-image.tar.gz"
@@ -393,7 +442,8 @@ class WorkflowAuthorizationTests(unittest.TestCase):
                 self.assertEqual(data["on"]["workflow_dispatch"]["inputs"]["publish"]["default"], "false")
                 for key, job in data["jobs"].items():
                     writes = [p for p, value in job.get("permissions", {}).items() if value == "write"]
-                    self.assertEqual(writes, [permission] if key == publisher else [])
+                    expected_writes = [permission, "actions"] if name == "releases" else [permission]
+                    self.assertEqual(writes, expected_writes if key == publisher else [])
                 job = data["jobs"][publisher]
                 self.assertEqual(job["needs"], ["prepare", "build"])
                 expected = "needs.prepare.outputs.publish == 'true'" if name == "docker" else "github.event_name == 'workflow_dispatch' && inputs.publish && needs.prepare.outputs.publish == 'true'"
@@ -413,6 +463,15 @@ class WorkflowAuthorizationTests(unittest.TestCase):
             for script in helpers:
                 calls = [line for line in script.splitlines() if "publication.py" in line]
                 self.assertTrue(all(line.endswith("prepare --allow-release") for line in calls))
+
+    def test_native_dispatch_is_bound_to_the_published_tag_and_success(self):
+        steps = workflow("releases")["jobs"]["publish-release"]["steps"]
+        self.assertEqual(steps[-2]["name"], "Publish all validated packages")
+        dispatch = steps[-1]
+        self.assertEqual(dispatch["name"], "Dispatch Docker publication")
+        self.assertNotIn("if", dispatch)  # implicit success(); failed releases cannot dispatch
+        self.assertEqual(dispatch["env"]["VERSION_TAG"], "${{ github.ref_name }}")
+        self.assertEqual(dispatch["env"]["GH_TOKEN"], "${{ secrets.GITHUB_TOKEN }}")
 
     def test_builders_do_not_log_in_or_publish(self):
         for name in ("releases", "docker"):

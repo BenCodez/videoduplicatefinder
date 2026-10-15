@@ -84,6 +84,13 @@ validation must pass for both architectures before the publication job can
 publish the validated images. Ordinary validation runs never push images, and the
 workflow does not publish a `latest` tag.
 
+Releases published by **Build releases** explicitly dispatch the same Docker
+workflow after native publication succeeds, because GitHub suppresses release
+events created with `GITHUB_TOKEN`. Only the native publication job receives
+permission to dispatch workflows. A dispatch failure leaves the published
+release intact and fails that step; use the manual Docker fallback for that tag
+instead of trying to recreate the native release.
+
 CI supplies the exact checkout SHA and repository URL as OCI image labels and
 verifies them before running the smoke check. Local builds label the revision
 `unknown` unless built with `--build-arg VDF_SOURCE_REVISION=<commit-sha>`; forks
