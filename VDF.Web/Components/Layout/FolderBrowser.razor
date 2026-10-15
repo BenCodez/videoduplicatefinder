@@ -47,7 +47,7 @@
         </div>
         <div class="folder-footer">
             <span class="folder-selected" title="@_currentPath">@(_currentPath ?? "No folder selected")</span>
-            <button class="primary" @onclick="SelectCurrent" disabled="@(string.IsNullOrEmpty(_currentPath) || _error is not null)">Select</button>
+            <button class="primary" @onclick="SelectCurrent" disabled="@string.IsNullOrEmpty(_currentPath)">Select</button>
             <button @onclick="Close">Cancel</button>
         </div>
     </div>

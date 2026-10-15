@@ -43,6 +43,26 @@ public sealed class FolderBrowserTests : BunitContext {
         Assert.Contains("Directory not found", page.Markup);
     }
 
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task TypedPathCanRecoverFromNavigationOrSelectionErrorWithoutPressingGo(bool selectInvalidPath) {
+        string? selected = null;
+        var page = Render<FolderBrowser>(p => p
+            .Add(c => c.OnFolderSelected, EventCallback.Factory.Create<string>(this, path => selected = path)));
+        await page.InvokeAsync(() => page.Instance.Open(root));
+        await page.Find(".folder-path-bar input").InputAsync(Path.Combine(root, "missing"));
+        var action = selectInvalidPath ? page.Find(".folder-footer .primary") : page.FindAll(".folder-path-bar button").Last();
+        await action.ClickAsync(new MouseEventArgs());
+        Assert.Null(selected);
+        Assert.Contains("Directory not found", page.Markup);
+        await page.Find(".folder-path-bar input").InputAsync(root);
+        Assert.False(page.Find(".folder-footer .primary").HasAttribute("disabled"));
+        await page.Find(".folder-footer .primary").ClickAsync(new MouseEventArgs());
+        Assert.Equal(root, selected);
+        Assert.Empty(page.FindAll(".folder-browser"));
+    }
+
     [Fact]
     public async Task ExistingBrowserWithoutScanPathsStillOpensAndNavigates() {
         var child = Directory.CreateDirectory(Path.Combine(root, "child")).FullName;
