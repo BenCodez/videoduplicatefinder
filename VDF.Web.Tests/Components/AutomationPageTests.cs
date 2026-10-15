@@ -206,6 +206,36 @@ public sealed class AutomationPageTests : BunitContext {
         }, JournalIoTimeout);
         Assert.Equal(2, scan.Duplicates.Count);
         Assert.Equal(unsupported, await File.ReadAllTextAsync(resultsPath));
+        await next.FindAll("button").Single(b => b.TextContent == "Dismiss recovery message").ClickAsync(new MouseEventArgs());
+        Assert.Null(scan.RecoveryError);
+        Assert.Empty(next.FindAll("[role='alert']"));
+        Assert.Equal(2, scan.Duplicates.Count);
+    }
+
+    [Fact]
+    public async Task StartingReplacementScanClearsThePreviousDiscardNotice() {
+        scan.Settings.IncludeList.Add(folder);
+        Assert.True(scan.SaveSettings());
+        scan.RequestDiscardResults();
+        var recovery = Render<VDF.Web.Components.Layout.ScanRecovery>();
+        await recovery.WaitForAssertionAsync(() => Assert.Contains("Scan results discarded", recovery.Markup), JournalIoTimeout);
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        scan.PrepareScanAsync = async (_, token) => { entered.SetResult(); await release.Task; token.ThrowIfCancellationRequested(); };
+        scan.StartSearchOverride = () => throw new IOException("Synthetic completion failure");
+        var start = scan.StartScanAndCompare();
+        try {
+            await entered.Task.WaitAsync(JournalIoTimeout);
+            await recovery.WaitForAssertionAsync(() => {
+                Assert.DoesNotContain("Scan results discarded", recovery.Markup);
+                Assert.Null(scan.RecoveryStatus);
+                Assert.Null(scan.RecoveryError);
+            }, JournalIoTimeout);
+            release.SetResult();
+            await start.WaitAsync(JournalIoTimeout);
+            Assert.DoesNotContain("Scan results discarded", recovery.Markup);
+        }
+        finally { release.TrySetResult(); await start.WaitAsync(JournalIoTimeout); }
     }
 
     [Fact]

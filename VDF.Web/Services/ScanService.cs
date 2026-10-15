@@ -120,6 +120,7 @@ namespace VDF.Web.Services {
 		async Task<string?> StartWebScanAsync(bool scheduled, DateTimeOffset now) {
 			lock (_operationSync) {
 				if (_disposed || WorkActiveLocked) return null;
+				ClearRecoveryMessagesLocked();
 				_scanStarting = true;
 				_scanRunActive = true;
 				_cts.Dispose();
@@ -279,6 +280,7 @@ namespace VDF.Web.Services {
 					return false;
 				}
 				FileOpRunning = true;
+				ClearRecoveryMessagesLocked();
 				FileOpVerb = verb;
 				FileOpCurrent = 0;
 				FileOpMax = max;

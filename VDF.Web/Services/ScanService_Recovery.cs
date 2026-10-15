@@ -10,6 +10,15 @@ public sealed partial class ScanService {
     public string? RecoveryStatus { get { lock (_operationSync) return _recoveryStatus; } }
     public string? RecoveryError { get { lock (_operationSync) return _recoveryError; } }
 
+    void ClearRecoveryMessagesLocked() => _recoveryStatus = _recoveryError = null;
+    public void DismissRecoveryMessages() {
+        lock (_operationSync) {
+            if (_pendingDiscard is not null) return;
+            ClearRecoveryMessagesLocked();
+        }
+        Notify();
+    }
+
     public void RequestDiscardResults() {
         DiscardRequest request;
         lock (_operationSync) {

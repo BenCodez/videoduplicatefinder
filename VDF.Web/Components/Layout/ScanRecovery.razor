@@ -24,6 +24,9 @@
     }
     @if (Scan.RecoveryStatus is { } status) { <p role="status">@status</p> }
     @if (Scan.RecoveryError is { } error) { <p role="alert">@error</p> }
+    @if (!Scan.IsDiscardingResults && (Scan.RecoveryStatus is not null || Scan.RecoveryError is not null)) {
+        <button @onclick="Scan.DismissRecoveryMessages">Dismiss recovery message</button>
+    }
     @if (_notice is not null) { <p role="status">@_notice</p> }
     @if (_error is not null) { <p role="alert">@_error</p> }
 </section>
