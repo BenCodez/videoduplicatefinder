@@ -47,6 +47,9 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: docker/setup-buildx-action@v4
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
       - name: Build vdf-web without publishing
         uses: docker/build-push-action@v7
         with:
@@ -56,8 +59,22 @@ jobs:
           push: false
           load: true
           tags: vdf-web:validation
+          build-args: |
+            VDF_SOURCE_REVISION=${{ github.sha }}
+            VDF_SOURCE_URL=${{ github.server_url }}/${{ github.repository }}
           cache-from: type=gha,scope=web-${{ matrix.arch }}
           cache-to: type=gha,mode=max,scope=web-${{ matrix.arch }}
+      - name: Install the browser smoke client
+        run: |
+          python -m pip install -r .github/scripts/web-container-smoke-requirements.txt
+          python -m playwright install --with-deps --only-shell chromium
+      - name: Run the image on its native architecture
+        env:
+          VDF_SOURCE_REVISION: ${{ github.sha }}
+          VDF_SOURCE_URL: ${{ github.server_url }}/${{ github.repository }}
+        run: >-
+          python .github/scripts/web_container_smoke.py --image vdf-web:validation --arch ${{ matrix.arch }}
+          --revision "$VDF_SOURCE_REVISION" --source-url "$VDF_SOURCE_URL"
       - name: Export the validated image
         if: needs.prepare.outputs.publish == 'true'
         run: docker save vdf-web:validation | gzip > web-image.tar.gz

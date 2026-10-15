@@ -11,6 +11,7 @@
 
 <div class="start-row" style="margin-bottom:1rem;margin-top:0;">
     <button class="primary" @onclick="SaveSettings">Save Settings</button>
+    <button @onclick="ReloadSettings" disabled="@Scan.IsBusy">Reload saved settings</button>
     @if (_saveMsg != null) {
         <span class="@(_saveFailed ? "aborted-msg" : "done-msg")" style="margin:0;">@_saveMsg</span>
     }
@@ -446,12 +447,18 @@
 
     void SaveSettings() {
         bool ok = Scan.SaveSettings();
-        _saveMsg = ok ? "Settings saved." : "Failed to save settings.";
+        _saveMsg = ok ? "Settings saved." : "Failed to save settings. Wait for active work, or reload saved settings before reapplying changes.";
         _saveFailed = !ok;
         _ = Task.Delay(3000).ContinueWith(_ => InvokeAsync(() => {
             _saveMsg = null;
             StateHasChanged();
         }));
+    }
+
+    void ReloadSettings() {
+        bool ok = Scan.ReloadSettings();
+        _saveFailed = !ok;
+        _saveMsg = ok ? "Saved settings reloaded. Unsaved scan settings were discarded." : "Saved settings could not be loaded; current values were retained.";
     }
 
     async Task CleanDatabase() {

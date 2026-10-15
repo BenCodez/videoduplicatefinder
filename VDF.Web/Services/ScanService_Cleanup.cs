@@ -227,7 +227,7 @@ public sealed partial class ScanService {
 			result.Failed = requested.Count - result.Done;
 			result.Errors.Add($"Cleanup could not complete; remaining files were retained: {ex.Message}");
 		}
-		finally { EndFileOp(); }
+		finally { await PersistFileOperationResultsAsync(result); EndFileOp(); }
 		return result;
 	}
 

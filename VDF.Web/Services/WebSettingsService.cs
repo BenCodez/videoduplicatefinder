@@ -17,10 +17,15 @@
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using VDF.Core;
+using VDF.Core.Review;
 using VDF.Core.FFTools;
 
 namespace VDF.Web.Services {
 	public sealed class WebSettingsService {
+		readonly object _settingsSync = new();
+		FileIdentity? _observedSettingsIdentity;
+		string? _observedSettingsPath;
+		bool _settingsReadFailed;
 		/// <summary>JSON-serializable mirror of the settings relevant to VDF.Web.</summary>
 		public sealed class Dto {
 			public List<string> IncludeList { get; set; } = new();
@@ -93,7 +98,7 @@ namespace VDF.Web.Services {
 		/// <summary>Test hook: redirects the settings file away from the user's real one.</summary>
 		internal static string? TestOverrideSettingsPath;
 
-		static string SettingsPath {
+		internal static string SettingsPath {
 			get {
 				if (TestOverrideSettingsPath != null) return TestOverrideSettingsPath;
 				string folder;
@@ -109,10 +114,19 @@ namespace VDF.Web.Services {
 		}
 
 		public bool Load(Settings s) {
-			if (!File.Exists(SettingsPath)) return false;
+			lock (_settingsSync) return LoadCore(s);
+		}
+		bool LoadCore(Settings s) {
+			_observedSettingsPath = Path.GetFullPath(SettingsPath);
+			_observedSettingsIdentity = null;
+			_settingsReadFailed = false;
+			if (!File.Exists(SettingsPath)) { _settingsReadFailed = File.Exists(SettingsPath + ".bak"); return false; }
 			try {
+				SafePaths.RequireRegularFile(SettingsPath);
+				if (new FileInfo(SettingsPath).Length > 32L * 1024 * 1024) throw new InvalidDataException("Settings file exceeds the supported limit.");
+				var before = FileIdentity.Capture(SettingsPath) ?? throw new IOException("Settings could not be verified.");
 				var dto = JsonSerializer.Deserialize(File.ReadAllText(SettingsPath), WebJsonContext.Default.Dto);
-				if (dto == null) return false;
+				if (dto == null || !before.MatchesCurrent(true)) throw new InvalidDataException("Settings changed while being read.");
 				foreach (var p in dto.IncludeList) s.IncludeList.Add(p);
 				foreach (var p in dto.BlackList) s.BlackList.Add(p);
 				s.Threshhold = dto.Threshhold;
@@ -170,14 +184,23 @@ namespace VDF.Web.Services {
 				AutoLoadThumbnails = dto.AutoLoadThumbnails;
 				ThumbnailWidth = Math.Clamp(dto.ThumbnailWidth, 48, 960);
 				ThumbnailJpegQuality = Math.Clamp(dto.ThumbnailJpegQuality, 10, 95);
+				_observedSettingsIdentity = before;
 				return true;
 			}
-			catch { return false; }
+			catch { _settingsReadFailed = true; return false; }
 		}
 
 		public bool Save(Settings s) {
+			lock (_settingsSync) return SaveCore(s);
+		}
+		bool SaveCore(Settings s) {
 			try {
 				Directory.CreateDirectory(Path.GetDirectoryName(SettingsPath)!);
+				using var lease = JournalWriteLease.Acquire(SettingsPath);
+				if (_settingsReadFailed || _observedSettingsPath is not null &&
+					!VDF.Core.Utils.PathComparer.ForCurrentPlatform.Equals(_observedSettingsPath, Path.GetFullPath(SettingsPath))) return false;
+				if (_observedSettingsIdentity is null ? SafePaths.Exists(SettingsPath) || SafePaths.Exists(SettingsPath + ".bak") :
+					!_observedSettingsIdentity.MatchesCurrent(true)) return false;
 				var dto = new Dto {
 					IncludeList = s.IncludeList.ToList(),
 					BlackList = s.BlackList.ToList(),
@@ -234,7 +257,9 @@ namespace VDF.Web.Services {
 					ThumbnailWidth = ThumbnailWidth,
 					ThumbnailJpegQuality = ThumbnailJpegQuality,
 				};
-				File.WriteAllText(SettingsPath, JsonSerializer.Serialize(dto, WebJsonContext.Default.Dto));
+				DurableJsonFile.WriteAsync(SettingsPath, dto, WebJsonContext.Default.Dto, _ => true).GetAwaiter().GetResult();
+				_observedSettingsIdentity = FileIdentity.Capture(SettingsPath) ?? throw new IOException("Saved settings could not be verified.");
+				_observedSettingsPath = Path.GetFullPath(SettingsPath);
 				return true;
 			}
 			catch { return false; }

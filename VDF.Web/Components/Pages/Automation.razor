@@ -1,0 +1,254 @@
+@page "/automation"
+@rendermode InteractiveServer
+@implements IDisposable
+@inject ScanService Scan
+@using VDF.Core.Selection
+@using VDF.Core.Scheduling
+@using VDF.Core.Cleanup
+
+<PageTitle>Automation — Video Duplicate Finder</PageTitle>
+
+<h1>Automation</h1>
+<p>Save selection, protection, and schedule settings here. Selection previews never remove files.</p>
+<div class="start-row" style="margin-top:1rem;">
+    <button class="primary" @onclick="SaveAsync" disabled="@(_draft is null || Busy)">Save automation settings</button>
+    <button @onclick="ReloadAsync" disabled="@Busy">Reload saved settings</button>
+    @if (_draftDirty) { <span>Unsaved draft changes</span> }
+</div>
+@if (_error is not null) { <p class="aborted-msg" role="alert">@_error</p> }
+@if (_notice is not null) { <p class="done-msg" role="status">@_notice</p> }
+@if (!string.IsNullOrWhiteSpace(Scan.AutomationStatus)) { <p role="status">@Scan.AutomationStatus</p> }
+
+@if (_draft is null) {
+    <p>Automation settings are unavailable. Use Reload saved settings to try again.</p>
+}
+else {
+    <fieldset disabled="@Busy" style="border:0;padding:0;min-width:0;">
+        <section class="settings-section">
+            <h2>Selection</h2>
+            <label>Selection profile
+                <select @bind="_draft.Selection.Profile" @bind:after="MarkDraftChanged">
+                    @foreach (var value in Enum.GetValues<SelectionProfile>()) { <option value="@value">@value</option> }
+                </select>
+            </label>
+            <label>Selection mode
+                <select @bind="_draft.Selection.Mode" @bind:after="MarkDraftChanged">
+                    @foreach (var value in Enum.GetValues<SelectionMode>()) { <option value="@value">@value</option> }
+                </select>
+            </label>
+            <p>Strict folder priority compares folder rules before quality criteria. Weighted mode combines scores. Criteria are compared in the order shown.</p>
+            <label>Date source
+                <select @bind="_draft.Selection.DateSource" @bind:after="MarkDraftChanged">
+                    @foreach (var value in Enum.GetValues<SelectionDateSource>()) { <option value="@value">@value</option> }
+                </select>
+            </label>
+            <label>Overlapping folder rules
+                <select @bind="_draft.Selection.OverlapPolicy" @bind:after="MarkDraftChanged">
+                    @foreach (var value in Enum.GetValues<FolderOverlapPolicy>()) { <option value="@value">@value</option> }
+                </select>
+            </label>
+            <label>Folder weight <input type="number" min="0" step="any" @bind="_draft.Selection.FolderWeight" @bind:after="MarkDraftChanged" /></label>
+            <label><input type="checkbox" @bind="_draft.Selection.AutoAfterScan" @bind:after="MarkDraftChanged" /> Automatically prepare selection after scans</label>
+            <p>Automatic selection prepares review decisions only. Quarantine requires a separate preview and confirmation on Results.</p>
+            <label><input type="checkbox" @bind="_draft.Selection.HighlightedGroupsOnly" @bind:after="MarkDraftChanged" /> Limit selection to explicitly highlighted groups</label>
+            <p>This scope applies to manual previews; choose preview groups below. Automatic previews after background scans cover all newly scanned groups.</p>
+
+            <h3>Folder rules</h3>
+            @foreach (var rule in _draft.Selection.FolderRules) {
+                <fieldset @key="rule" style="margin:0.5rem 0;padding:0.75rem;border:1px solid var(--border-default);">
+                    <legend>Folder rule @(_draft.Selection.FolderRules.IndexOf(rule) + 1)</legend>
+                    <label>Directory <input type="text" @bind="rule.Directory" @bind:after="MarkDraftChanged" /></label>
+                    <label>Priority (higher wins) <input type="number" @bind="rule.Priority" @bind:after="MarkDraftChanged" /></label>
+                    <label>Relative path wildcard (optional) <input type="text" @bind="rule.Pattern" @bind:after="MarkDraftChanged" /></label>
+                    <label><input type="checkbox" @bind="rule.Enabled" @bind:after="MarkDraftChanged" /> Enabled</label>
+                    <label><input type="checkbox" @bind="rule.Recursive" @bind:after="MarkDraftChanged" /> Include subdirectories</label>
+                    <label><input type="checkbox" @bind="rule.ProtectAll" @bind:after="MarkDraftChanged" /> Protect all matching files</label>
+                    <button @onclick="() => RemoveFolderRule(rule)">Remove rule</button>
+                </fieldset>
+            }
+            <button @onclick="AddFolderRule">Add folder rule</button>
+
+            <h3>Quality criteria</h3>
+            @foreach (var criterion in _draft.Selection.Criteria) {
+                var index = _draft.Selection.Criteria.IndexOf(criterion);
+                <fieldset @key="criterion" style="margin:0.5rem 0;padding:0.75rem;border:1px solid var(--border-default);">
+                    <legend>Criterion @(index + 1)</legend>
+                    <label>Quality measure
+                        <select @bind="criterion.Name" @bind:after="MarkDraftChanged">
+                            @foreach (var name in CriterionNames) { <option value="@name">@name</option> }
+                        </select>
+                    </label>
+                    <label>Weight <input type="number" min="0" step="any" @bind="criterion.Weight" @bind:after="MarkDraftChanged" /></label>
+                    <label><input type="checkbox" @bind="criterion.PreferLower" @bind:after="MarkDraftChanged" /> Prefer lower values</label>
+                    <button @onclick="() => MoveCriterion(criterion, -1)" disabled="@(index == 0)">Move up</button>
+                    <button @onclick="() => MoveCriterion(criterion, 1)" disabled="@(index == _draft.Selection.Criteria.Count - 1)">Move down</button>
+                    <button @onclick="() => RemoveCriterion(criterion)">Remove criterion</button>
+                </fieldset>
+            }
+            <button @onclick="AddCriterion">Add criterion</button>
+            <label>Preferred codecs (one per line, best first)
+                <textarea rows="3" value="@string.Join('\n', _draft.Selection.PreferredCodecs)" @onchange="e => SetLines(_draft.Selection.PreferredCodecs, e.Value)"></textarea>
+            </label>
+            <label>Preferred audio languages (one per line, best first)
+                <textarea rows="3" value="@string.Join('\n', _draft.Selection.PreferredAudioLanguages)" @onchange="e => SetLines(_draft.Selection.PreferredAudioLanguages, e.Value)"></textarea>
+            </label>
+            <label>Preferred containers (one extension per line, best first)
+                <textarea rows="3" value="@string.Join('\n', _draft.Selection.PreferredContainers)" @onchange="e => SetLines(_draft.Selection.PreferredContainers, e.Value)"></textarea>
+            </label>
+        </section>
+
+        <section class="settings-section">
+            <h2>Named selection profiles</h2>
+            <p>These actions update the draft. Save automation settings to keep the changes.</p>
+            <label>Profile name <input type="text" @bind="_profileName" /></label>
+            <button @onclick="SaveNamedProfile" disabled="@string.IsNullOrWhiteSpace(_profileName)">Save current selection as named profile</button>
+            @foreach (var profile in _draft.Profiles) {
+                <div class="path-entry" @key="profile">
+                    <span>@profile.Name</span>
+                    <button @onclick="() => LoadNamedProfile(profile)">Load into draft</button>
+                    <button @onclick="() => RemoveNamedProfile(profile)">Remove named profile</button>
+                </div>
+            }
+        </section>
+
+        <section class="settings-section">
+            <h2>Local NFO favourites</h2>
+            <p>Read local XML sidecars to protect favourites. No online lookup is performed.</p>
+            <label><input type="checkbox" @bind="_draft.Nfo.Enabled" @bind:after="MarkDraftChanged" /> Enable local NFO protection</label>
+            <label>Boolean favourite elements (one per line)
+                <textarea rows="3" value="@string.Join('\n', _draft.Nfo.BooleanElements)" @onchange="e => SetLines(_draft.Nfo.BooleanElements, e.Value)"></textarea>
+            </label>
+            <label>Tag element names (one per line)
+                <textarea rows="3" value="@string.Join('\n', _draft.Nfo.TagElements)" @onchange="e => SetLines(_draft.Nfo.TagElements, e.Value)"></textarea>
+            </label>
+            <label>Favourite tag values (one per line)
+                <textarea rows="3" value="@string.Join('\n', _draft.Nfo.TagValues)" @onchange="e => SetLines(_draft.Nfo.TagValues, e.Value)"></textarea>
+            </label>
+            <label><input type="checkbox" @bind="_draft.Nfo.InheritSeries" @bind:after="MarkDraftChanged" /> Inherit series favourites</label>
+            <label><input type="checkbox" @bind="_draft.Nfo.InheritSeason" @bind:after="MarkDraftChanged" /> Inherit season favourites</label>
+        </section>
+
+        <section class="settings-section">
+            <h2>Background scans</h2>
+            <p>Schedules run on the server while the web service is running. Daily and weekly times use the server timezone: @TimeZoneInfo.Local.DisplayName. Intervals use UTC.</p>
+            <label><input type="checkbox" @bind="ScheduleEnabled" @bind:after="MarkDraftChanged" /> Enable scheduled scans</label>
+            <label><input type="checkbox" @bind="_draft.ScanAtStartup" @bind:after="MarkDraftChanged" /> Scan when the web service starts</label>
+            <label>Scan profile
+                <select @bind="_draft.ScheduledScanProfile" @bind:after="MarkDraftChanged">
+                    @foreach (var profile in Enum.GetValues<WebScanProfile>()) { <option value="@profile">@profile</option> }
+                </select>
+            </label>
+            <p>Custom uses the saved scan settings and paths from Scan and Settings.</p>
+            <label>Schedule type
+                <select @bind="ScheduleKind" @bind:after="MarkDraftChanged">
+                    @foreach (var kind in Enum.GetValues<ScanScheduleKind>()) { <option value="@kind">@kind</option> }
+                </select>
+            </label>
+            @if (ScheduleKind == ScanScheduleKind.Interval) {
+                <label>Interval in minutes (5–10080) <input type="number" min="5" max="10080" @bind="IntervalMinutes" @bind:after="MarkDraftChanged" /></label>
+            }
+            else {
+                <label>Server local time (HH:mm) <input type="text" placeholder="02:00" @bind="ScheduleLocalTime" @bind:after="MarkDraftChanged" /></label>
+            }
+            @if (ScheduleKind == ScanScheduleKind.Weekly) {
+                <fieldset style="padding:0.75rem;border:1px solid var(--border-default);">
+                    <legend>Weekdays</legend>
+                    @foreach (var day in Enum.GetValues<DayOfWeek>()) {
+                        <label><input type="checkbox" checked="@IncludesDay(day)" @onchange="e => SetDay(day, e.Value is true)" /> @day</label>
+                    }
+                </fieldset>
+            }
+            <label>Catch up missed scans within hours (1–168) <input type="number" min="1" max="168" @bind="CatchUpHours" @bind:after="MarkDraftChanged" /></label>
+            <p>Only the latest missed slot can run. Claimed slots are persisted before scanning and are never retried automatically.</p>
+        </section>
+
+        <section class="settings-section">
+            <h2>Quarantine destination</h2>
+            <label>Quarantine directory <input type="text" @bind="_draft.QuarantineDirectory" @bind:after="MarkDraftChanged" /></label>
+            <p>Files remain in quarantine until explicitly restored. There is no automatic deletion.</p>
+        </section>
+    </fieldset>
+}
+
+<section class="settings-section" style="max-width:none;">
+    <h2>Saved schedule status</h2>
+    @if (Scan.ScheduleState is { } scheduleState) {
+        <p>Status: @scheduleState.Status. Last claimed: @FormatTime(scheduleState.LastClaimedSlotUtc). Last started: @FormatTime(scheduleState.LastStartedUtc). Last completed: @FormatTime(scheduleState.LastCompletedUtc). Duration: @scheduleState.DurationSeconds.ToString("0.0") seconds.</p>
+    }
+    else { <p>No schedule run has been recorded.</p> }
+    <button @onclick="CheckScheduleAsync" disabled="@Busy">Check saved schedule now</button>
+    <p>This check can start a scan if a saved schedule slot is due.</p>
+</section>
+
+<section class="settings-section" style="max-width:none;">
+    <h2>Selection preview</h2>
+    <p>Preview uses saved settings. Save draft changes first. Keep, protected, and uncertain decisions remain visible with their reasons.</p>
+    @if (_draft?.Selection.HighlightedGroupsOnly == true) {
+        <fieldset style="padding:0.75rem;border:1px solid var(--border-default);">
+            <legend>Highlighted groups for this preview</legend>
+            @foreach (var group in _rows.GroupBy(row => row.Item.GroupId)) {
+                <label><input type="checkbox" checked="@_previewGroups.Contains(group.Key)" @onchange="e => SetPreviewGroup(group.Key, e.Value is true)" /> @group.Key (@group.Count() files)</label>
+            }
+        </fieldset>
+    }
+    <button @onclick="PreviewAsync" disabled="@(_draft is null || Busy || _draftDirty)">Preview saved selection</button>
+    @if (_plan is not null) {
+        <p>@_plan.Profile — @_plan.Decisions.Count decisions; estimated savings @_plan.EstimatedSavings bytes. Preview generated @_plan.CreatedUtc.ToString("u").</p>
+        @foreach (var decision in _plan.Decisions) {
+            <div class="action-panel" @key="decision.Path" style="display:block;overflow-wrap:anywhere;">
+                <p><strong>@DecisionLabel(decision)</strong> — @decision.Path</p>
+                <p>Group: @decision.GroupId. @decision.Reason</p>
+            </div>
+        }
+    }
+</section>
+
+<section class="settings-section" style="max-width:none;">
+    <h2>Review and protection</h2>
+    <p>Review choices and manual protection are saved immediately. Remove marks a candidate for review; quarantine is a separate confirmed action on <a href="/results">Results</a>. Reject group prevents automatic selection for the whole group. Reset clears the row's review choice and retains manual protection. Removing manual protection leaves folder and NFO protections active.</p>
+    <button @onclick="RefreshAsync" disabled="@Busy">Refresh review and quarantine history</button>
+    @if (_rows.Count == 0) { <p>No result rows. <a href="/">Run a scan</a> to review duplicates.</p> }
+    @foreach (var group in _rows.GroupBy(row => row.Item.GroupId)) {
+        <h3>Group @group.Key</h3>
+        @foreach (var row in group) {
+            <div class="action-panel" @key="row.Item.Path" style="display:block;overflow-wrap:anywhere;">
+                <p><strong>@row.Item.Path</strong></p>
+                <p>Review: @row.Choice. Protection: @(row.IsProtected ? "Protected" : "Not protected")@(row.ManuallyProtected ? " (manual)" : ""). @row.Reason</p>
+                <div class="start-row" style="margin-top:0.5rem;">
+                    <button @onclick="() => SetReviewAsync(row, ReviewChoice.Keep)" disabled="@ReviewBusy">Keep</button>
+                    <button @onclick="() => SetReviewAsync(row, ReviewChoice.Remove)" disabled="@ReviewBusy">Remove candidate</button>
+                    <button @onclick="() => SetReviewAsync(row, ReviewChoice.Ignore)" disabled="@ReviewBusy">Ignore</button>
+                    <button @onclick="() => SetReviewAsync(row, ReviewChoice.RejectGroup)" disabled="@ReviewBusy">Reject group</button>
+                    <button @onclick="() => SetReviewAsync(row, ReviewChoice.None)" disabled="@ReviewBusy">Reset review</button>
+                    <button @onclick="() => SetReviewAsync(row, row.Choice, !row.ManuallyProtected)" disabled="@ReviewBusy">@(row.ManuallyProtected ? "Remove manual protection" : "Protect manually")</button>
+                </div>
+            </div>
+        }
+    }
+</section>
+
+<section class="settings-section" style="max-width:none;">
+    <h2>Quarantine history</h2>
+    <p>Restore verifies the retained copy and never overwrites an existing original path. Sidecar files are left in place.</p>
+    @if (_history.Count == 0) { <p>No quarantine operations recorded.</p> }
+    @foreach (var record in _history.OrderByDescending(record => record.CreatedUtc)) {
+        <div class="action-panel" @key="record.OperationId" style="display:block;overflow-wrap:anywhere;">
+            <p><strong>@record.State</strong> — @record.OriginalPath</p>
+            <p>Operation: @record.OperationId. Updated @record.UpdatedUtc.ToString("u").</p>
+            <p>Quarantine copy: @record.QuarantinePath</p>
+            <p>@record.Reason</p>
+            @if (!string.IsNullOrEmpty(record.Error)) { <p class="aborted-msg">@record.Error</p> }
+            @if (record.SidecarsLeftInPlace.Count > 0) { <p>Sidecars left in place: @string.Join(", ", record.SidecarsLeftInPlace)</p> }
+            @if (_restoreOperation == record.OperationId) {
+                <div role="group" aria-label="Confirm quarantine restore">
+                    <p>Restore this copy to <strong>@record.OriginalPath</strong>?</p>
+                    <button class="primary" @onclick="() => RestoreAsync(record.OperationId)" disabled="@Busy">Confirm restore</button>
+                    <button @onclick="() => _restoreOperation = null" disabled="@Busy">Cancel restore</button>
+                </div>
+            }
+            else {
+                <button @onclick="() => _restoreOperation = record.OperationId" disabled="@(Busy || string.IsNullOrWhiteSpace(record.QuarantinePath))">Restore…</button>
+            }
+        </div>
+    }
+</section>

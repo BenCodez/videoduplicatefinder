@@ -4,6 +4,8 @@
 @inject WebSettingsService WebSettings
 @inject IJSRuntime JS
 @implements IDisposable
+@using VDF.Core.Selection
+@using VDF.Core.Cleanup
 
 <PageTitle>Results — Video Duplicate Finder</PageTitle>
 
@@ -46,21 +48,24 @@ else {
 
         @* Auto-select dropdown *@
         <div class="dropdown-wrap">
-            <button @onclick="() => _autoSelectOpen = !_autoSelectOpen">Select &#x25BE;</button>
+            <button @onclick="() => _autoSelectOpen = !_autoSelectOpen" disabled="@AutomationBusy">Select &#x25BE;</button>
             @if (_autoSelectOpen) {
                 <div class="dropdown-overlay" @onclick="() => _autoSelectOpen = false"></div>
                 <div class="dropdown-menu">
-                    <button @onclick="() => AutoSelect(AutoSelectMode.LowestQuality)">Lowest quality</button>
-                    <button @onclick="() => AutoSelect(AutoSelectMode.SmallestFile)">Smallest file</button>
-                    <button @onclick="() => AutoSelect(AutoSelectMode.Oldest)">Oldest (keep newest)</button>
-                    <button @onclick="() => AutoSelect(AutoSelectMode.Newest)">Newest (keep oldest)</button>
-                    <button @onclick="() => AutoSelect(AutoSelectMode.HundredPercentEqual)">100% equal groups</button>
+                    <button @onclick="() => PlanSelectionAsync()" disabled="@AutomationBusy">Saved selection profile</button>
+                    <button @onclick="() => AutoSelect(AutoSelectMode.LowestQuality)" disabled="@AutomationBusy">Lowest quality</button>
+                    <button @onclick="() => AutoSelect(AutoSelectMode.SmallestFile)" disabled="@AutomationBusy">Smallest file</button>
+                    <button @onclick="() => AutoSelect(AutoSelectMode.Oldest)" disabled="@AutomationBusy">Oldest (keep newest)</button>
+                    <button @onclick="() => AutoSelect(AutoSelectMode.Newest)" disabled="@AutomationBusy">Newest (keep oldest)</button>
+                    <button @onclick="() => AutoSelect(AutoSelectMode.HundredPercentEqual)" disabled="@AutomationBusy">100% equal groups</button>
                     <hr />
                     <button @onclick="InvertSelection">Invert selection</button>
                     <button @onclick="ClearSelection">Deselect all</button>
                 </div>
             }
         </div>
+        <a href="/automation">Automation settings and review</a>
+        <span>When highlighted-group scope is saved, selection uses groups containing checked files.</span>
 
         @* Collapse all / Expand all *@
         <button @onclick="CollapseAll" title="Collapse all groups">Collapse all</button>
@@ -69,6 +74,7 @@ else {
 
         @if (_selected.Count > 0) {
             <div class="action-group">
+                <button @onclick="PreviewQuarantineAsync" disabled="@AutomationBusy">Preview quarantine…</button>
                 <button @onclick="RemoveSelected">Remove from list</button>
                 <button @onclick="() => _confirmDelete = true" class="danger-outline" disabled="@Scan.FileOpRunning">Delete (trash)</button>
                 <button @onclick="() => _confirmDeletePermanent = true" class="danger" disabled="@Scan.FileOpRunning">Delete permanently</button>
@@ -88,6 +94,34 @@ else {
                 <div class="progress-bar-fill" style="width:@(Scan.FileOpMax > 0 ? 100 * Scan.FileOpCurrent / Scan.FileOpMax : 0)%"></div>
             </div>
         </div>
+    }
+
+    @if (_quarantinePreview is not null) {
+        <section class="action-panel" style="display:block;overflow-wrap:anywhere;" aria-label="Quarantine preview">
+            <h2>Confirm quarantine</h2>
+            <p>Review @_quarantinePreview.Count target(s). The keeper stays in place. Quarantined files remain available for an explicit restore from Automation.</p>
+            @foreach (var preview in _quarantinePreview) {
+                <div style="margin-bottom:1rem;">
+                    <p><strong>Target:</strong> @preview.Target.Path</p>
+                    <p><strong>Keeper:</strong> @preview.Keeper.Path</p>
+                    <p><strong>Destination directory:</strong> @preview.DestinationDirectory @(preview.DestinationWillBeCreated ? "(will be created)" : "")</p>
+                    <p>@(preview.ByteIdentical ? "Byte-identical files." : "Visually similar files; bytes differ.") @preview.Reason</p>
+                    <p>Sidecars left in place: @(preview.SidecarsLeftInPlace.Count == 0 ? "none" : string.Join(", ", preview.SidecarsLeftInPlace))</p>
+                </div>
+            }
+            <button class="primary" @onclick="ConfirmQuarantineAsync" disabled="@AutomationBusy">Confirm quarantine of @_quarantinePreview.Count file(s)</button>
+            <button @onclick="CancelQuarantine" disabled="@AutomationBusy">Cancel quarantine</button>
+        </section>
+    }
+
+    @if (_displayPlan is not null) {
+        <details class="action-panel" style="display:block;overflow-wrap:anywhere;">
+            <summary>@_displayPlan.Profile selection preview — @_displayPlan.Decisions.Count decisions, @FormatSize(_displayPlan.EstimatedSavings) estimated savings</summary>
+            <p>Only removal candidates are selected. File operations still require confirmation and fresh protection checks.</p>
+            @foreach (var decision in _displayPlan.Decisions) {
+                <p><strong>@(decision.IsProtected ? "Protected" : decision.RemoveCandidate ? "Remove candidate — review required" : decision.RequiresReview ? "Needs review" : decision.IsKeeper ? "Keep" : "Leave unchanged"):</strong> @decision.Path — @decision.Reason</p>
+            }
+        </details>
     }
 
     @* Move panel *@
@@ -125,7 +159,7 @@ else {
 
     @* Operation result feedback *@
     @if (_operationMsg != null) {
-        <div class="@(_operationFailed ? "error-box" : "info-box")">@_operationMsg</div>
+        <div class="@(_operationFailed ? "error-box" : "info-box")" role="@(_operationFailed ? "alert" : "status")">@_operationMsg</div>
     }
 
     @foreach (var group in filteredGroups) {
@@ -163,7 +197,7 @@ else {
                     </select>
                     <button class="compare-btn" @onclick="() => OpenCompare(sortedItems)" title="Compare fullsize">Compare</button>
                     <button class="metadata-btn" @onclick="() => OpenMetadata(sortedItems)" title="Compare every metadata tag of these files">Metadata</button>
-                    <button @onclick="() => KeepBest(sortedItems)" title="Select all except best quality">Keep Best</button>
+                    <button @onclick="() => KeepBest(sortedItems)" disabled="@AutomationBusy" title="Preview quality selection using saved protections">Keep Best</button>
                     <button class="collapse-toggle" @onclick="() => ToggleCollapse(groupId)" title="@(isCollapsed ? "Expand" : "Collapse")">
                         @(isCollapsed ? "\u25B6" : "\u25BC")
                     </button>
@@ -189,6 +223,7 @@ else {
                                            @onchange="() => ToggleItem(item)" />
                                 </label>
                                 <div style="display:flex;gap:0.2rem;">
+                                    <a href="/automation" title="Review this file and manage durable protection">Review &amp; protect</a>
                                     <button class="card-hide" @onclick="() => HideItem(item.Path)" title="Hide card">&#x1F441;</button>
                                     <button class="card-remove" @onclick="() => RemoveSingle(item)" title="Remove from list">&#x2715;</button>
                                 </div>
@@ -517,6 +552,7 @@ else {
 @code {
     string _search = string.Empty;
     readonly HashSet<DuplicateItem> _selected = new();
+    readonly HashSet<DuplicateItem> _selectedByPlan = new();
     bool _confirmDelete;
     bool _confirmDeletePermanent;
     bool _showMovePanel;
@@ -525,6 +561,14 @@ else {
     string _moveDestination = string.Empty;
     string? _operationMsg;
     bool _operationFailed;
+    bool _automationWorking;
+    bool _disposed;
+    int _messageGeneration;
+    SelectionPlan? _lastAppliedPlan;
+    SelectionPlan? _displayPlan;
+    IReadOnlyList<QuarantinePreview>? _quarantinePreview;
+    List<DuplicateItem> _quarantineItems = new();
+    bool AutomationBusy => _automationWorking || Scan.IsBusy;
 
     // Context menu
     bool _menuVisible;
@@ -564,8 +608,10 @@ else {
 
     enum AutoSelectMode { LowestQuality, SmallestFile, Oldest, Newest, HundredPercentEqual }
 
-    protected override void OnInitialized() =>
+    protected override void OnInitialized() {
         Scan.StateChanged += OnStateChanged;
+        SyncSelectionPlan();
+    }
 
     protected override async Task OnAfterRenderAsync(bool firstRender) {
         try {
@@ -595,24 +641,75 @@ else {
     }
 
     void OnStateChanged() {
-        try { _ = InvokeAsync(StateHasChanged); }
+        try { _ = InvokeAsync(() => {
+            if (_disposed) return;
+            SyncSelectionPlan();
+            StateHasChanged();
+        }); }
         catch { }
+    }
+
+    void SyncSelectionPlan() {
+        _selected.IntersectWith(Scan.Duplicates);
+        _selectedByPlan.IntersectWith(Scan.Duplicates);
+        if (_automationWorking || Scan.IsBusy) return;
+        if (Scan.LastSelectionPlan is not { } plan) {
+            // A new Keep/protection or configuration change invalidates an old
+            // automatic plan. Preserve deliberate checkbox edits, while clearing
+            // candidates that still came solely from that invalidated plan.
+            if (_selected.RemoveWhere(item => _selectedByPlan.Contains(item)) > 0) CancelQuarantine();
+            _selectedByPlan.Clear();
+            _lastAppliedPlan = null;
+            _displayPlan = null;
+            return;
+        }
+        if (ReferenceEquals(plan, _lastAppliedPlan)) return;
+        ApplySelectionPlan(plan, plan.Decisions.Select(decision => decision.GroupId).ToHashSet());
+    }
+
+    void ApplySelectionPlan(SelectionPlan plan, HashSet<Guid>? scope) {
+        CancelQuarantine();
+        if (scope is null) {
+            _selected.Clear();
+            _selectedByPlan.Clear();
+        }
+        else {
+            _selected.RemoveWhere(item => scope.Contains(item.GroupId));
+            _selectedByPlan.RemoveWhere(item => scope.Contains(item.GroupId));
+        }
+        var paths = plan.Decisions.Where(decision => decision.RemoveCandidate && !decision.IsProtected)
+            .Select(decision => decision.Path).ToHashSet(VDF.Core.Utils.PathComparer.ForCurrentPlatform);
+        foreach (var item in Scan.Duplicates.Where(item => paths.Contains(item.Path))) {
+            _selected.Add(item);
+            _selectedByPlan.Add(item);
+        }
+        _lastAppliedPlan = plan;
+        _displayPlan = plan;
     }
 
     // === Selection ===
     void ToggleItem(DuplicateItem item) {
+        if (_automationWorking) return;
+        CancelQuarantine();
+        _selectedByPlan.Remove(item);
         if (!_selected.Remove(item))
             _selected.Add(item);
     }
 
     void ToggleGroup(IEnumerable<DuplicateItem> items, bool select) {
+        if (_automationWorking) return;
+        CancelQuarantine();
         foreach (var item in items) {
+            _selectedByPlan.Remove(item);
             if (select) _selected.Add(item);
             else _selected.Remove(item);
         }
     }
 
     void InvertSelection() {
+        if (_automationWorking) return;
+        CancelQuarantine();
+        _selectedByPlan.Clear();
         _autoSelectOpen = false;
         foreach (var item in Scan.Duplicates.ToList()) {
             if (!_selected.Remove(item))
@@ -621,24 +718,33 @@ else {
     }
 
     void ClearSelection() {
+        if (_automationWorking) return;
+        CancelQuarantine();
+        _selectedByPlan.Clear();
         _autoSelectOpen = false;
         _selected.Clear();
     }
 
     // === Remove / Delete / Move ===
-    void RemoveSelected() {
-        Scan.RemoveFromResults(_selected.ToList());
-        _selected.Clear();
-        ShowMsg("Removed from results list.", false);
+    async Task RemoveSelected() {
+        CancelQuarantine();
+        try {
+            await Scan.RemoveFromResultsAsync(_selected.ToList());
+            _selected.Clear();
+            ShowMsg("Removed from results list.", false);
+        }
+        catch (Exception ex) { ShowMsg("Removing results failed: " + ex.Message, true); }
     }
 
-    void RemoveSingle(DuplicateItem item) {
+    async Task RemoveSingle(DuplicateItem item) {
+        CancelQuarantine();
         HideContextMenu();
-        Scan.RemoveFromResults(new List<DuplicateItem> { item });
-        _selected.Remove(item);
+        try { await Scan.RemoveFromResultsAsync([item]); _selected.Remove(item); }
+        catch (Exception ex) { ShowMsg("Removing result failed: " + ex.Message, true); }
     }
 
     async Task ExecuteDelete(bool permanent) {
+        CancelQuarantine();
         _confirmDelete = false;
         _confirmDeletePermanent = false;
         var toDelete = _selected.ToList();
@@ -648,6 +754,7 @@ else {
     }
 
     async Task MoveSelected() {
+        CancelQuarantine();
         _showMovePanel = false;
         var toMove = _selected.ToList();
         _selected.Clear();
@@ -656,6 +763,7 @@ else {
     }
 
     async Task CreateLinksSelected() {
+        CancelQuarantine();
         _showLinkPanel = false;
         var toLink = _selected.ToList();
         _selected.Clear();
@@ -668,13 +776,17 @@ else {
         if (result.FreedBytes > 0) msg += $" — {FormatSize(result.FreedBytes)} freed";
         msg += ".";
         if (result.Failed > 0) msg += $" {result.Failed} failed: {string.Join("; ", result.Errors.Take(3))}";
-        ShowMsg(msg, result.Failed > 0);
+        else if (result.Errors.Count > 0) msg += $" {string.Join("; ", result.Errors.Take(3))}";
+        ShowMsg(msg, result.Failed > 0 || result.Errors.Count > 0);
     }
 
     void ShowMsg(string msg, bool failed) {
+        int generation = ++_messageGeneration;
         _operationMsg = msg;
         _operationFailed = failed;
+        if (failed) return;
         _ = Task.Delay(5000).ContinueWith(_ => InvokeAsync(() => {
+            if (_disposed || generation != _messageGeneration) return;
             _operationMsg = null;
             StateHasChanged();
         }));
@@ -863,13 +975,7 @@ else {
     }
 
     // === QoL: Keep Best ===
-    void KeepBest(List<DuplicateItem> items) {
-        if (items.Count < 2) return;
-        var keeper = PickHighestQuality(items);
-        foreach (var item in items)
-            if (item.Path != keeper.Path)
-                _selected.Add(item);
-    }
+    Task KeepBest(List<DuplicateItem> items) => PlanSelectionAsync(SelectionProfile.QualityFirst, items.Select(item => item.GroupId).ToHashSet());
 
     // === QoL: Sort Within Group ===
     void SetGroupSort(Guid groupId, string? sort) {
@@ -1002,7 +1108,7 @@ else {
             case "x" or "X":
                 if (_focusedGroup >= 0 && _focusedGroup < groups.Count) {
                     var items = groups[_focusedGroup].ToList();
-                    KeepBest(items);
+                    await KeepBest(items);
                 }
                 break;
             case "h" or "H":
@@ -1020,55 +1126,108 @@ else {
         }
     }
 
-    // === Auto-select ===
-    void AutoSelect(AutoSelectMode mode) {
+    // === Selection planning and quarantine ===
+    async Task PlanSelectionAsync(SelectionProfile? profile = null, HashSet<Guid>? explicitScope = null) {
         _autoSelectOpen = false;
-        var all = Scan.Duplicates;
-        var processed = new HashSet<Guid>();
-
-        if (mode == AutoSelectMode.HundredPercentEqual) {
-            foreach (var grp in all.GroupBy(d => d.GroupId)) {
-                var items = grp.ToList();
-                if (items.All(i => i.Similarity >= 100f)) {
-                    for (int i = 1; i < items.Count; i++)
-                        _selected.Add(items[i]);
-                }
-            }
-            return;
+        if (_automationWorking) return;
+        _automationWorking = true;
+        CancelQuarantine();
+        try {
+            if (Scan.IsBusy) throw new InvalidOperationException("Wait for the current scan or operation to finish.");
+            var config = await Scan.LoadAutomationAsync();
+            var scope = explicitScope ?? (config.Selection.HighlightedGroupsOnly
+                ? _selected.Select(item => item.GroupId).ToHashSet() : null);
+            if (scope is { Count: 0 }) throw new InvalidOperationException("Select at least one file to highlight its group before previewing selection.");
+            var plan = await Scan.PreviewSelectionAsync(profile, scope);
+            ApplySelectionPlan(plan, scope);
+            ShowMsg($"Selection preview prepared: {_selected.Count} removal candidate(s) selected. Review the explanations before cleanup.", false);
         }
-
-        foreach (var first in all) {
-            if (processed.Contains(first.GroupId)) continue;
-            var groupItems = all.Where(d => d.GroupId == first.GroupId).ToList();
-            if (groupItems.Count < 2) { processed.Add(first.GroupId); continue; }
-
-            DuplicateItem keeper = mode switch {
-                AutoSelectMode.LowestQuality => PickHighestQuality(groupItems),
-                AutoSelectMode.SmallestFile  => groupItems.OrderByDescending(d => d.SizeLong).First(),
-                AutoSelectMode.Oldest        => groupItems.OrderByDescending(d => d.DateCreated).First(),
-                AutoSelectMode.Newest        => groupItems.OrderBy(d => d.DateCreated).First(),
-                _                            => groupItems[0]
-            };
-
-            foreach (var item in groupItems)
-                if (item.Path != keeper.Path)
-                    _selected.Add(item);
-
-            processed.Add(first.GroupId);
-        }
+        catch (Exception ex) { ShowMsg("Selection preview failed: " + ex.Message, true); }
+        finally { _automationWorking = false; }
     }
 
-    static readonly VDF.Core.Utils.QualityRanker.Criterion<DuplicateItem>[] WebCriteria = {
-        new("Duration",      d => d.Duration,        videoOnly: true),
-        new("Resolution",    d => d.FrameSizeInt,    videoOnly: false),
-        new("Bitrate",       d => d.BitRateKbs,      videoOnly: true),
-        new("FPS",           d => d.Fps,             videoOnly: true),
-        new("Audio Bitrate", d => d.AudioSampleRate, videoOnly: true),
-        new("Size",          d => d.SizeLong,        videoOnly: false, ascending: true),
-    };
+    async Task AutoSelect(AutoSelectMode mode) {
+        if (mode is AutoSelectMode.LowestQuality or AutoSelectMode.Oldest or AutoSelectMode.Newest) {
+            await PlanSelectionAsync(mode switch {
+                AutoSelectMode.LowestQuality => SelectionProfile.QualityFirst,
+                AutoSelectMode.Oldest => SelectionProfile.NewestFirst,
+                _ => SelectionProfile.OldestFirst
+            });
+            return;
+        }
+        _autoSelectOpen = false;
+        if (_automationWorking) return;
+        _automationWorking = true;
+        CancelQuarantine();
+        try {
+            if (Scan.IsBusy) throw new InvalidOperationException("Wait for the current scan or operation to finish.");
+            var config = await Scan.LoadAutomationAsync();
+            var scope = config.Selection.HighlightedGroupsOnly ? _selected.Select(item => item.GroupId).ToHashSet() : null;
+            if (scope is { Count: 0 }) throw new InvalidOperationException("Select a file to highlight its group first.");
+            var reviewRows = await Scan.GetReviewRowsAsync();
+            var protectedPaths = reviewRows.Where(row => row.IsProtected || row.Choice is ReviewChoice.Keep or ReviewChoice.Ignore or ReviewChoice.RejectGroup)
+                .Select(row => row.Item.Path).ToHashSet(VDF.Core.Utils.PathComparer.ForCurrentPlatform);
+            var rejectedGroups = reviewRows.Where(row => row.Choice is ReviewChoice.Ignore or ReviewChoice.RejectGroup).Select(row => row.Item.GroupId).ToHashSet();
+            foreach (var group in Scan.Duplicates.GroupBy(item => item.GroupId).Where(group =>
+                (scope is null || scope.Contains(group.Key)) && !rejectedGroups.Contains(group.Key))) {
+                var items = group.OrderBy(item => item.Path, VDF.Core.Utils.PathComparer.ForCurrentPlatform).ToList();
+                if (items.Count < 2) continue;
+                if (mode == AutoSelectMode.HundredPercentEqual && items.Any(item => item.Similarity < 100f)) continue;
+                var keeper = mode == AutoSelectMode.SmallestFile ? items.OrderByDescending(item => item.SizeLong).First() : items[0];
+                foreach (var item in items)
+                    if (!ReferenceEquals(item, keeper) && !protectedPaths.Contains(item.Path)) _selected.Add(item);
+            }
+            ShowMsg("Selection updated. Protected files and rejected groups were preserved; cleanup verifies protections again.", false);
+        }
+        catch (Exception ex) { ShowMsg("Selection failed: " + ex.Message, true); }
+        finally { _automationWorking = false; }
+    }
 
-    static DuplicateItem PickHighestQuality(List<DuplicateItem> items) =>
-        VDF.Core.Utils.QualityRanker.PickKeeper(items, WebCriteria, d => d.IsImage);
+    async Task PreviewQuarantineAsync() {
+        if (_automationWorking) return;
+        _automationWorking = true;
+        CancelQuarantine();
+        try {
+            if (Scan.IsBusy) throw new InvalidOperationException("Wait for the current scan or operation to finish.");
+            var selected = _selected.ToList();
+            if (selected.Count == 0) throw new InvalidOperationException("Select at least one removal candidate first.");
+            var preview = await Scan.PreviewQuarantineAsync(selected);
+            if (!_selected.SetEquals(selected)) throw new InvalidOperationException("Selection changed. Preview quarantine again.");
+            if (preview.Count != selected.Count) throw new InvalidOperationException("The preview does not include every selected file. Review the selection and preview again.");
+            _quarantineItems = selected;
+            _quarantinePreview = preview;
+            _operationMsg = null;
+            _messageGeneration++;
+        }
+        catch (Exception ex) { ShowMsg("Quarantine preview failed: " + ex.Message, true); }
+        finally { _automationWorking = false; }
+    }
+
+    async Task ConfirmQuarantineAsync() {
+        if (_automationWorking) return;
+        _automationWorking = true;
+        try {
+            if (Scan.IsBusy) throw new InvalidOperationException("Wait for the current scan or operation to finish.");
+            if (_quarantinePreview is null || _quarantineItems.Count == 0 || !_selected.SetEquals(_quarantineItems))
+                throw new InvalidOperationException("Selection changed. Preview quarantine again before confirming.");
+            var items = _quarantineItems.ToList();
+            CancelQuarantine();
+            var result = await Scan.QuarantineItemsAsync(items);
+            _selected.IntersectWith(Scan.Duplicates);
+            _displayPlan = null;
+            ShowOpResult($"{result.Done} file(s) quarantined", result);
+        }
+        catch (Exception ex) {
+            CancelQuarantine();
+            ShowMsg("Quarantine failed: " + ex.Message, true);
+        }
+        finally { _automationWorking = false; }
+    }
+
+    void CancelQuarantine() {
+        _quarantinePreview = null;
+        _quarantineItems = new();
+    }
 
     static string FormatSize(long bytes) {
         if (bytes < 0) return "?";
@@ -1078,6 +1237,8 @@ else {
         return $"{bytes / (1024.0 * 1024 * 1024):F2} GB";
     }
 
-    public void Dispose() =>
+    public void Dispose() {
+        _disposed = true;
         Scan.StateChanged -= OnStateChanged;
+    }
 }

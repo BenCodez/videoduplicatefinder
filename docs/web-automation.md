@@ -1,0 +1,71 @@
+# Automation in the standalone Web app
+
+The standalone Web app is built from `VDF.Web` in this repository. The separate
+desktop container repository serves the Avalonia application and is not required
+for this Web interface.
+
+On **Scan**, add container-visible media paths and save scan settings. On
+**Automation**, configure and save selection, protection and schedules. Local
+drafts do not affect cleanup until saved. Conflicting saves preserve the newer
+generation; use **Reload saved settings** before reapplying a conflicting edit.
+
+Selection supports newest/oldest, quality, strict or weighted folder priorities,
+overlapping rules, protected folders, custom criteria and named selection
+profiles. Dates retain their stored precision; ties use deterministic path order.
+The Results selection menu and per-group Keep Best use the shared planner.
+Explanations are available in Results and Automation. A selected checkbox is a
+candidate for an explicit action, never permission for unattended removal.
+
+Keep, Remove, Ignore, Reject group and manual protection in Automation are durable
+reviews tied to the current file identity. Ignore and Reject group veto cleanup
+of the entire current duplicate group. A removal choice does not clear manual
+protection. Reset the review and remove protection explicitly when intended.
+Automatic previews never overwrite manual reviews. Other clients' newer review
+generations require refresh before a conflicting choice can be reapplied.
+
+NFO favourites use explicit local XML boolean elements or configured tag values.
+Series and season inheritance are optional and bounded. Ratings and watched state
+do not imply favourites. There is no live media-server API integration. Unreadable
+or uncertain associations retain files conservatively.
+
+Daily, weekly and interval schedules run in the server process with no browser
+connected. Calendar times use the container timezone; set `TZ` to the desired
+timezone. Intervals use UTC. Scheduling uses saved scan settings, validates the
+required folders/tools, durably claims a slot before starting and collapses missed
+slots to at most one recent run. Restarting does not repeat an already claimed
+slot. **Scan when the web service starts** is a separate opt-in startup scan.
+AI schedules require installing the AI components with a manual scan first.
+
+Automatic selection after a scan previews all newly scanned groups. The
+highlighted-groups setting scopes manual previews only. No schedule deletes,
+quarantines, moves or creates links. A scan holds the shared busy reservation
+through preparation, scanning and result processing; its settings snapshot is
+separate from browser edits.
+
+To quarantine, save a destination, select candidates on Results, choose
+**Preview quarantine**, inspect each target, remaining keeper and sidecars, then
+confirm. A changed destination, target or keeper invalidates that preview.
+Quarantine verifies the copy before removing the source and leaves NFOs,
+subtitles and artwork in place. History and explicit restore are on Automation.
+Restore verifies the retained copy and never overwrites an occupied original
+path. Startup recovery restores interrupted claims; it never resumes deletion.
+Delete, trash and link replacement continue to use live shared protection checks
+and require a current independent unselected keeper.
+
+The default persistent locations remain `/root/.config/VDF` and
+`/root/.local/state/VDF` in the container. New files include
+`web-settings.automation.json` in config, and `WebSchedule.json`, `WebResults.json`
+and `SelectionPlan.json` beside the scan database. Results preserve their original
+native snapshots across restart; replacements do not inherit old cleanup
+authority. Reviews and cleanup history use the existing Core journals without
+changing the scan database schema. Preserve all state, backups and quarantine
+destinations together. See [the shared recovery guidance](review-cleanup.md) and
+[container setup and validation](web-container.md).
+
+For an upgrade, stop the old container and make copies of both persistent mounts.
+Test the new image with those copies, another port and read-only media. Keep the
+old image and untouched original state for rollback. Restore the entire matching
+state snapshot when testing an older image; later media changes and newer review
+protections require reconciliation before permitting old cleanup again. Updating
+only a settings or database file is insufficient. Do not run two containers
+against the same writable state during migration.
