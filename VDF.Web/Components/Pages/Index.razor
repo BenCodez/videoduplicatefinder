@@ -7,6 +7,8 @@
 <PageTitle>Scan — Video Duplicate Finder</PageTitle>
 
 <h1>Scan</h1>
+@if (Scan.ResultsPersistenceWarning is { } resultsWarning) { <p class="aborted-msg" role="alert">@resultsWarning</p> }
+@if (Scan.SelectionPersistenceWarning is { } selectionWarning) { <p class="aborted-msg" role="alert">@selectionWarning</p> }
 
 @* FFmpeg setup banner *@
 @if (FFmpegSetup.State == FFmpegSetupState.Checking) {

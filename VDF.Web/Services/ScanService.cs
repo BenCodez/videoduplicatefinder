@@ -141,7 +141,7 @@ namespace VDF.Web.Services {
 				_engine.Duplicates.Clear();
 				ClearCleanupSnapshots();
 				ClearThumbnailCaches();
-				LastSelectionPlan = null;
+				ClearSelectionPlan();
 				NotifyAutomationChanged();
 				// Reserve the lifecycle before awaiting a first-use AI download.
 				await PrepareScanAsync(_engine.Settings, _cts.Token);
@@ -413,10 +413,11 @@ namespace VDF.Web.Services {
 				// database; a restart must not revive this folder's old rows.
 				if (File.Exists(AutomationStore.Path) || File.Exists(Path.Combine(folder, "WebResults.json")))
 					await SaveResultsAsync(folder, new());
+				ResultsPersistenceWarning = null;
 				ScanEngine.ClearDatabase();
 				_engine.Duplicates.Clear();
 				ClearCleanupSnapshots();
-				LastSelectionPlan = null;
+				ClearSelectionPlan();
 				_quarantinePreview = null;
 			}
 			finally { EndDataWork(); }

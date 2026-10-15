@@ -333,6 +333,157 @@ public sealed class WebAutomationTests : IAsyncLifetime {
     [Theory]
     [InlineData(false)]
     [InlineData(true)]
+    public async Task OversizedResultsCompleteInMemoryAndDiscloseRestartLimit(bool scheduled) {
+        var config = await scan.LoadAutomationAsync();
+        config.Schedule = new() { Enabled = scheduled, Kind = ScanScheduleKind.Interval, IntervalMinutes = 5 };
+        config.Selection.AutoAfterScan = true;
+        await scan.SaveAutomationAsync(config);
+        scan.PrepareScanAsync = (_, _) => Task.CompletedTask;
+        scan.StartSearchOverride = () => {
+            // Two references serialize as more than the real 32 MiB limit.
+            string largeFormat = new('x', 17 * 1024 * 1024);
+            Seed("large-a.mp4").Format = largeFormat;
+            Seed("large-b.mp4").Format = largeFormat;
+            ScanEngine.SaveDatabase();
+        };
+        if (scheduled) await scan.CheckScheduleAsync(DateTimeOffset.UtcNow);
+        else await scan.StartScanAndCompare();
+        Assert.True(scan.IsBusy);
+        await scan.CompleteWebScanAsync(false);
+        Assert.Equal(ScanState.Done, scan.State);
+        Assert.False(scan.IsBusy);
+        Assert.Null(scan.ErrorMessage);
+        Assert.Equal(2, scan.Duplicates.Count);
+        Assert.Equal(2, scan.LastSelectionPlan?.Decisions.Count);
+        Assert.Contains("until the service restarts", scan.ResultsPersistenceWarning);
+        Assert.Null(scan.SelectionPersistenceWarning);
+        if (scheduled) Assert.Equal("Completed", scan.ScheduleState?.Status);
+        AssertEmptySavedResults(folder);
+        Assert.Empty(Directory.GetFiles(folder, "*.tmp-*"));
+        using (var restarted = NewService()) {
+            await restarted.InitializeWebAutomationAsync();
+            Assert.Empty(restarted.Duplicates);
+            Assert.Equal(2, restarted.DatabaseEntryCount);
+        }
+        Assert.All(scan.Duplicates, item => Assert.Equal(new byte[] { 1, 2, 3, 4 }, File.ReadAllBytes(item.Path)));
+        // A new small result generation can be saved and clears the warning.
+        scan.StartSearchOverride = () => { Seed("small-a.mp4"); Seed("small-b.mp4"); ScanEngine.SaveDatabase(); };
+        await scan.StartScanAndCompare();
+        await scan.CompleteWebScanAsync(false);
+        Assert.Equal(ScanState.Done, scan.State);
+        Assert.Null(scan.ResultsPersistenceWarning);
+        using var smallRestart = NewService();
+        await smallRestart.InitializeWebAutomationAsync();
+        Assert.Equal(2, smallRestart.Duplicates.Count);
+        Assert.All(smallRestart.Duplicates, item => Assert.Contains("small-", item.Path));
+    }
+
+    [Fact]
+    public async Task OversizedSelectionPreviewReplacesStaleSavedCopiesAndRetainsCurrentPlan() {
+        var a = Seed("preview-a.mp4"); Seed("preview-b.mp4"); Anchor();
+        await scan.PreviewSelectionAsync();
+        string largeReason = new('x', 17 * 1024 * 1024);
+        var plan = new SelectionPlan { Decisions = [
+            new() { Path = a.Path, Reason = largeReason }, new() { Path = a.Path, Reason = largeReason }] };
+        await scan.SaveSelectionPlanForSessionAsync(folder, plan);
+        Assert.Same(plan, scan.LastSelectionPlan);
+        Assert.Contains("until the service restarts", scan.SelectionPersistenceWarning);
+        foreach (string suffix in new[] { "", ".bak" }) {
+            var saved = await SelectionPlanStore.LoadAsync(Path.Combine(folder, "SelectionPlan.json" + suffix));
+            Assert.Empty(saved!.Decisions);
+        }
+        Assert.Empty(Directory.GetFiles(folder, "*.tmp-*"));
+        await scan.PreviewSelectionAsync();
+        Assert.Null(scan.SelectionPersistenceWarning);
+        Assert.Equal(2, scan.LastSelectionPlan?.Decisions.Count);
+        Assert.All(scan.Duplicates, item => Assert.True(File.Exists(item.Path)));
+    }
+
+    [Fact]
+    public async Task LargeScheduledResultsAndGeneratedAutomaticPreviewBothComplete() {
+        var config = await scan.LoadAutomationAsync();
+        config.Schedule = new() { Enabled = true, Kind = ScanScheduleKind.Interval, IntervalMinutes = 5 };
+        config.Selection.AutoAfterScan = true;
+        await scan.SaveAutomationAsync(config);
+        scan.PrepareScanAsync = (_, _) => Task.CompletedTask;
+        scan.StartSearchOverride = () => {
+            // Missing-media results still require explanations. Realistic long
+            // nested paths exceed the actual journal cap without large media.
+            string parent = folder;
+            for (int i = 0; i < 18; i++) parent = Path.Combine(parent, new string('a', 100));
+            for (int i = 0; i < 20_000; i++) scan.Engine.Duplicates.Add(new DuplicateItem {
+                Path = Path.Combine(parent, $"missing-{i:D5}.mp4"), Folder = parent, GroupId = group });
+            ScanEngine.SaveDatabase();
+        };
+        await scan.CheckScheduleAsync(DateTimeOffset.UtcNow);
+        await scan.CompleteWebScanAsync(false);
+        Assert.Equal(ScanState.Done, scan.State);
+        Assert.Equal("Completed", scan.ScheduleState?.Status);
+        Assert.Null(scan.ErrorMessage);
+        Assert.Equal(20_000, scan.Duplicates.Count);
+        Assert.Equal(20_000, scan.LastSelectionPlan?.Decisions.Count);
+        Assert.All(scan.LastSelectionPlan!.Decisions, decision => {
+            Assert.False(decision.RemoveCandidate);
+            Assert.True(decision.RequiresReview);
+        });
+        Assert.NotNull(scan.ResultsPersistenceWarning);
+        Assert.NotNull(scan.SelectionPersistenceWarning);
+        AssertEmptySavedResults(folder);
+        Assert.Empty((await SelectionPlanStore.LoadAsync(Path.Combine(folder, "SelectionPlan.json")))!.Decisions);
+        Assert.Empty(Directory.GetFiles(folder, "*.mp4", SearchOption.AllDirectories));
+    }
+
+    [Fact]
+    public async Task OversizedResultUpdateCannotRevivePreviousSavedRowsAndResetClearsWarning() {
+        Seed("updated-a.mp4"); Seed("updated-b.mp4"); Anchor();
+        ScanEngine.SaveDatabase();
+        await scan.RemoveFromResultsAsync([]);
+        Assert.NotEmpty(JsonNode.Parse(File.ReadAllText(Path.Combine(folder, "WebResults.json")))!["rows"]!.AsArray());
+        string largeFormat = new('x', 17 * 1024 * 1024);
+        foreach (var item in scan.Duplicates) item.Format = largeFormat;
+        await scan.RemoveFromResultsAsync([]);
+        Assert.Equal(2, scan.Duplicates.Count);
+        Assert.NotNull(scan.ResultsPersistenceWarning);
+        AssertEmptySavedResults(folder);
+        await scan.ResetAsync();
+        Assert.Empty(scan.Duplicates);
+        Assert.Null(scan.ResultsPersistenceWarning);
+        AssertEmptySavedResults(folder);
+        Assert.All(Directory.GetFiles(folder, "*.mp4"), path => Assert.Equal(new byte[] { 1, 2, 3, 4 }, File.ReadAllBytes(path)));
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task NonSizeResultsSaveFailureStillFailsCompletion(bool corrupt) {
+        scan.PrepareScanAsync = (_, _) => Task.CompletedTask;
+        scan.StartSearchOverride = () => { Seed("failure-a.mp4"); Seed("failure-b.mp4"); };
+        await scan.StartScanAndCompare();
+        string path = Path.Combine(folder, "WebResults.json");
+        if (corrupt) { File.WriteAllText(path, "{"); File.WriteAllText(path + ".bak", "{"); }
+        using var lease = corrupt ? null : JournalWriteLease.Acquire(path);
+        await scan.CompleteWebScanAsync(false);
+        Assert.Equal(ScanState.Error, scan.State);
+        Assert.NotNull(scan.ErrorMessage);
+        Assert.Null(scan.ResultsPersistenceWarning);
+        Assert.Equal(2, scan.Duplicates.Count);
+        Assert.All(scan.Duplicates, item => Assert.True(File.Exists(item.Path)));
+    }
+
+    [Fact]
+    public async Task CorruptSelectionPreviewIsPreservedAndStillFails() {
+        Seed("preview-a.mp4"); Seed("preview-b.mp4"); Anchor();
+        string path = Path.Combine(folder, "SelectionPlan.json");
+        File.WriteAllText(path, "{"); File.WriteAllText(path + ".bak", "{");
+        await Assert.ThrowsAsync<InvalidDataException>(() => scan.PreviewSelectionAsync());
+        Assert.Null(scan.SelectionPersistenceWarning);
+        Assert.Equal("{", File.ReadAllText(path));
+        Assert.Equal("{", File.ReadAllText(path + ".bak"));
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
     public async Task UnwritableResultsSnapshotRefusesScanBeforeDiscardingVisibleResults(bool corrupt) {
         Seed("preserved-a.mp4"); Seed("preserved-b.mp4");
         ScanEngine.SaveDatabase();

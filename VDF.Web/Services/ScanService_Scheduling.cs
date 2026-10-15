@@ -36,7 +36,7 @@ public sealed partial class ScanService {
 
     async Task<bool> PrepareWebScanAsync(bool scheduled, DateTimeOffset now) {
         _runAutomation = null;
-        LastSelectionPlan = null;
+        ClearSelectionPlan();
         _scheduledStateFolder = null;
         _scheduledRunStarted = null;
         _engine.Settings = scheduled ? ReadScheduledSettings() : SnapshotConfiguredSettings();

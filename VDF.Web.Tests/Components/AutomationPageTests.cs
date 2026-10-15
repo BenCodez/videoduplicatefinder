@@ -71,6 +71,59 @@ public sealed class AutomationPageTests : BunitContext {
     }
 
     [Fact]
+    public async Task OversizedResultsWarningIsVisibleAcrossPagesAndClearsAfterSuccessfulSave() {
+        await ScanEngine.LoadDatabase(folder);
+        DatabaseUtils.Database.Clear();
+        scan.Settings.IncludeList.Add(folder);
+        Assert.True(scan.SaveSettings());
+        await scan.LoadAutomationAsync();
+        scan.PrepareScanAsync = (_, _) => Task.CompletedTask;
+        scan.StartSearchOverride = () => {
+            var group = Guid.NewGuid();
+            Seed("large-ui-a.mp4", group); Seed("large-ui-b.mp4", group);
+            string largeFormat = new('x', 17 * 1024 * 1024);
+            foreach (var item in scan.Duplicates) {
+                item.Format = largeFormat;
+                DatabaseUtils.Database.Add(new FileEntry(item.Path));
+            }
+            ScanEngine.SaveDatabase();
+        };
+        await scan.StartScanAndCompare();
+        await scan.CompleteWebScanAsync(false);
+        Assert.Equal(ScanState.Done, scan.State);
+        // The on-disk generation remains empty until explicitly saved again.
+        // Shorten display metadata to keep the component render bounded.
+        foreach (var item in scan.Duplicates) item.Format = "mp4";
+        Services.AddSingleton(new FFmpegSetupService());
+        var index = Render<VDF.Web.Components.Pages.Index>();
+        var results = Render<Results>();
+        var automation = await RenderPageAsync();
+        foreach (var markup in new[] { index.Markup, results.Markup, automation.Markup }) {
+            Assert.Contains("32 MiB save limit", markup);
+            Assert.Contains("until the service restarts", markup);
+            Assert.Contains("role=\"alert\"", markup);
+        }
+        await scan.RemoveFromResultsAsync([]);
+        await automation.WaitForAssertionAsync(() => Assert.DoesNotContain("32 MiB save limit", automation.Markup), JournalIoTimeout);
+        await results.WaitForAssertionAsync(() => Assert.DoesNotContain("32 MiB save limit", results.Markup), JournalIoTimeout);
+        await index.WaitForAssertionAsync(() => Assert.DoesNotContain("32 MiB save limit", index.Markup), JournalIoTimeout);
+    }
+
+    [Fact]
+    public async Task OversizedPreviewWarningIsVisibleOnScanAndClearsWithPreviewInvalidation() {
+        await scan.LoadAutomationAsync();
+        string largeReason = new('x', 17 * 1024 * 1024);
+        var plan = new SelectionPlan { Decisions = [new() { Path = "a", Reason = largeReason }, new() { Path = "b", Reason = largeReason }] };
+        await scan.SaveSelectionPlanForSessionAsync(folder, plan);
+        Services.AddSingleton(new FFmpegSetupService());
+        var index = Render<VDF.Web.Components.Pages.Index>();
+        Assert.Contains("This selection preview exceeds the 32 MiB save limit", index.Find("[role='alert']").TextContent);
+        Assert.Contains("until the service restarts", index.Markup);
+        await scan.ResetAsync();
+        await index.WaitForAssertionAsync(() => Assert.Empty(index.FindAll("[role='alert']")), JournalIoTimeout);
+    }
+
+    [Fact]
     public async Task StaleSaveKeepsDraftAndShowsConflictUntilExplicitReload() {
         var page = await RenderPageAsync();
         await ChangeCheckboxAsync(page, "Automatically prepare selection after scans", true);

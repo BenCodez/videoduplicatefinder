@@ -62,6 +62,15 @@ changing the scan database schema. Preserve all state, backups and quarantine
 destinations together. See [the shared recovery guidance](review-cleanup.md) and
 [container setup and validation](web-container.md).
 
+Results and selection previews each have a 32 MiB serialized save limit. A scan
+that exceeds this limit still completes and keeps the complete results and
+preview available in the running service. Scan, Results and Automation show a
+warning that the oversized data lasts only until service restart. Saved copies
+are replaced with an empty generation so older results cannot reappear. After
+restarting, run a new scan and prepare the preview again. This fallback applies
+only to the size limit; corrupt journals and other save failures still report an
+error. A subsequent successful save clears the corresponding warning.
+
 After a restart, an abandoned scheduled run is marked **Interrupted** while its
 claimed slot remains recorded, so that slot is not repeated. A live cooperating
 process keeps its run status. Preserve the persistent lock files, including

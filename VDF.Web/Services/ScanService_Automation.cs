@@ -19,6 +19,8 @@ public sealed partial class ScanService {
         Path.GetFileNameWithoutExtension(WebSettingsService.SettingsPath) + ".automation.json"));
     public string AutomationStatus { get; private set; } = "";
     public SelectionPlan? LastSelectionPlan { get; private set; }
+    public string? ResultsPersistenceWarning { get; private set; }
+    public string? SelectionPersistenceWarning { get; private set; }
     public WebScheduleState? ScheduleState { get; private set; }
     long _automationGeneration;
     public long AutomationGeneration => Interlocked.Read(ref _automationGeneration);
@@ -75,7 +77,7 @@ public sealed partial class ScanService {
             // preference has since changed. Never silently borrow another folder.
             string folder = _resultStateFolder ?? ConfiguredStateFolder();
             var saved = await AutomationStore.SaveAsync(config, folder);
-            LastSelectionPlan = null;
+            ClearSelectionPlan();
             _quarantinePreview = null;
             AutomationStatus = "Web automation settings saved.";
             return saved;
@@ -159,7 +161,7 @@ public sealed partial class ScanService {
                 return merged.Values;
             });
             AutomationStatus = "Review saved. Automatic selection preserves deliberate choices.";
-            LastSelectionPlan = null;
+            ClearSelectionPlan();
         }
         finally { EndDataWork(); }
     }
@@ -198,10 +200,32 @@ public sealed partial class ScanService {
         var plan = SelectionPlanner.BuildPlan(candidates, options);
         // Persist explanations separately. Automatic previews never upsert manual
         // reviews: a concurrent Keep/Protect cannot be lost to an autosave.
-        await SelectionPlanStore.SaveAsync(Path.Combine(folder, "SelectionPlan.json"), plan);
-        LastSelectionPlan = plan;
+        await SaveSelectionPlanForSessionAsync(folder, plan);
         AutomationStatus = $"{plan.Decisions.Count(d => d.RemoveCandidate)} removal candidates. Review before explicit cleanup.";
         return plan;
+    }
+    // Only the known serialized-size failure is recoverable here. Corruption,
+    // unsupported schemas, leases and IO errors must still fail visibly.
+    static bool IsJournalSizeLimit(InvalidDataException ex) =>
+        ex.Message == "The journal exceeds the supported size limit.";
+    internal async Task SaveSelectionPlanForSessionAsync(string folder, SelectionPlan plan) {
+        string path = Path.Combine(folder, "SelectionPlan.json");
+        using var lease = JournalWriteLease.Acquire(path);
+        try {
+            await SelectionPlanStore.SaveAsync(path, plan);
+            SelectionPersistenceWarning = null;
+        }
+        catch (InvalidDataException ex) when (IsJournalSizeLimit(ex)) {
+            // Replace both saved copies: an older explanation must not reappear
+            // after restart when this session's preview cannot be persisted.
+            await SelectionPlanStore.SaveAsync(path, new SelectionPlan());
+            SelectionPersistenceWarning = "This selection preview exceeds the 32 MiB save limit. It is available only until the service restarts; prepare the preview again after restarting.";
+        }
+        LastSelectionPlan = plan;
+    }
+    void ClearSelectionPlan() {
+        LastSelectionPlan = null;
+        SelectionPersistenceWarning = null;
     }
 
     public async Task<IReadOnlyList<QuarantineRecord>> GetQuarantineHistoryAsync() {
@@ -214,7 +238,7 @@ public sealed partial class ScanService {
         try {
             var guard = new CleanupProtectionGuard(_resultStateFolder ?? ConfiguredStateFolder());
             await guard.CreateQuarantineService().RestoreAsync(operationId);
-            LastSelectionPlan = null;
+            ClearSelectionPlan();
             AutomationStatus = "Quarantine restored. Rescan to include the restored file in results.";
         }
         finally { EndDataWork(); }
@@ -297,7 +321,7 @@ public sealed partial class ScanService {
                 catch (Exception ex) { result.Errors.Add("Quarantine completed, but the database save failed: " + ex.Message); }
             }
             DropSingletonGroups();
-            LastSelectionPlan = null;
+            ClearSelectionPlan();
             await PersistResultsAsync();
         }
         catch (Exception ex) { result.Failed = selected.Count - result.Done; result.Errors.Add(ex.Message); }
@@ -317,26 +341,39 @@ public sealed partial class ScanService {
             SafePaths.RequireDirectory(previous);
             await SaveResultsAsync(previous, new());
         }
+        ResultsPersistenceWarning = null;
     }
     async Task PersistResultsAsync() {
         if (_resultStateFolder is null || _runAutomation is null && !File.Exists(AutomationStore.Path)) return;
-        await SaveResultsAsync(_resultStateFolder, Duplicates.Select(item => new WebSavedResult {
-            Item = item, Snapshot = _resultSnapshots.GetValueOrDefault(item) }).ToList());
+        bool saved = await SaveResultsAsync(_resultStateFolder, Duplicates.Select(item => new WebSavedResult {
+            Item = item, Snapshot = _resultSnapshots.GetValueOrDefault(item) }).ToList(), allowSizeFallback: true);
+        ResultsPersistenceWarning = saved ? null : "These results exceed the 32 MiB save limit. They are available only until the service restarts; run a new scan after restarting to recreate the results.";
     }
-    static async Task SaveResultsAsync(string folder, List<WebSavedResult> rows) {
+    static async Task<bool> SaveResultsAsync(string folder, List<WebSavedResult> rows, bool allowSizeFallback = false) {
         string path = Path.Combine(folder, "WebResults.json");
         using var lease = JournalWriteLease.Acquire(path);
-        await DurableJsonFile.WriteAsync(path, new WebResultsEnvelope { Rows = rows },
-            WebAutomationJsonContext.Default.WebResultsEnvelope, ValidateResults);
+        try {
+            await DurableJsonFile.WriteAsync(path, new WebResultsEnvelope { Rows = rows },
+                WebAutomationJsonContext.Default.WebResultsEnvelope, ValidateResults);
+            return true;
+        }
+        catch (InvalidDataException ex) when (allowSizeFallback && IsJournalSizeLimit(ex)) {
+            // Keep the writer lease through the fallback. Preserve complete
+            // in-memory results; restart must not revive an older generation.
+            await DurableJsonFile.WriteAsync(path, new WebResultsEnvelope(),
+                WebAutomationJsonContext.Default.WebResultsEnvelope, ValidateResults);
+            return false;
+        }
     }
     public async Task ResetAsync() {
         ReserveAutomationWork();
         try {
             if (_resultStateFolder is { } folder && File.Exists(AutomationStore.Path)) await SaveResultsAsync(folder, new());
+            ResultsPersistenceWarning = null;
             _engine.Duplicates.Clear();
             ClearCleanupSnapshots();
             ClearThumbnailCaches();
-            LastSelectionPlan = null;
+            ClearSelectionPlan();
             _quarantinePreview = null;
             State = ScanState.Idle;
             ErrorMessage = null;
@@ -351,7 +388,7 @@ public sealed partial class ScanService {
         try {
             foreach (var item in selected) { _engine.Duplicates.Remove(item); _resultSnapshots.Remove(item); }
             DropSingletonGroups();
-            LastSelectionPlan = null;
+            ClearSelectionPlan();
             _quarantinePreview = null;
             await PersistResultsAsync();
         }
