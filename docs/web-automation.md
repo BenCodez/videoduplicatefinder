@@ -37,6 +37,8 @@ slot. **Scan when the web service starts** is a separate opt-in startup scan.
 If prerequisites fail before its durable claim, the startup scan remains eligible
 for a later server tick after the prerequisite recovers. A claimed run stays
 consumed for that service instance even if preparation later fails or is aborted.
+Unexpected engine errors are reported as failed scans, including their error
+message. Explicit cancellation remains an aborted run.
 AI schedules require installing the AI components with a manual scan first.
 
 Automatic selection after a scan previews all newly scanned groups. The
@@ -82,6 +84,12 @@ Saved results record whether the scan completed, including scans with no
 duplicates. A reset or an interrupted replacement scan restores the Scan page
 as idle. Older empty snapshots without completion metadata also restore as idle;
 older nonempty snapshots continue to restore as completed results.
+Saved previews belong to their result generation. Replacing, resetting, clearing
+or dismissing results prevents an earlier preview from automatically selecting
+the new generation after a restart. A matching saved preview is recomputed using
+current settings and reviews. Existing version-one snapshots and previews
+without generation fields remain readable together; newly saved generations do
+not inherit an unbound older preview. The shared scan database format is unchanged.
 Result invalidation, completion saves and explicit resets are independent of the
 optional automation configuration. Missing established protection settings still
 require restoration; scanning does not replace them with permissive defaults.

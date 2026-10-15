@@ -27,6 +27,7 @@ public sealed partial class ScanService {
     void NotifyAutomationChanged() { Interlocked.Increment(ref _automationGeneration); Notify(); }
     Task<WebAutomationView>? _automationViewRead;
     WebAutomationConfiguration? _runAutomation;
+    string? _resultsGeneration;
     string? _scheduledStateFolder;
     bool _startupChecked;
     (string Folder, string Revision, Dictionary<string, QuarantinePreview> Targets)? _quarantinePreview;
@@ -230,17 +231,26 @@ public sealed partial class ScanService {
         using var lease = JournalWriteLease.Acquire(path);
         await RequireSupportedJournalCopiesAsync(path, "selection preview");
         try {
-            await SelectionPlanStore.SaveAsync(path, plan);
+            await SaveWebSelectionPlanAsync(path, plan);
             SelectionPersistenceWarning = null;
         }
         catch (InvalidDataException ex) when (IsJournalSizeLimit(ex)) {
             // Replace both saved copies: an older explanation must not reappear
             // after restart when this session's preview cannot be persisted.
-            await SelectionPlanStore.SaveAsync(path, new SelectionPlan());
+            await SaveWebSelectionPlanAsync(path, new SelectionPlan());
             SelectionPersistenceWarning = "This selection preview exceeds the 32 MiB save limit. It is available only until the service restarts; prepare the preview again after restarting.";
         }
         LastSelectionPlan = plan;
     }
+    Task SaveWebSelectionPlanAsync(string path, SelectionPlan plan) => DurableJsonFile.WriteAsync(path,
+        new WebSelectionPlanEnvelope { Plan = plan, ResultGeneration = _resultsGeneration },
+        WebAutomationJsonContext.Default.WebSelectionPlanEnvelope, ValidateSelectionPlan);
+    static bool ValidateSelectionPlan(WebSelectionPlanEnvelope value) {
+        RequireJournalVersion(value.Version, "selection preview");
+        return ValidGeneration(value.ResultGeneration) && value.Plan is { Decisions: not null } &&
+            value.Plan.Decisions.All(d => d is not null && d.Path is not null && d.Reason is not null);
+    }
+    static bool ValidGeneration(string? value) => value is null || Guid.TryParseExact(value, "N", out _);
     void ClearSelectionPlan() {
         LastSelectionPlan = null;
         SelectionPersistenceWarning = null;
@@ -366,26 +376,32 @@ public sealed partial class ScanService {
     }
     async Task PersistResultsAsync() {
         if (_resultStateFolder is null) return;
-        bool saved = await SaveResultsAsync(_resultStateFolder, Duplicates.Select(item => new WebSavedResult {
+        // A failed save leaves the changed in-memory rows unsaved. A later
+        // preview must not borrow the preceding durable generation, including
+        // a legacy snapshot whose generation is null.
+        _resultsGeneration = Guid.NewGuid().ToString("N");
+        var saved = await SaveResultsAsync(_resultStateFolder, Duplicates.Select(item => new WebSavedResult {
             Item = item, Snapshot = _resultSnapshots.GetValueOrDefault(item) }).ToList(), allowSizeFallback: true, completed: true);
-        ResultsPersistenceWarning = saved ? null : "These results exceed the 32 MiB save limit. They are available only until the service restarts; run a new scan after restarting to recreate the results.";
+        _resultsGeneration = saved.Generation;
+        ResultsPersistenceWarning = saved.Saved ? null : "These results exceed the 32 MiB save limit. They are available only until the service restarts; run a new scan after restarting to recreate the results.";
     }
-    static async Task<bool> SaveResultsAsync(string folder, List<WebSavedResult> rows, bool allowSizeFallback = false, bool completed = false) {
+    static async Task<(bool Saved, string Generation)> SaveResultsAsync(string folder, List<WebSavedResult> rows, bool allowSizeFallback = false, bool completed = false) {
         SafePaths.RequireDirectory(folder);
         string path = Path.Combine(folder, "WebResults.json");
         using var lease = JournalWriteLease.Acquire(path);
         await RequireSupportedJournalCopiesAsync(path);
+        string generation = Guid.NewGuid().ToString("N");
         try {
-            await DurableJsonFile.WriteAsync(path, new WebResultsEnvelope { Rows = rows, Completed = completed },
+            await DurableJsonFile.WriteAsync(path, new WebResultsEnvelope { Rows = rows, Completed = completed, Generation = generation },
                 WebAutomationJsonContext.Default.WebResultsEnvelope, ValidateResults);
-            return true;
+            return (true, generation);
         }
         catch (InvalidDataException ex) when (allowSizeFallback && IsJournalSizeLimit(ex)) {
             // Keep the writer lease through the fallback. Preserve complete
             // in-memory results; restart must not revive an older generation.
-            await DurableJsonFile.WriteAsync(path, new WebResultsEnvelope { Completed = false },
+            await DurableJsonFile.WriteAsync(path, new WebResultsEnvelope { Completed = false, Generation = generation },
                 WebAutomationJsonContext.Default.WebResultsEnvelope, ValidateResults);
-            return false;
+            return (false, generation);
         }
     }
     public async Task ResetAsync() {
@@ -440,7 +456,7 @@ public sealed partial class ScanService {
     }
     static bool ValidateResults(WebResultsEnvelope value) {
         RequireJournalVersion(value.Version);
-        return value.Rows is not null && value.Rows.Count <= 1_000_000 && value.Rows.All(r => r is not null && r.Item is not null &&
+        return ValidGeneration(value.Generation) && value.Rows is not null && value.Rows.Count <= 1_000_000 && value.Rows.All(r => r is not null && r.Item is not null &&
             Path.IsPathFullyQualified(r.Item.Path) && r.Item.GroupId != Guid.Empty &&
             (r.Snapshot is null || PathComparer.ForCurrentPlatform.Equals(r.Snapshot.Path, r.Item.Path))) &&
         value.Rows.Select(r => r.Item.Path).Distinct(PathComparer.ForCurrentPlatform).Count() == value.Rows.Count;
@@ -450,6 +466,7 @@ public sealed partial class ScanService {
         ReserveAutomationWork();
         try {
             ClearSelectionPlan();
+            _resultsGeneration = null;
             string folder = ConfiguredStateFolder();
             var config = await LoadAutomationCoreAsync(folder);
             await new CleanupProtectionGuard(folder).RecoverAsync();
@@ -467,8 +484,14 @@ public sealed partial class ScanService {
                 _engine.Duplicates = saved.Rows.Select(r => r.Item).ToHashSet();
                 _resultSnapshots = saved.Rows.Where(r => r.Snapshot is not null).ToDictionary(r => r.Item, r => r.Snapshot!);
                 _resultStateFolder = folder;
+                _resultsGeneration = saved.Generation;
                 State = saved.Completed == true || saved.Completed is null && saved.Rows.Count > 0 ? ScanState.Done : ScanState.Idle;
-                if (await SelectionPlanStore.LoadAsync(Path.Combine(folder, "SelectionPlan.json")) is not null) {
+                string planPath = Path.Combine(folder, "SelectionPlan.json");
+                await RequireSupportedJournalCopiesAsync(planPath, "selection preview");
+                var preview = await DurableJsonFile.ReadAsync(planPath,
+                    WebAutomationJsonContext.Default.WebSelectionPlanEnvelope, ValidateSelectionPlan);
+                if (saved.Rows.Count > 0 && preview is { Plan.Decisions.Count: > 0 } &&
+                    preview.ResultGeneration == saved.Generation) {
                     // An explanation saved before a later manual review is not
                     // current permission or a current checkbox selection.
                     config.Selection.HighlightedGroupsOnly = false;

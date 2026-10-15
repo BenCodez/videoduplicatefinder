@@ -226,6 +226,235 @@ public sealed class WebAutomationTests : IAsyncLifetime {
         Assert.True(File.Exists(sidecar));
     }
 
+    [Theory]
+    [InlineData(false, "complete")]
+    [InlineData(true, "complete")]
+    [InlineData(false, "prepare")]
+    [InlineData(true, "prepare")]
+    [InlineData(false, "abort")]
+    [InlineData(true, "abort")]
+    [InlineData(false, "incomplete")]
+    [InlineData(true, "incomplete")]
+    public async Task ReplacingResultsInvalidatesPersistedPreviewBeforeAutomaticSelectionIsDisabled(bool scheduled, string outcome) {
+        Seed("previous-a.mp4"); Seed("previous-b.mp4"); Anchor(); ScanEngine.SaveDatabase();
+        await scan.RemoveFromResultsAsync([]);
+        await scan.PreviewSelectionAsync();
+        var config = await scan.LoadAutomationAsync(); config.Selection.AutoAfterScan = false;
+        config.Schedule = new() { Enabled = scheduled, Kind = ScanScheduleKind.Interval, IntervalMinutes = 5 };
+        await scan.SaveAutomationAsync(config);
+        scan.PrepareScanAsync = (_, _) => outcome == "prepare" ? Task.FromException(new IOException("Synthetic preparation failure")) : Task.CompletedTask;
+        scan.StartSearchOverride = () => { Seed("current-a.mp4"); Seed("current-b.mp4"); ScanEngine.SaveDatabase(); };
+        if (scheduled) await scan.CheckScheduleAsync(DateTimeOffset.UtcNow);
+        else await scan.StartScanAndCompare();
+        if (outcome is "complete" or "abort") await scan.CompleteWebScanAsync(outcome == "abort");
+        using var restarted = NewService();
+        try {
+            await restarted.InitializeWebAutomationAsync();
+            Assert.Null(restarted.LastSelectionPlan);
+            Assert.Equal(outcome == "complete" ? 2 : 0, restarted.Duplicates.Count);
+        }
+        finally { if (scan.IsBusy) await scan.CompleteWebScanAsync(true); }
+        Assert.All(Directory.GetFiles(folder, "*.mp4"), path => Assert.Equal(new byte[] { 1, 2, 3, 4 }, File.ReadAllBytes(path)));
+    }
+
+    [Theory]
+    [InlineData("reset")]
+    [InlineData("clear")]
+    [InlineData("dismiss")]
+    public async Task ExplicitResultGenerationChangesInvalidatePersistedPreview(string operation) {
+        Seed("previous-a.mp4"); Seed("previous-b.mp4"); Anchor(); ScanEngine.SaveDatabase();
+        await scan.RemoveFromResultsAsync([]); await scan.PreviewSelectionAsync();
+        if (operation == "reset") await scan.ResetAsync();
+        if (operation == "clear") await scan.ClearDatabaseAsync();
+        if (operation == "dismiss") await scan.RemoveFromResultsAsync(scan.Duplicates.ToArray());
+        using var restarted = NewService(); await restarted.InitializeWebAutomationAsync();
+        Assert.Empty(restarted.Duplicates); Assert.Null(restarted.LastSelectionPlan);
+        Assert.All(Directory.GetFiles(folder, "*.mp4"), path => Assert.True(File.Exists(path)));
+    }
+
+    [Theory]
+    [InlineData(false, false)]
+    [InlineData(true, false)]
+    [InlineData(false, true)]
+    [InlineData(true, true)]
+    public async Task FailedResultSaveCannotBindANewPreviewToOlderRows(bool legacy, bool retry) {
+        Seed("saved-a.mp4"); Seed("saved-b.mp4"); Seed("saved-c.mp4"); Anchor(); ScanEngine.SaveDatabase();
+        await scan.RemoveFromResultsAsync([]); await scan.PreviewSelectionAsync();
+        string results = Path.Combine(folder, "WebResults.json"), plan = Path.Combine(folder, "SelectionPlan.json");
+        if (legacy) foreach (string suffix in new[] { "", ".bak" }) {
+            var rows = JsonNode.Parse(File.ReadAllText(results + suffix))!; rows.AsObject().Remove("generation");
+            var preview = JsonNode.Parse(File.ReadAllText(plan + suffix))!; preview.AsObject().Remove("resultGeneration");
+            File.WriteAllText(results + suffix, rows.ToJsonString()); File.WriteAllText(plan + suffix, preview.ToJsonString());
+        }
+        using var active = NewService(); await active.InitializeWebAutomationAsync();
+        byte[] original = File.ReadAllBytes(results), backup = File.ReadAllBytes(results + ".bak");
+        using (JournalWriteLease.Acquire(results))
+            await Assert.ThrowsAsync<IOException>(() => active.RemoveFromResultsAsync([active.Duplicates.First()]));
+        Assert.Equal(2, active.Duplicates.Count);
+        Assert.Equal(original, File.ReadAllBytes(results)); Assert.Equal(backup, File.ReadAllBytes(results + ".bak"));
+        if (retry) await active.RemoveFromResultsAsync([]);
+        Assert.Equal(2, (await active.PreviewSelectionAsync()).Decisions.Count);
+        using var restarted = NewService(); await restarted.InitializeWebAutomationAsync();
+        Assert.Equal(retry ? 2 : 3, restarted.Duplicates.Count);
+        if (retry) Assert.Equal(2, restarted.LastSelectionPlan?.Decisions.Count); else Assert.Null(restarted.LastSelectionPlan);
+        Assert.All(Directory.GetFiles(folder, "*.mp4"), path => Assert.Equal(new byte[] { 1, 2, 3, 4 }, File.ReadAllBytes(path)));
+    }
+
+    [Theory]
+    [InlineData(false, "fault")]
+    [InlineData(true, "fault")]
+    [InlineData(false, "cancel")]
+    [InlineData(true, "cancel")]
+    [InlineData(false, "stop")]
+    [InlineData(true, "stop")]
+    [InlineData(false, "prepare")]
+    [InlineData(true, "prepare")]
+    public async Task EngineFaultsAreFailedRunsAndExplicitCancellationRemainsAborted(bool scheduled, string outcome) {
+        string media = Path.Combine(folder, "preserved.bin"); await File.WriteAllBytesAsync(media, [1, 2, 3, 4]);
+        var config = await scan.LoadAutomationAsync(); config.Selection.AutoAfterScan = true;
+        config.Schedule = new() { Enabled = scheduled, Kind = ScanScheduleKind.Interval, IntervalMinutes = 5 };
+        await scan.SaveAutomationAsync(config);
+        scan.Settings.UseNativeFfmpegBinding = false; Assert.True(scan.SaveSettings());
+        scan.PrepareScanAsync = (_, _) => Task.CompletedTask;
+        var terminal = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        scan.Engine.ScanAborted += (_, _) => terminal.TrySetResult();
+        scan.Engine.FilesEnumerated += (_, _) => {
+            if (outcome == "fault") throw new IOException("Synthetic scan engine failure");
+            if (outcome == "cancel") throw new OperationCanceledException();
+            if (outcome == "stop") scan.Stop();
+        };
+        scan.StartSearchOverride = () => {
+            if (outcome == "prepare") {
+                scan.Engine.Settings.IncludeList = null!; // Fail inside the real engine preparation, after Web preflight.
+            }
+            scan.Engine.StartSearch(searchAndCompare: false);
+        };
+        if (scheduled) await scan.CheckScheduleAsync(DateTimeOffset.UtcNow); else await scan.StartScanAndCompare();
+        await terminal.Task.WaitAsync(TimeSpan.FromSeconds(15));
+        await scan.CompletionTask.WaitAsync(TimeSpan.FromSeconds(15));
+        bool failed = outcome is "fault" or "prepare";
+        Assert.Equal(failed ? ScanState.Error : ScanState.Aborted, scan.State);
+        if (failed) Assert.False(string.IsNullOrWhiteSpace(scan.ErrorMessage)); else Assert.Null(scan.ErrorMessage);
+        Assert.False(scan.IsBusy); Assert.Null(scan.LastSelectionPlan);
+        if (scheduled) {
+            if (failed) Assert.StartsWith("Failed:", scan.ScheduleState?.Status); else Assert.Equal("Aborted", scan.ScheduleState?.Status);
+            Assert.NotNull(scan.ScheduleState?.LastCompletedUtc);
+            using var lease = JournalWriteLease.Acquire(Path.Combine(folder, ScanService.ScheduledRunLeaseFileName));
+        }
+        Assert.Equal(new byte[] { 1, 2, 3, 4 }, await File.ReadAllBytesAsync(media));
+    }
+
+    [Theory]
+    [InlineData("matched")]
+    [InlineData("mismatched")]
+    [InlineData("legacy-both")]
+    [InlineData("legacy-plan")]
+    [InlineData("legacy-results")]
+    [InlineData("empty-plan")]
+    [InlineData("bad-results")]
+    [InlineData("bad-plan")]
+    [InlineData("core-writer")]
+    [InlineData("backup-plan")]
+    [InlineData("fallback-binding")]
+    public async Task SavedPreviewUsesItsOwnResultGenerationAndPreservesLegacyPairs(string kind) {
+        Seed("generation-a.mp4"); Seed("generation-b.mp4"); Anchor(); ScanEngine.SaveDatabase();
+        await scan.RemoveFromResultsAsync([]); await scan.PreviewSelectionAsync();
+        string results = Path.Combine(folder, "WebResults.json"), planPath = Path.Combine(folder, "SelectionPlan.json");
+        foreach (string suffix in new[] { "", ".bak" }) {
+            var rows = JsonNode.Parse(File.ReadAllText(results + suffix))!;
+            var plan = JsonNode.Parse(File.ReadAllText(planPath + suffix))!;
+            if (kind is "legacy-both" or "legacy-results") rows.AsObject().Remove("generation");
+            if (kind is "legacy-both" or "legacy-plan") plan.AsObject().Remove("resultGeneration");
+            if (kind is "mismatched" or "fallback-binding") rows["generation"] = Guid.NewGuid().ToString("N");
+            if (kind == "empty-plan") plan["plan"]!["decisions"] = new JsonArray();
+            if (kind == "bad-results") rows["generation"] = "invalid generation";
+            if (kind == "bad-plan") plan["resultGeneration"] = "invalid generation";
+            File.WriteAllText(results + suffix, rows.ToJsonString()); File.WriteAllText(planPath + suffix, plan.ToJsonString());
+        }
+        if (kind == "core-writer") {
+            var corePlan = await SelectionPlanStore.LoadAsync(planPath); Assert.Equal(2, corePlan!.Decisions.Count);
+            await SelectionPlanStore.SaveAsync(planPath, corePlan);
+        }
+        if (kind == "backup-plan") File.Delete(planPath);
+        if (kind == "fallback-binding") {
+            var primary = JsonNode.Parse(File.ReadAllText(planPath))!;
+            primary["resultGeneration"] = JsonNode.Parse(File.ReadAllText(results))!["generation"]!.GetValue<string>();
+            primary["plan"] = "damaged payload"; File.WriteAllText(planPath, primary.ToJsonString());
+        }
+        using var restarted = NewService();
+        if (kind is "bad-results" or "bad-plan") await Assert.ThrowsAsync<InvalidDataException>(() => restarted.InitializeWebAutomationAsync());
+        else {
+            await restarted.InitializeWebAutomationAsync(); Assert.Equal(2, restarted.Duplicates.Count);
+            if (kind is "matched" or "legacy-both" or "backup-plan") Assert.Equal(2, restarted.LastSelectionPlan?.Decisions.Count);
+            else Assert.Null(restarted.LastSelectionPlan);
+        }
+        Assert.False(restarted.IsBusy);
+        Assert.All(Directory.GetFiles(folder, "*.mp4"), path => Assert.Equal(new byte[] { 1, 2, 3, 4 }, File.ReadAllBytes(path)));
+    }
+
+    [Theory]
+    [InlineData(false, "same")]
+    [InlineData(true, "same")]
+    [InlineData(false, "renamed")]
+    [InlineData(true, "renamed")]
+    [InlineData(false, "changed")]
+    [InlineData(true, "changed")]
+    public async Task FuturePreviewCopiesRefuseInitializationEvenWhenTheirGenerationIsNotCurrent(bool backup, string shape) {
+        Seed("future-generation-a.mp4"); Seed("future-generation-b.mp4"); Anchor(); ScanEngine.SaveDatabase();
+        await scan.RemoveFromResultsAsync([]); await scan.PreviewSelectionAsync();
+        string path = Path.Combine(folder, "SelectionPlan.json"); var future = JsonNode.Parse(File.ReadAllText(path))!;
+        future["version"] = 2; future["resultGeneration"] = Guid.NewGuid().ToString("N");
+        if (shape == "renamed") { future["preview"] = future["plan"]!.DeepClone(); future.AsObject().Remove("plan"); }
+        if (shape == "changed") future["plan"] = "future payload";
+        File.WriteAllText(path + (backup ? ".bak" : ""), future.ToJsonString());
+        byte[] primary = File.ReadAllBytes(path), previousBackup = File.ReadAllBytes(path + ".bak");
+        using var restarted = NewService();
+        await Assert.ThrowsAsync<NotSupportedException>(() => restarted.InitializeWebAutomationAsync());
+        Assert.Null(restarted.LastSelectionPlan); Assert.False(restarted.IsBusy);
+        Assert.Equal(primary, File.ReadAllBytes(path)); Assert.Equal(previousBackup, File.ReadAllBytes(path + ".bak"));
+    }
+
+    [Theory]
+    [InlineData(false, false, "corrupt")]
+    [InlineData(true, false, "corrupt")]
+    [InlineData(false, true, "corrupt")]
+    [InlineData(true, true, "corrupt")]
+    [InlineData(false, false, "future")]
+    [InlineData(true, false, "future")]
+    [InlineData(false, true, "future")]
+    [InlineData(true, true, "future")]
+    [InlineData(false, false, "lease")]
+    [InlineData(true, false, "lease")]
+    [InlineData(false, true, "lease")]
+    [InlineData(true, true, "lease")]
+    public async Task PreviewStorageFaultCannotLoseCompletedResultsOrLendAnOlderGeneration(bool scheduled, bool autoPreview, string fault) {
+        Seed("previous-a.mp4"); Seed("previous-b.mp4"); Anchor(); ScanEngine.SaveDatabase();
+        await scan.RemoveFromResultsAsync([]); await scan.PreviewSelectionAsync();
+        string path = Path.Combine(folder, "SelectionPlan.json");
+        byte[] original = File.ReadAllBytes(path), originalBackup = File.ReadAllBytes(path + ".bak");
+        var config = await scan.LoadAutomationAsync(); config.Selection.AutoAfterScan = autoPreview;
+        config.Schedule = new() { Enabled = scheduled, Kind = ScanScheduleKind.Interval, IntervalMinutes = 5 };
+        await scan.SaveAutomationAsync(config);
+        scan.PrepareScanAsync = (_, _) => Task.CompletedTask;
+        scan.StartSearchOverride = () => { Seed("current-a.mp4"); Seed("current-b.mp4"); ScanEngine.SaveDatabase(); };
+        if (scheduled) await scan.CheckScheduleAsync(DateTimeOffset.UtcNow); else await scan.StartScanAndCompare();
+        if (fault == "corrupt") { File.WriteAllText(path, "{"); File.WriteAllText(path + ".bak", "{"); }
+        if (fault == "future") { var future = JsonNode.Parse(File.ReadAllText(path))!; future["version"] = 2; File.WriteAllText(path, future.ToJsonString()); }
+        byte[] primary = File.ReadAllBytes(path), backup = File.ReadAllBytes(path + ".bak");
+        using (fault == "lease" ? JournalWriteLease.Acquire(path) : null) await scan.CompleteWebScanAsync(false);
+        Assert.Equal(autoPreview ? ScanState.Error : ScanState.Done, scan.State);
+        Assert.Equal(primary, File.ReadAllBytes(path)); Assert.Equal(backup, File.ReadAllBytes(path + ".bak"));
+        foreach (string suffix in new[] { "", ".bak" }) {
+            var rows = JsonNode.Parse(File.ReadAllText(Path.Combine(folder, "WebResults.json" + suffix)))!;
+            Assert.Equal(2, rows["rows"]!.AsArray().Count); Assert.True(rows["completed"]!.GetValue<bool>());
+        }
+        File.WriteAllBytes(path, original); File.WriteAllBytes(path + ".bak", originalBackup);
+        using var restarted = NewService(); await restarted.InitializeWebAutomationAsync();
+        Assert.Equal(2, restarted.Duplicates.Count); Assert.Null(restarted.LastSelectionPlan);
+        Assert.All(restarted.Duplicates, item => Assert.StartsWith("current-", Path.GetFileName(item.Path)));
+        Assert.All(Directory.GetFiles(folder, "*.mp4"), media => Assert.Equal(new byte[] { 1, 2, 3, 4 }, File.ReadAllBytes(media)));
+    }
+
     [Fact]
     public async Task SchedulerDurablyClaimsBeforeSearchAndDoesNotRepeatAfterRestartWithoutBrowser() {
         var config = await scan.LoadAutomationAsync();

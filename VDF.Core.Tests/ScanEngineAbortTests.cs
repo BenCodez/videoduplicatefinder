@@ -40,12 +40,14 @@ public class ScanEngineAbortTests {
 			engine.FilesEnumerated += (_, _) => throw new InvalidOperationException("injected scan failure");
 
 			var aborted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-			engine.ScanAborted += (_, _) => aborted.TrySetResult();
+			EventArgs? abortedArgs = null;
+			engine.ScanAborted += (_, args) => { abortedArgs = args; aborted.TrySetResult(); };
 
 			engine.StartSearch(searchAndCompare: false);
 
 			var winner = await Task.WhenAny(aborted.Task, Task.Delay(TimeSpan.FromSeconds(30)));
 			Assert.True(winner == aborted.Task, "ScanAborted was not raised — the failed scan would hang the UI forever.");
+			Assert.NotNull(Assert.IsType<ScanAbortedEventArgs>(abortedArgs).Error);
 		}
 		finally {
 			VDF.Core.Utils.DatabaseUtils.CustomDatabaseFolder = null;
@@ -63,11 +65,13 @@ public class ScanEngineAbortTests {
 	public void Stop_WhenNoScanIsRunning_RaisesScanAborted() {
 		var engine = new ScanEngine();
 		bool aborted = false;
-		engine.ScanAborted += (_, _) => aborted = true;
+		EventArgs? abortedArgs = null;
+		engine.ScanAborted += (_, args) => { abortedArgs = args; aborted = true; };
 
 		engine.Stop();
 
 		Assert.True(aborted);
+		Assert.Null(Assert.IsType<ScanAbortedEventArgs>(abortedArgs).Error);
 	}
 
 	[Fact]
@@ -81,8 +85,9 @@ public class ScanEngineAbortTests {
 		engine.Settings.UseNativeFfmpegBinding = false;
 		engine.Settings.IncludeList.Add(directory);
 		int abortCount = 0;
+		EventArgs? abortedArgs = null;
 		engine.FilesEnumerated += (_, _) => { enumerated.TrySetResult(); release.Wait(TimeSpan.FromSeconds(15)); };
-		engine.ScanAborted += (_, _) => { Interlocked.Increment(ref abortCount); aborted.TrySetResult(); };
+		engine.ScanAborted += (_, args) => { abortedArgs = args; Interlocked.Increment(ref abortCount); aborted.TrySetResult(); };
 		try {
 			var starting = Task.Run(() => engine.StartSearch(searchAndCompare: false));
 			await enumerated.Task.WaitAsync(TimeSpan.FromSeconds(15));
@@ -92,6 +97,7 @@ public class ScanEngineAbortTests {
 			await aborted.Task.WaitAsync(TimeSpan.FromSeconds(15));
 			await starting;
 			Assert.Equal(1, Volatile.Read(ref abortCount));
+			Assert.Null(Assert.IsType<ScanAbortedEventArgs>(abortedArgs).Error);
 		}
 		finally {
 			release.Set();

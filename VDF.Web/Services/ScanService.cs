@@ -110,7 +110,7 @@ namespace VDF.Web.Services {
 				Notify();
 			};
 			_engine.ScanDone += (_, _) => CompletionTask = CompleteWebScanAsync(false);
-			_engine.ScanAborted += (_, _) => CompletionTask = CompleteWebScanAsync(true);
+			_engine.ScanAborted += (_, args) => CompletionTask = CompleteWebScanAsync(true, (args as ScanAbortedEventArgs)?.Error);
 		}
 
 		public Task StartScanAndCompare() => StartWebScanAsync(false, DateTimeOffset.UtcNow);

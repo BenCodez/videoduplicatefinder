@@ -44,6 +44,7 @@ public sealed record WebAutomationView(IReadOnlyList<WebReviewRow> Rows,
 [JsonSerializable(typeof(SelectionOptions))]
 [JsonSerializable(typeof(VDF.Core.Settings))]
 [JsonSerializable(typeof(WebResultsEnvelope))]
+[JsonSerializable(typeof(WebSelectionPlanEnvelope))]
 [JsonSerializable(typeof(WebJournalVersion))]
 internal partial class WebAutomationJsonContext : JsonSerializerContext { }
 
@@ -58,6 +59,12 @@ internal sealed class WebResultsEnvelope {
     // Optional for existing version 1 files. Legacy empty snapshots do not
     // establish that a scan completed; nonempty legacy results still restore.
     public bool? Completed { get; set; }
+    public string? Generation { get; set; }
+}
+internal sealed class WebSelectionPlanEnvelope {
+    [JsonRequired] public int Version { get; set; } = 1;
+    [JsonRequired] public SelectionPlan Plan { get; set; } = new();
+    public string? ResultGeneration { get; set; }
 }
 internal sealed class WebSavedResult {
     [JsonRequired] public DuplicateItem Item { get; set; } = new();

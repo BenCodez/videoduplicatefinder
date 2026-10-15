@@ -41,6 +41,7 @@ public sealed partial class ScanService {
 		}
 		lock (_operationSync) {
 			_resultSnapshots = snapshots;
+			_resultsGeneration = null;
 			_resultStateFolder = actualStateFolder ?? CoreUtils.ResolveDatabaseFolder(Settings.CustomDatabaseFolder);
 			ObserveReviewJournal(_resultStateFolder);
 		}
@@ -48,6 +49,7 @@ public sealed partial class ScanService {
 
 	void ClearCleanupSnapshots() {
 		_resultSnapshots.Clear();
+		_resultsGeneration = null;
 		_resultStateFolder = null;
 	}
 

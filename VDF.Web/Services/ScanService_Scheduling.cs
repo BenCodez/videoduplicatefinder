@@ -87,12 +87,17 @@ public sealed partial class ScanService {
         return true;
     }
 
-    internal async Task CompleteWebScanAsync(bool aborted) {
+    internal async Task CompleteWebScanAsync(bool aborted, Exception? failure = null) {
         lock (_operationSync) {
             if (_terminalProcessing) return;
             _terminalProcessing = true;
         }
         try {
+            if (failure is not null) {
+                SetError(failure);
+                await FinishScheduledStateAsync("Failed: " + failure.Message);
+                return;
+            }
             if (!aborted) {
                 CaptureCleanupSnapshots(DatabaseUtils.GetDatabaseFolderPath());
                 // Preserve completed scan output even if optional settings or
