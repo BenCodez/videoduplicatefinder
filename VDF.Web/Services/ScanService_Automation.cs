@@ -283,7 +283,7 @@ public sealed partial class ScanService {
         string folder = ResultsStateFolder();
         if (!PathComparer.ForCurrentPlatform.Equals(NormalizeDatabaseFolder(DatabaseUtils.GetDatabaseFolderPath()),
             NormalizeDatabaseFolder(folder)) && !await LoadDatabaseWithResultsAuthorityAsync(folder)) {
-            ClearCleanupSnapshots();
+            RevokeResultsDatabaseAuthority();
             throw new IOException("The results database could not be loaded; rescan before cleanup.");
         }
         return folder;
@@ -368,26 +368,27 @@ public sealed partial class ScanService {
         SafePaths.Exists(Path.Combine(folder, "WebResults.json.bak"));
     async Task InvalidatePersistedResultsForScanAsync() {
         string nextFolder = CoreUtils.ResolveDatabaseFolder(_engine.Settings.CustomDatabaseFolder);
-        if (_runAutomation is null && _resultStateFolder is null && !HasSavedResultsJournal(nextFolder)) return;
+        if (_runAutomation is null && _resultOriginFolder is null && !HasSavedResultsJournal(nextFolder)) return;
         // Commit the discarded generation before preparation or the engine can
         // fail, be interrupted, or change its database. Both journal copies must
         // be empty so restart cannot resurrect results this scan replaced.
         nextFolder = ConfiguredStateFolder(_engine.Settings);
         await SaveResultsAsync(nextFolder, new());
-        if (_resultStateFolder is { } previous && !PathComparer.ForCurrentPlatform.Equals(
+        if (_resultOriginFolder is { } previous && !PathComparer.ForCurrentPlatform.Equals(
             NormalizeDatabaseFolder(previous), NormalizeDatabaseFolder(nextFolder))) {
             SafePaths.RequireDirectory(previous);
             await SaveResultsAsync(previous, new());
         }
         ResultsPersistenceWarning = null;
     }
-    async Task PersistResultsAsync() {
-        if (_resultStateFolder is null) return;
+    async Task PersistResultsAsync(string? persistenceFolder = null) {
+        string? folder = persistenceFolder ?? _resultStateFolder;
+        if (folder is null) return;
         // A failed save leaves the changed in-memory rows unsaved. A later
         // preview must not borrow the preceding durable generation, including
         // a legacy snapshot whose generation is null.
         _resultsGeneration = Guid.NewGuid().ToString("N");
-        var saved = await SaveResultsAsync(_resultStateFolder, Duplicates.Select(item => new WebSavedResult {
+        var saved = await SaveResultsAsync(folder, Duplicates.Select(item => new WebSavedResult {
             Item = item, Snapshot = _resultSnapshots.GetValueOrDefault(item) }).ToList(), allowSizeFallback: true, completed: true);
         _resultsGeneration = saved.Generation;
         ResultsPersistenceWarning = saved.Saved ? null : "These results exceed the 32 MiB save limit. They are available only until the service restarts; run a new scan after restarting to recreate the results.";
@@ -414,7 +415,7 @@ public sealed partial class ScanService {
     public async Task ResetAsync() {
         ReserveAutomationWork();
         try {
-            if (_resultStateFolder is { } folder) await SaveResultsAsync(folder, new());
+            if (_resultOriginFolder is { } folder) await SaveResultsAsync(folder, new());
             ResultsPersistenceWarning = null;
             _engine.Duplicates.Clear();
             ClearCleanupSnapshots();
@@ -436,7 +437,7 @@ public sealed partial class ScanService {
             DropSingletonGroups();
             ClearSelectionPlan();
             _quarantinePreview = null;
-            await PersistResultsAsync();
+            await PersistResultsAsync(_resultOriginFolder);
         }
         finally { EndDataWork(); }
     }
@@ -491,6 +492,7 @@ public sealed partial class ScanService {
                 _engine.Duplicates = saved.Rows.Select(r => r.Item).ToHashSet();
                 _resultSnapshots = saved.Rows.Where(r => r.Snapshot is not null).ToDictionary(r => r.Item, r => r.Snapshot!);
                 _resultStateFolder = folder;
+                _resultOriginFolder = folder;
                 _resultsGeneration = saved.Generation;
                 State = saved.Completed == true || saved.Completed is null && saved.Rows.Count > 0 ? ScanState.Done : ScanState.Idle;
                 string planPath = Path.Combine(folder, "SelectionPlan.json");

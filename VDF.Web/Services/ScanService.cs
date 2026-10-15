@@ -318,7 +318,7 @@ namespace VDF.Web.Services {
 						throw new IOException("These results have no verified file snapshots. Rescan before moving files.");
 					if (!PathComparer.ForCurrentPlatform.Equals(Path.GetFullPath(DatabaseUtils.GetDatabaseFolderPath()),
 						Path.GetFullPath(_resultStateFolder)) && !await LoadDatabaseWithResultsAuthorityAsync(_resultStateFolder)) {
-						ClearCleanupSnapshots();
+						RevokeResultsDatabaseAuthority();
 						throw new IOException("The results database could not be loaded; files were retained.");
 					}
 					var sw = System.Diagnostics.Stopwatch.StartNew();
@@ -415,6 +415,11 @@ namespace VDF.Web.Services {
 				// database; a restart must not revive this folder's old rows.
 				if (File.Exists(AutomationStore.Path) || HasSavedResultsJournal(folder))
 					await SaveResultsAsync(folder, new());
+				// Visible rows can still belong to a previously selected database.
+				// Invalidate their saved generation before forgetting its authority.
+				if (_resultOriginFolder is { } producing && !PathComparer.ForCurrentPlatform.Equals(
+					NormalizeDatabaseFolder(producing), NormalizeDatabaseFolder(folder)))
+					await SaveResultsAsync(producing, new());
 				ResultsPersistenceWarning = null;
 				ScanEngine.ClearDatabase();
 				_engine.Duplicates.Clear();

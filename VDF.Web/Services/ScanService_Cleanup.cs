@@ -12,6 +12,8 @@ namespace VDF.Web.Services;
 public sealed partial class ScanService {
 	Dictionary<DuplicateItem, FileSnapshot> _resultSnapshots = new();
 	string? _resultStateFolder;
+	// Persistence origin survives revoked cleanup authority until rows are discarded.
+	string? _resultOriginFolder;
 	readonly HashSet<string> _observedReviewJournals = new(PathComparer.ForCurrentPlatform);
 
 	// Tests exercise file actions and database transitions using copied state.
@@ -43,11 +45,17 @@ public sealed partial class ScanService {
 			_resultSnapshots = snapshots;
 			_resultsGeneration = null;
 			_resultStateFolder = actualStateFolder ?? CoreUtils.ResolveDatabaseFolder(Settings.CustomDatabaseFolder);
+			_resultOriginFolder = _resultStateFolder;
 			ObserveReviewJournal(_resultStateFolder);
 		}
 	}
 
 	void ClearCleanupSnapshots() {
+		RevokeResultsDatabaseAuthority();
+		_resultOriginFolder = null;
+	}
+
+	void RevokeResultsDatabaseAuthority() {
 		_resultSnapshots.Clear();
 		_resultsGeneration = null;
 		_resultStateFolder = null;
@@ -112,7 +120,7 @@ public sealed partial class ScanService {
 		// that touched their producing folder revoke those results' authority.
 		if (_resultStateFolder is not null && PathComparer.ForCurrentPlatform.Equals(
 			NormalizeDatabaseFolder(folder), NormalizeDatabaseFolder(_resultStateFolder)))
-			ClearCleanupSnapshots();
+			RevokeResultsDatabaseAuthority();
 	}
 
 	static bool MatchesScannedMetadata(DuplicateItem item, long length, DateTime modifiedUtc) =>
@@ -148,7 +156,7 @@ public sealed partial class ScanService {
 					Path.GetFullPath(_resultStateFolder)) && !await LoadDatabaseWithResultsAuthorityAsync(_resultStateFolder)) {
 					// A failed load can set the global folder while retaining another
 					// database wrapper. Retries must require a fresh scan authority.
-					ClearCleanupSnapshots();
+					RevokeResultsDatabaseAuthority();
 					throw new IOException("The results database could not be loaded; files were retained.");
 				}
 				await guard.RecoverAsync();

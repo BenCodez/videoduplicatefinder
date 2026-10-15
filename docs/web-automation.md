@@ -106,6 +106,13 @@ not inherit an unbound older preview. The shared scan database format is unchang
 Result invalidation, completion saves and explicit resets are independent of the
 optional automation configuration. Missing established protection settings still
 require restoration; scanning does not replace them with permissive defaults.
+Clear Database empties only the selected scan database, and invalidates saved
+results in both that folder and the folder that produced the visible rows.
+If either result save fails, the database and visible rows are retained for retry;
+Reset clears only the visible result generation and leaves scan databases intact.
+The saved origin remains tracked after a failed database load revokes cleanup
+authority; restoring storage does not reauthorize file operations in the running
+service without a rescan.
 Completed results are saved before optional settings reload or selection
 processing, so restoring settings after a reported configuration error retains
 the completed scan output.

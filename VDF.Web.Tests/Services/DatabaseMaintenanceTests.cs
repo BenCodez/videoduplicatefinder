@@ -87,6 +87,192 @@ public sealed class DatabaseMaintenanceTests : IAsyncLifetime {
 		Assert.Equal(databaseABefore, File.ReadAllBytes(Path.Combine(databaseA, "ScannedFiles.db")));
 	}
 
+	async Task SeedSavedResultsInBothFoldersAsync(bool saveDestinationResults) {
+		scan.Settings.IncludeList.Add(folder); Assert.True(scan.SaveSettings()); await scan.LoadAutomationAsync();
+		string second = Path.Combine(folder, "second.mp4"); File.WriteAllBytes(second, [1, 2, 3, 4]);
+		DatabaseUtils.Database.Add(new FileEntry(second));
+		var group = Guid.NewGuid();
+		scan.Engine.Duplicates = DatabaseUtils.Database.Select(entry => new DuplicateItem(entry, .01f, group, DuplicateFlags.None)).ToHashSet();
+		ScanEngine.SaveDatabase(); databaseABefore = File.ReadAllBytes(Path.Combine(databaseA, "ScannedFiles.db"));
+		scan.CaptureCleanupSnapshots(databaseA); await scan.RemoveFromResultsAsync([]); await scan.PreviewSelectionAsync();
+		Assert.True(await ScanEngine.LoadDatabase(databaseB)); DatabaseUtils.Database.Clear();
+		foreach (string path in new[] { mediaPath, second }) DatabaseUtils.Database.Add(new FileEntry(path));
+		string marker = Path.Combine(folder, "destination-only.mp4"); File.WriteAllBytes(marker, [1, 2, 3, 4]);
+		DatabaseUtils.Database.Add(new FileEntry(marker)); ScanEngine.SaveDatabase();
+		if (saveDestinationResults) {
+			using var destination = new ScanService(new WebSettingsService()); destination.Settings.CustomDatabaseFolder = databaseB;
+			var destinationGroup = Guid.NewGuid();
+			destination.Engine.Duplicates = DatabaseUtils.Database.Select(entry => new DuplicateItem(entry, .01f, destinationGroup, DuplicateFlags.None)).ToHashSet();
+			destination.CaptureCleanupSnapshots(databaseB); await destination.RemoveFromResultsAsync([]);
+		}
+	}
+
+	Action HideAutomationConfiguration() {
+		string path = Path.Combine(folder, "web-settings.automation.json");
+		byte[] primary = File.ReadAllBytes(path), backup = File.ReadAllBytes(path + ".bak");
+		File.Delete(path); File.Delete(path + ".bak");
+		return () => { File.WriteAllBytes(path, primary); File.WriteAllBytes(path + ".bak", backup); };
+	}
+
+	[Theory]
+	[InlineData(false, false, false)]
+	[InlineData(true, false, false)]
+	[InlineData(false, true, false)]
+	[InlineData(true, true, false)]
+	[InlineData(false, false, true)]
+	[InlineData(true, false, true)]
+	[InlineData(false, true, true)]
+	[InlineData(true, true, true)]
+	public async Task ClearAfterFolderSwitchInvalidatesProducingAndDestinationResults(bool freshService, bool destinationResults, bool missingConfig) {
+		await SeedSavedResultsInBothFoldersAsync(destinationResults);
+		using var fresh = freshService ? new ScanService(new WebSettingsService()) : null;
+		var actor = fresh ?? scan;
+		if (freshService) { actor.Settings.CustomDatabaseFolder = databaseA; await actor.InitializeWebAutomationAsync(); }
+		Assert.Equal(2, actor.Duplicates.Count);
+		actor.Settings.CustomDatabaseFolder = databaseB; Assert.True(actor.SaveSettings());
+		Action? restore = missingConfig ? HideAutomationConfiguration() : null;
+		try { await actor.ClearDatabaseAsync(); }
+		finally { restore?.Invoke(); }
+		Assert.False(actor.IsBusy); Assert.Empty(actor.Duplicates); Assert.Empty(DatabaseUtils.Database);
+		Assert.Equal(databaseABefore, File.ReadAllBytes(Path.Combine(databaseA, "ScannedFiles.db")));
+		foreach (string state in new[] { databaseA, databaseB }) {
+			using var restarted = new ScanService(new WebSettingsService()); restarted.Settings.CustomDatabaseFolder = state;
+			await restarted.InitializeWebAutomationAsync();
+			Assert.Empty(restarted.Duplicates); Assert.Null(restarted.LastSelectionPlan);
+			Assert.Equal(state == databaseA ? 2 : 0, restarted.DatabaseEntryCount);
+		}
+		Assert.All(Directory.GetFiles(folder, "*.mp4"), path => Assert.Equal(new byte[] { 1, 2, 3, 4 }, File.ReadAllBytes(path)));
+	}
+
+	[Theory]
+	[InlineData(false, "corrupt")]
+	[InlineData(true, "corrupt")]
+	[InlineData(false, "future")]
+	[InlineData(true, "future")]
+	[InlineData(false, "lease")]
+	[InlineData(true, "lease")]
+	[InlineData(false, "missing")]
+	[InlineData(true, "missing")]
+	public async Task ProducingResultStorageFaultRefusesClearAcrossFoldersUntilRepaired(bool missingConfig, string fault) {
+		await SeedSavedResultsInBothFoldersAsync(true);
+		byte[] databaseBBefore = File.ReadAllBytes(Path.Combine(databaseB, "ScannedFiles.db"));
+		string path = Path.Combine(databaseA, "WebResults.json"), held = Path.Combine(folder, "held-a");
+		byte[] primary = File.ReadAllBytes(path), backup = File.ReadAllBytes(path + ".bak");
+		scan.Settings.CustomDatabaseFolder = databaseB; Assert.True(scan.SaveSettings());
+		Action? restoreConfig = missingConfig ? HideAutomationConfiguration() : null;
+		if (fault == "corrupt") File.WriteAllText(path, "{");
+		if (fault == "future") {
+			var future = System.Text.Json.Nodes.JsonNode.Parse(File.ReadAllText(path))!; future["version"] = 2;
+			File.WriteAllText(path, future.ToJsonString());
+		}
+		if (fault == "missing") Directory.Move(databaseA, held);
+		byte[]? invalid = fault == "missing" ? null : File.ReadAllBytes(path);
+		try {
+			using (fault == "lease" ? JournalWriteLease.Acquire(path) : null) for (int retry = 0; retry < 2; retry++) {
+				if (fault == "future") await Assert.ThrowsAsync<NotSupportedException>(() => scan.ClearDatabaseAsync());
+				else if (fault == "corrupt") await Assert.ThrowsAsync<InvalidDataException>(() => scan.ClearDatabaseAsync());
+				else if (fault == "missing") await Assert.ThrowsAnyAsync<IOException>(() => scan.ClearDatabaseAsync());
+				else await Assert.ThrowsAsync<IOException>(() => scan.ClearDatabaseAsync());
+				Assert.False(scan.IsBusy); Assert.Equal(2, scan.Duplicates.Count);
+				Assert.Equal(databaseBBefore, File.ReadAllBytes(Path.Combine(databaseB, "ScannedFiles.db")));
+				if (fault == "missing") Assert.False(Directory.Exists(databaseA));
+				else Assert.Equal(invalid, File.ReadAllBytes(path));
+			}
+		}
+		finally {
+			if (fault == "missing") Directory.Move(held, databaseA);
+			File.WriteAllBytes(path, primary); File.WriteAllBytes(path + ".bak", backup);
+			restoreConfig?.Invoke();
+		}
+		await scan.ClearDatabaseAsync(); Assert.Empty(scan.Duplicates); Assert.Empty(DatabaseUtils.Database);
+		Assert.Equal(databaseABefore, File.ReadAllBytes(Path.Combine(databaseA, "ScannedFiles.db")));
+		using var restarted = new ScanService(new WebSettingsService()); restarted.Settings.CustomDatabaseFolder = databaseA;
+		await restarted.InitializeWebAutomationAsync(); Assert.Empty(restarted.Duplicates); Assert.Null(restarted.LastSelectionPlan);
+		Assert.All(Directory.GetFiles(folder, "*.mp4"), media => Assert.Equal(new byte[] { 1, 2, 3, 4 }, File.ReadAllBytes(media)));
+	}
+
+	public static IEnumerable<object[]> RevokedOriginTransitions() {
+		foreach (string revocation in new[] { "clear", "clean", "move", "delete-load", "quarantine", "false", "throw" })
+			foreach (string discard in new[] { "clear", "reset", "scan" })
+				foreach (bool missingConfig in new[] { false, true }) yield return [revocation, discard, missingConfig];
+	}
+
+	async Task RevokeProducingAuthorityAsync(string operation) {
+		var item = scan.Duplicates.First();
+		if (operation == "delete-load") scan.DatabaseLoader = async requested => { Assert.True(await ScanEngine.LoadDatabase(requested)); return false; };
+		if (operation is "clear" or "clean" or "false" or "throw") {
+			scan.Settings.CustomDatabaseFolder = databaseA;
+			if (operation is "false" or "throw") scan.DatabaseLoader = async requested => {
+				Assert.True(await ScanEngine.LoadDatabase(requested));
+				if (operation == "throw") throw new IOException("Synthetic database load failure");
+				return false;
+			};
+			if (operation == "clean") await Assert.ThrowsAnyAsync<IOException>(() => scan.CleanDatabaseAsync());
+			else await Assert.ThrowsAnyAsync<IOException>(() => scan.ClearDatabaseAsync());
+			scan.DatabaseLoader = ScanEngine.LoadDatabase;
+		}
+		else if (operation == "quarantine") await Assert.ThrowsAnyAsync<IOException>(() => scan.PreviewQuarantineAsync([item]));
+		else {
+			var result = operation == "move" ? await scan.MoveItemsAsync([item], Path.Combine(folder, "must-not-move"))
+				: await scan.DeleteItemsAsync([item], permanent: true);
+			Assert.Equal(0, result.Done); Assert.Equal(1, result.Failed); Assert.NotEmpty(result.Errors);
+		}
+		scan.DatabaseLoader = ScanEngine.LoadDatabase;
+		Assert.False(scan.IsBusy); Assert.Equal(2, scan.Duplicates.Count);
+	}
+
+	[Theory]
+	[MemberData(nameof(RevokedOriginTransitions))]
+	public async Task RevokedAuthorityRetainsOriginForDiscardAndRetry(string revocation, string discard, bool missingConfig) {
+		await SeedSavedResultsInBothFoldersAsync(true);
+		string held = Path.Combine(folder, "held-a");
+		if (revocation is not ("false" or "throw" or "delete-load")) Directory.Move(databaseA, held);
+		await RevokeProducingAuthorityAsync(revocation);
+		if (revocation is "false" or "throw" or "delete-load") Directory.Move(databaseA, held);
+		scan.Settings.CustomDatabaseFolder = databaseB; Assert.True(scan.SaveSettings());
+		byte[] databaseBBefore = File.ReadAllBytes(Path.Combine(databaseB, "ScannedFiles.db"));
+		Action? restore = missingConfig ? HideAutomationConfiguration() : null;
+		int prepared = 0;
+		scan.PrepareScanAsync = (_, _) => { prepared++; throw new IOException("Synthetic preparation after invalidation"); };
+		try {
+			for (int retry = 0; retry < 2; retry++) {
+				if (discard == "clear") await Assert.ThrowsAnyAsync<IOException>(() => scan.ClearDatabaseAsync());
+				else if (discard == "reset") await Assert.ThrowsAnyAsync<IOException>(() => scan.ResetAsync());
+				else { await scan.StartScanAndCompare(); Assert.Equal(ScanState.Error, scan.State); Assert.Equal(0, prepared); }
+				Assert.False(scan.IsBusy); Assert.Equal(2, scan.Duplicates.Count); Assert.False(Directory.Exists(databaseA));
+				Assert.Equal(databaseBBefore, File.ReadAllBytes(Path.Combine(databaseB, "ScannedFiles.db")));
+			}
+		}
+		finally { Directory.Move(held, databaseA); restore?.Invoke(); }
+		// Restoring storage must not restore revoked file-operation authority.
+		var retained = await scan.DeleteItemsAsync([scan.Duplicates.First()], permanent: true);
+		Assert.Equal(0, retained.Done); Assert.Equal(1, retained.Failed);
+		if (discard == "clear") await scan.ClearDatabaseAsync();
+		else if (discard == "reset") await scan.ResetAsync();
+		else { await scan.StartScanAndCompare(); Assert.Equal(1, prepared); }
+		Assert.Empty(scan.Duplicates); Assert.False(scan.IsBusy);
+		Assert.Equal(databaseABefore, File.ReadAllBytes(Path.Combine(databaseA, "ScannedFiles.db")));
+		if (discard != "clear") Assert.Equal(databaseBBefore, File.ReadAllBytes(Path.Combine(databaseB, "ScannedFiles.db")));
+		using var restarted = new ScanService(new WebSettingsService()); restarted.Settings.CustomDatabaseFolder = databaseA;
+		await restarted.InitializeWebAutomationAsync(); Assert.Empty(restarted.Duplicates); Assert.Null(restarted.LastSelectionPlan);
+		Assert.All(Directory.GetFiles(folder, "*.mp4"), media => Assert.Equal(new byte[] { 1, 2, 3, 4 }, File.ReadAllBytes(media)));
+	}
+
+	[Theory]
+	[InlineData("clear")]
+	[InlineData("move")]
+	[InlineData("delete")]
+	[InlineData("quarantine")]
+	public async Task RevokedAuthorityDismissalCannotReviveSavedRows(string revocation) {
+		await SeedSavedResultsInBothFoldersAsync(true);
+		string held = Path.Combine(folder, "held-a"); Directory.Move(databaseA, held);
+		await RevokeProducingAuthorityAsync(revocation); Directory.Move(held, databaseA);
+		await scan.RemoveFromResultsAsync(scan.Duplicates.ToArray());
+		using var restarted = new ScanService(new WebSettingsService()); restarted.Settings.CustomDatabaseFolder = databaseA;
+		await restarted.InitializeWebAutomationAsync(); Assert.Empty(restarted.Duplicates); Assert.Null(restarted.LastSelectionPlan);
+		Assert.Equal(databaseABefore, File.ReadAllBytes(Path.Combine(databaseA, "ScannedFiles.db")));
+	}
+
 	[Theory]
 	[InlineData(false)]
 	[InlineData(true)]
@@ -108,6 +294,49 @@ public sealed class DatabaseMaintenanceTests : IAsyncLifetime {
 			Assert.Equal(databaseABefore, File.ReadAllBytes(Path.Combine(databaseA, "ScannedFiles.db")));
 			Assert.False(Directory.Exists(databaseB));
 		}
+	}
+
+	[Theory]
+	[InlineData(false)]
+	[InlineData(true)]
+	public async Task ResetAfterFolderSwitchOnlyDiscardsTheVisibleResultGeneration(bool missingConfig) {
+		await SeedSavedResultsInBothFoldersAsync(true);
+		byte[] databaseBBefore = File.ReadAllBytes(Path.Combine(databaseB, "ScannedFiles.db"));
+		scan.Settings.CustomDatabaseFolder = databaseB; Assert.True(scan.SaveSettings());
+		Action? restore = missingConfig ? HideAutomationConfiguration() : null;
+		try { await scan.ResetAsync(); } finally { restore?.Invoke(); }
+		Assert.Empty(scan.Duplicates); Assert.False(scan.IsBusy);
+		Assert.Equal(databaseABefore, File.ReadAllBytes(Path.Combine(databaseA, "ScannedFiles.db")));
+		Assert.Equal(databaseBBefore, File.ReadAllBytes(Path.Combine(databaseB, "ScannedFiles.db")));
+		foreach (string state in new[] { databaseA, databaseB }) {
+			using var restored = new ScanService(new WebSettingsService()); restored.Settings.CustomDatabaseFolder = state;
+			await restored.InitializeWebAutomationAsync(); Assert.Equal(state == databaseA ? 0 : 3, restored.Duplicates.Count);
+		}
+	}
+
+	[Theory]
+	[InlineData(false)]
+	[InlineData(true)]
+	public async Task DestinationLoadFailurePreservesProducingResultsUntilClearCanSucceed(bool unavailable) {
+		await SeedSavedResultsInBothFoldersAsync(true);
+		string primaryPath = Path.Combine(databaseA, "WebResults.json"), held = Path.Combine(folder, "held-b");
+		byte[] primary = File.ReadAllBytes(primaryPath), backup = File.ReadAllBytes(primaryPath + ".bak");
+		string targetDatabase = Path.Combine(databaseB, "ScannedFiles.db"); byte[] databaseBBefore = File.ReadAllBytes(targetDatabase);
+		scan.Settings.CustomDatabaseFolder = databaseB; Assert.True(scan.SaveSettings());
+		Assert.True(await ScanEngine.LoadDatabase(databaseA));
+		if (unavailable) Directory.Move(databaseB, held);
+		try {
+			for (int retry = 0; retry < 2; retry++) {
+				// Core quarantines a damaged primary; reinject it to exercise another failed load.
+				if (!unavailable) File.WriteAllBytes(targetDatabase, "VDFDB002"u8.ToArray());
+				await Assert.ThrowsAnyAsync<IOException>(() => scan.ClearDatabaseAsync());
+				Assert.False(scan.IsBusy); Assert.Equal(2, scan.Duplicates.Count);
+				Assert.Equal(primary, File.ReadAllBytes(primaryPath)); Assert.Equal(backup, File.ReadAllBytes(primaryPath + ".bak"));
+				Assert.Equal(databaseABefore, File.ReadAllBytes(Path.Combine(databaseA, "ScannedFiles.db")));
+			}
+		}
+		finally { if (unavailable) Directory.Move(held, databaseB); else File.WriteAllBytes(targetDatabase, databaseBBefore); }
+		await scan.ClearDatabaseAsync(); Assert.Empty(scan.Duplicates); Assert.Empty(DatabaseUtils.Database);
 	}
 
 	[Theory]
