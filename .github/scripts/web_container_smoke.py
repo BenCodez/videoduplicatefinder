@@ -63,7 +63,8 @@ def login(context, base, password):
     assert response.status == 302 and response.headers["location"] == "/"
     assert "httponly" in response.headers["set-cookie"].lower()
     assert context.request.get(base + "/").status == 200
-    assert context.request.get(base + "/_framework/blazor.server.js").status == 200
+    framework = context.request.get(base + "/_framework/blazor.server.js")
+    assert framework.status == 200, f"Blazor framework script returned {framework.status}"
 
 
 def scan_and_thumbnail(page, context, base):

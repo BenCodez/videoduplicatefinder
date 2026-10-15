@@ -38,11 +38,8 @@ builder.Services.Configure<ForwardedHeadersOptions>(options => {
 		options.KnownIPNetworks.Add(network);
 });
 
-// Serve the Blazor framework files (_framework/blazor.server.js) in every environment.
-// Only Development loads the build's static web assets manifest by itself, and without
-// launchSettings.json a plain `dotnet run` is Production: blazor.server.js 404s and the
-// page never goes interactive. Published and Docker builds have no manifest (the files
-// are copied to wwwroot), so there this is a no-op.
+// Load build-time assets for a plain Production `dotnet run` as well as Development.
+// Published assets are mapped separately below through their endpoint manifest.
 builder.WebHost.UseStaticWebAssets();
 
 builder.Services.AddRazorComponents()
@@ -85,6 +82,7 @@ if (!app.Environment.IsDevelopment()) {
 	app.UseExceptionHandler("/Error");
 }
 
+app.MapStaticAssets();
 app.UseStaticFiles();
 app.UseAntiforgery();
 
