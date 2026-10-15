@@ -166,13 +166,30 @@ public sealed partial class ScanService {
         finally { EndDataWork(); }
     }
 
+    public async Task<(SelectionPlan Plan, HashSet<Guid>? Scope)> PreviewResultsSelectionAsync(
+        SelectionProfile? profile, HashSet<Guid>? explicitScope, HashSet<Guid> highlightedGroups) {
+        ReserveAutomationWork();
+        try {
+            ClearSelectionPlan();
+            var config = await LoadAutomationCoreAsync(ResultsStateFolder());
+            var scope = explicitScope ?? (config.Selection.HighlightedGroupsOnly ? highlightedGroups : null);
+            if (scope is { Count: 0 })
+                throw new InvalidOperationException("Select at least one file to highlight its group before previewing selection.");
+            return (await PreviewSelectionCoreAsync(config, profile, scope), scope);
+        }
+        finally { EndDataWork(); }
+    }
     public async Task<SelectionPlan> PreviewSelectionAsync(SelectionProfile? profile = null, IEnumerable<Guid>? groups = null) {
         ReserveAutomationWork();
-        try { return await PreviewSelectionCoreAsync(await LoadAutomationCoreAsync(ResultsStateFolder()), profile, groups); }
+        try {
+            ClearSelectionPlan();
+            return await PreviewSelectionCoreAsync(await LoadAutomationCoreAsync(ResultsStateFolder()), profile, groups);
+        }
         finally { EndDataWork(); }
     }
     async Task<SelectionPlan> PreviewSelectionCoreAsync(WebAutomationConfiguration config, SelectionProfile? profile = null,
         IEnumerable<Guid>? groups = null) {
+        ClearSelectionPlan();
         string folder = ResultsStateFolder();
         var options = JsonSerializer.Deserialize(JsonSerializer.Serialize(config.Selection, WebAutomationJsonContext.Default.SelectionOptions),
             WebAutomationJsonContext.Default.SelectionOptions)!;
@@ -432,6 +449,7 @@ public sealed partial class ScanService {
     public async Task InitializeWebAutomationAsync() {
         ReserveAutomationWork();
         try {
+            ClearSelectionPlan();
             string folder = ConfiguredStateFolder();
             var config = await LoadAutomationCoreAsync(folder);
             await new CleanupProtectionGuard(folder).RecoverAsync();
@@ -450,8 +468,7 @@ public sealed partial class ScanService {
                 _resultSnapshots = saved.Rows.Where(r => r.Snapshot is not null).ToDictionary(r => r.Item, r => r.Snapshot!);
                 _resultStateFolder = folder;
                 State = saved.Completed == true || saved.Completed is null && saved.Rows.Count > 0 ? ScanState.Done : ScanState.Idle;
-                LastSelectionPlan = await SelectionPlanStore.LoadAsync(Path.Combine(folder, "SelectionPlan.json"));
-                if (LastSelectionPlan is not null) {
+                if (await SelectionPlanStore.LoadAsync(Path.Combine(folder, "SelectionPlan.json")) is not null) {
                     // An explanation saved before a later manual review is not
                     // current permission or a current checkbox selection.
                     config.Selection.HighlightedGroupsOnly = false;

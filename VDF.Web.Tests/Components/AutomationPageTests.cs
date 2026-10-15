@@ -225,8 +225,13 @@ public sealed class AutomationPageTests : BunitContext {
         }
     }
 
-    [Fact]
-    public async Task InvalidatedPlanClearsAutomaticCandidatesAndPreservesExplicitCheckboxEdits() {
+    [Theory]
+    [InlineData("review")]
+    [InlineData("service")]
+    [InlineData("button-plan")]
+    [InlineData("button-config")]
+    [InlineData("button-reviews")]
+    public async Task InvalidatedPlanClearsAutomaticCandidatesAndPreservesExplicitCheckboxEdits(string trigger) {
         await scan.LoadAutomationAsync();
         var groupA = Guid.NewGuid();
         var groupB = Guid.NewGuid();
@@ -245,12 +250,59 @@ public sealed class AutomationPageTests : BunitContext {
         await page.InvokeAsync(() => Card(page, candidateB).QuerySelector(".card-check input")!.ChangeAsync(true));
         await page.WaitForAssertionAsync(() => Assert.True(Card(page, candidateB).ClassList.Contains("selected")));
 
-        var row = (await scan.GetReviewRowsAsync()).Single(row => row.Item.Path == candidateA);
-        await scan.SetReviewAsync(row.Item, ReviewChoice.Keep, true, row.Revision);
+        if (trigger != "review") {
+            string path = trigger == "button-config" ? store.Path : Path.Combine(folder,
+                trigger == "button-reviews" ? "ReviewedFiles.json" : "SelectionPlan.json");
+            await File.WriteAllTextAsync(path, "{");
+            if (trigger is "button-config" or "button-reviews") await File.WriteAllTextAsync(path + ".bak", "{");
+            if (trigger.StartsWith("button-")) {
+                await page.InvokeAsync(() => page.FindAll("button").First(button => button.TextContent.Trim() == "Keep Best").ClickAsync(new MouseEventArgs()));
+                await page.WaitForAssertionAsync(() => Assert.Contains("Selection preview failed:", page.Markup));
+            }
+            else await Assert.ThrowsAsync<InvalidDataException>(() => scan.PreviewSelectionAsync());
+            Assert.Null(scan.LastSelectionPlan);
+        }
+        else {
+            var row = (await scan.GetReviewRowsAsync()).Single(row => row.Item.Path == candidateA);
+            await scan.SetReviewAsync(row.Item, ReviewChoice.Keep, true, row.Revision);
+        }
         await page.WaitForAssertionAsync(() => {
             Assert.False(Card(page, candidateA).ClassList.Contains("selected"));
             Assert.True(Card(page, candidateB).ClassList.Contains("selected"));
         });
+        Assert.All(scan.Duplicates, item => Assert.True(File.Exists(item.Path)));
+    }
+
+    [Fact]
+    public async Task ResultsPreviewCompletesBeforeNotifiedCircuitCanReserveFollowUpWork() {
+        await scan.LoadAutomationAsync();
+        var group = Guid.NewGuid(); Seed("reserve-a.mp4", group); Seed("reserve-b.mp4", group);
+        scan.CaptureCleanupSnapshots(folder);
+        var row = (await scan.GetReviewRowsAsync()).First();
+        await scan.PreviewSelectionAsync();
+        var page = Render<Results>();
+        await page.WaitForAssertionAsync(() => Assert.Single(page.FindAll(".dup-card.selected")));
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        scan.BeforeReviewCommitAsync = () => release.Task;
+        Task? followUp = null;
+        long generation = scan.AutomationGeneration;
+        void OtherCircuit() {
+            if (followUp is null && !scan.IsBusy && generation != scan.AutomationGeneration)
+                followUp = scan.SetReviewAsync(row.Item, ReviewChoice.Keep, false, row.Revision);
+        }
+        scan.StateChanged += OtherCircuit;
+        try {
+            await page.InvokeAsync(() => page.FindAll("button").First(button => button.TextContent.Trim() == "Keep Best").ClickAsync(new MouseEventArgs()));
+            Assert.NotNull(followUp);
+            await page.WaitForAssertionAsync(() => Assert.Contains("Selection preview prepared:", page.Markup));
+            Assert.DoesNotContain("Selection preview failed:", page.Markup);
+        }
+        finally {
+            scan.StateChanged -= OtherCircuit;
+            release.TrySetResult();
+            if (followUp is not null) await followUp.WaitAsync(JournalIoTimeout);
+            scan.BeforeReviewCommitAsync = null;
+        }
         Assert.All(scan.Duplicates, item => Assert.True(File.Exists(item.Path)));
     }
 

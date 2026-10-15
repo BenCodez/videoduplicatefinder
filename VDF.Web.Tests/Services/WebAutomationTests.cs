@@ -859,6 +859,118 @@ public sealed class WebAutomationTests : IAsyncLifetime {
         Assert.Equal(populated ? 2 : 0, restarted.Duplicates.Count);
     }
 
+    [Theory]
+    [InlineData(false, false)]
+    [InlineData(false, true)]
+    [InlineData(true, false)]
+    [InlineData(true, true)]
+    public async Task ResultsPreviewResolvesSavedAndExplicitScopeWithinItsReservation(bool highlightedOnly, bool explicitScope) {
+        Seed("scope-a.mp4"); Seed("scope-b.mp4");
+        var otherGroup = Guid.NewGuid();
+        Seed("scope-c.mp4").GroupId = otherGroup; Seed("scope-d.mp4").GroupId = otherGroup; Anchor();
+        var config = await scan.LoadAutomationAsync(); config.Selection.HighlightedGroupsOnly = highlightedOnly;
+        await scan.SaveAutomationAsync(config);
+        var (plan, scope) = await scan.PreviewResultsSelectionAsync(SelectionProfile.QualityFirst,
+            explicitScope ? [otherGroup] : null, [group]);
+        Assert.Same(plan, scan.LastSelectionPlan);
+        Assert.Equal(SelectionProfile.QualityFirst, plan.Profile);
+        Assert.False(scan.IsBusy);
+        if (explicitScope || highlightedOnly) {
+            Assert.Equal(new[] { explicitScope ? otherGroup : group }, scope);
+            Assert.Equal(2, plan.Decisions.Count);
+            Assert.All(plan.Decisions, d => Assert.Equal(explicitScope ? otherGroup : group, d.GroupId));
+        }
+        else { Assert.Null(scope); Assert.Equal(4, plan.Decisions.Count); }
+        Assert.All(scan.Duplicates, item => Assert.True(File.Exists(item.Path)));
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task EmptyResultsPreviewScopeInvalidatesOldCandidatesAndReleasesReservation(bool explicitScope) {
+        Seed("scope-a.mp4"); Seed("scope-b.mp4"); Anchor();
+        var config = await scan.LoadAutomationAsync(); config.Selection.HighlightedGroupsOnly = true;
+        await scan.SaveAutomationAsync(config); await scan.PreviewSelectionAsync(groups: [group]);
+        Assert.NotNull(scan.LastSelectionPlan);
+        await Assert.ThrowsAsync<InvalidOperationException>(() => scan.PreviewResultsSelectionAsync(null,
+            explicitScope ? [] : null, []));
+        Assert.Null(scan.LastSelectionPlan); Assert.False(scan.IsBusy);
+        Assert.All(scan.Duplicates, item => Assert.True(File.Exists(item.Path)));
+    }
+
+    [Theory]
+    [InlineData(false, "primary")]
+    [InlineData(true, "primary")]
+    [InlineData(false, "backup")]
+    [InlineData(true, "backup")]
+    [InlineData(false, "future")]
+    [InlineData(true, "future")]
+    [InlineData(false, "lease")]
+    [InlineData(true, "lease")]
+    public async Task FailedRestoredPreviewNeverExposesSavedOrPreviousCandidates(bool retainedService, string fault) {
+        Seed("preview-a.mp4"); Seed("preview-b.mp4"); Anchor();
+        ScanEngine.SaveDatabase();
+        await scan.RemoveFromResultsAsync([]);
+        var plan = await scan.PreviewSelectionAsync();
+        Assert.Contains(plan.Decisions, d => d.RemoveCandidate);
+        var reviews = await Reviews();
+        await reviews.UpdateAsync(records => plan.Decisions.Where(d => d.RemoveCandidate).Select(d => new ReviewRecord {
+            Identity = FileIdentity.Capture(d.Path)!, Choice = ReviewChoice.Keep, Reason = "Later deliberate review" }));
+        string path = Path.Combine(folder, "SelectionPlan.json");
+        if (fault is "primary" or "backup") File.WriteAllText(path + (fault == "backup" ? ".bak" : ""), "{");
+        if (fault == "future") {
+            var future = JsonNode.Parse(File.ReadAllText(path))!; future["version"] = 2;
+            File.WriteAllText(path, future.ToJsonString());
+        }
+        byte[] primary = File.ReadAllBytes(path), backup = File.ReadAllBytes(path + ".bak");
+        using var lease = fault == "lease" ? JournalWriteLease.Acquire(path) : null;
+        using var restarted = retainedService ? null : NewService();
+        var target = restarted ?? scan;
+        await Assert.ThrowsAnyAsync<Exception>(() => target.InitializeWebAutomationAsync());
+        Assert.Null(target.LastSelectionPlan);
+        Assert.Null(target.SelectionPersistenceWarning);
+        Assert.False(target.IsBusy);
+        Assert.Equal(primary, File.ReadAllBytes(path));
+        Assert.Equal(backup, File.ReadAllBytes(path + ".bak"));
+        Assert.All(target.Duplicates, item => Assert.Equal(new byte[] { 1, 2, 3, 4 }, File.ReadAllBytes(item.Path)));
+    }
+
+    [Theory]
+    [InlineData("plan")]
+    [InlineData("config")]
+    [InlineData("reviews")]
+    public async Task FailedExplicitPreviewClearsPreviousAutomaticCandidates(string fault) {
+        Seed("preview-a.mp4"); Seed("preview-b.mp4"); Anchor();
+        var plan = await scan.PreviewSelectionAsync();
+        Assert.Contains(plan.Decisions, d => d.RemoveCandidate);
+        string path = fault == "config" ? configStore.Path : Path.Combine(folder,
+            fault == "plan" ? "SelectionPlan.json" : "ReviewedFiles.json");
+        File.WriteAllText(path, "{"); File.WriteAllText(path + ".bak", "{");
+        await Assert.ThrowsAnyAsync<Exception>(() => scan.PreviewSelectionAsync());
+        Assert.Null(scan.LastSelectionPlan);
+        Assert.Null(scan.SelectionPersistenceWarning);
+        Assert.False(scan.IsBusy);
+        Assert.Equal("{", File.ReadAllText(path)); Assert.Equal("{", File.ReadAllText(path + ".bak"));
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task RestoredPreviewRecomputesLaterKeepBeforeExposingCandidates(bool missingPrimary) {
+        Seed("preview-a.mp4"); Seed("preview-b.mp4"); Anchor();
+        ScanEngine.SaveDatabase(); await scan.RemoveFromResultsAsync([]);
+        var plan = await scan.PreviewSelectionAsync();
+        var removed = Assert.Single(plan.Decisions, d => d.RemoveCandidate);
+        var reviews = await Reviews();
+        await reviews.UpdateAsync(records => [new ReviewRecord { Identity = FileIdentity.Capture(removed.Path)!,
+            Choice = ReviewChoice.Keep, Reason = "Later deliberate review" }]);
+        if (missingPrimary) File.Delete(Path.Combine(folder, "SelectionPlan.json"));
+        using var restarted = NewService(); await restarted.InitializeWebAutomationAsync();
+        Assert.NotNull(restarted.LastSelectionPlan);
+        Assert.False(restarted.LastSelectionPlan.Decisions.Single(d => d.Path == removed.Path).RemoveCandidate);
+        Assert.All(restarted.Duplicates, item => Assert.True(File.Exists(item.Path)));
+    }
+
     [Fact]
     public async Task CorruptSelectionPreviewIsPreservedAndStillFails() {
         Seed("preview-a.mp4"); Seed("preview-b.mp4"); Anchor();

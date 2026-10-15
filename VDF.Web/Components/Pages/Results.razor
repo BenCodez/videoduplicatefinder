@@ -1136,16 +1136,16 @@ else {
         CancelQuarantine();
         try {
             if (Scan.IsBusy) throw new InvalidOperationException("Wait for the current scan or operation to finish.");
-            var config = await Scan.LoadAutomationAsync();
-            var scope = explicitScope ?? (config.Selection.HighlightedGroupsOnly
-                ? _selected.Select(item => item.GroupId).ToHashSet() : null);
-            if (scope is { Count: 0 }) throw new InvalidOperationException("Select at least one file to highlight its group before previewing selection.");
-            var plan = await Scan.PreviewSelectionAsync(profile, scope);
+            var (plan, scope) = await Scan.PreviewResultsSelectionAsync(profile, explicitScope,
+                _selected.Select(item => item.GroupId).ToHashSet());
             ApplySelectionPlan(plan, scope);
             ShowMsg($"Selection preview prepared: {_selected.Count} removal candidate(s) selected. Review the explanations before cleanup.", false);
         }
         catch (Exception ex) { ShowMsg("Selection preview failed: " + ex.Message, true); }
-        finally { _automationWorking = false; }
+        finally {
+            _automationWorking = false;
+            SyncSelectionPlan();
+        }
     }
 
     async Task AutoSelect(AutoSelectMode mode) {
