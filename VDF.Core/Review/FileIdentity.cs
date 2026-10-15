@@ -115,6 +115,17 @@ internal static partial class IdentityReader {
 
     internal static bool MatchesCurrent(FileIdentity identity, bool forceHash) {
         if (forceHash) return identity.Matches(Capture(identity.Path, true, CancellationToken.None));
+        if (MatchesTrustedSnapshot(identity) is { } matched) return matched;
+        var current = Capture(identity.Path, false, CancellationToken.None);
+        if (!identity.Matches(current)) return false;
+        if (current!.ChangeStamp.Length != 0 && TrustedIdentities.TryGetValue(current, out var snapshotTrust))
+            TrustedIdentities.GetValue(identity, _ => snapshotTrust);
+        return true;
+    }
+
+    // null means this object has no in-process content proof with a reliable
+    // native stamp. Destructive preflight must force a hash in that case.
+    internal static bool? MatchesTrustedSnapshot(FileIdentity identity) {
         if (TrustedIdentities.TryGetValue(identity, out var trusted) && trusted.Snapshot.ChangeStamp.Length != 0) {
             try {
                 SafePaths.RequireRegularFile(identity.Path);
@@ -130,11 +141,7 @@ internal static partial class IdentityReader {
                 return false;
             }
         }
-        var current = Capture(identity.Path, false, CancellationToken.None);
-        if (!identity.Matches(current)) return false;
-        if (current!.ChangeStamp.Length != 0 && TrustedIdentities.TryGetValue(current, out var snapshotTrust))
-            TrustedIdentities.GetValue(identity, _ => snapshotTrust);
-        return true;
+        return null;
     }
 
     internal static FileIdentity? Capture(string path, bool forceHash, CancellationToken ct) {

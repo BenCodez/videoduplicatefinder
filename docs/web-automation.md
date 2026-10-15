@@ -89,6 +89,12 @@ path. Startup recovery restores interrupted claims; it never resumes deletion.
 Delete, trash and link replacement continue to use live shared protection checks
 and require a current independent unselected keeper.
 
+Cleanup still fully reads the keeper and claimed source immediately before
+removal. Already verified identities with unchanged reliable filesystem stamps
+avoid redundant earlier reads. Untrusted identities and files without reliable
+stamps retain full preflight verification; an evicted claim digest is recomputed.
+Large videos on slow storage can still take time even with these extra reads removed.
+
 The default persistent locations remain `/root/.config/VDF` and
 `/root/.local/state/VDF` in the container. New files include
 `web-settings.automation.json` in config, and `WebSchedule.json`, `WebResults.json`
