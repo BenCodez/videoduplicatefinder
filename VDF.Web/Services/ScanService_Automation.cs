@@ -195,6 +195,12 @@ public sealed partial class ScanService {
         var options = JsonSerializer.Deserialize(JsonSerializer.Serialize(config.Selection, WebAutomationJsonContext.Default.SelectionOptions),
             WebAutomationJsonContext.Default.SelectionOptions)!;
         if (profile is { } value) options.Profile = value;
+        if (profile is SelectionProfile.NewestFirst or SelectionProfile.OldestFirst) {
+            // Explicit date actions promise chronological order. Keep folder
+            // protection rules, but neutralize their ranking and weighted scores.
+            options.Mode = SelectionMode.StrictFolderPriority;
+            foreach (var rule in options.FolderRules) rule.Priority = 0;
+        }
         var scope = groups?.ToHashSet();
         if (options.HighlightedGroupsOnly && scope is null)
             throw new InvalidOperationException("Choose the groups to preview or turn off selected-groups-only scope.");

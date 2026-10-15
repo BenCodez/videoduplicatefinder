@@ -267,6 +267,36 @@ public sealed class AutomationPageTests : BunitContext {
     }
 
     [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task ResultsDateMenuKeepsItsNamedDateDirectionWithWeightedSettings(bool keepNewest) {
+        await ScanEngine.LoadDatabase(folder); DatabaseUtils.Database.Clear();
+        var group = Guid.NewGuid(); Seed("menu-older.mp4", group); Seed("menu-newer.mp4", group);
+        var older = scan.Duplicates.Single(item => item.Path.EndsWith("menu-older.mp4"));
+        var newer = scan.Duplicates.Single(item => item.Path.EndsWith("menu-newer.mp4"));
+        var date = new DateTime(2026, 1, 1, 0, 0, 0, DateTimeKind.Utc);
+        File.SetLastWriteTimeUtc(older.Path, date); older.DateModified = File.GetLastWriteTimeUtc(older.Path);
+        File.SetLastWriteTimeUtc(newer.Path, date.AddTicks(1)); newer.DateModified = File.GetLastWriteTimeUtc(newer.Path);
+        var wanted = keepNewest ? newer : older; var opposite = keepNewest ? older : newer;
+        wanted.FrameSize = "320x240"; opposite.FrameSize = "1920x1080";
+        foreach (var item in scan.Duplicates) DatabaseUtils.Database.Add(new FileEntry(item.Path));
+        ScanEngine.SaveDatabase(); scan.CaptureCleanupSnapshots(folder); await scan.RemoveFromResultsAsync([]);
+        var config = await scan.LoadAutomationAsync(); config.Selection.Mode = SelectionMode.Weighted;
+        config.Selection.FolderWeight = 10000; config.Selection.Criteria = [new() { Name = "Resolution", Weight = 10000 }];
+        config.Selection.FolderRules.Add(new() { Directory = folder, Pattern = Path.GetFileName(opposite.Path), Priority = 1000 });
+        await scan.SaveAutomationAsync(config);
+        var page = Render<Results>();
+        await page.InvokeAsync(() => page.Find(".dropdown-wrap > button").ClickAsync(new MouseEventArgs()));
+        string action = keepNewest ? "Oldest (keep newest)" : "Newest (keep oldest)";
+        await page.InvokeAsync(() => page.FindAll("button").Single(button => button.TextContent.Trim() == action).ClickAsync(new MouseEventArgs()));
+        await page.WaitForAssertionAsync(() => {
+            Assert.Equal(Path.GetFileName(opposite.Path), Assert.Single(page.FindAll(".dup-card.selected")).QuerySelector(".card-filename")!.TextContent);
+            Assert.Equal(wanted.Path, Assert.Single(scan.LastSelectionPlan!.Decisions, d => d.IsKeeper).Path);
+        }, JournalIoTimeout);
+        Assert.All(new[] { older.Path, newer.Path }, path => Assert.Equal(new byte[] { 1, 2, 3, 4 }, File.ReadAllBytes(path)));
+    }
+
+    [Theory]
     [InlineData("review")]
     [InlineData("service")]
     [InlineData("button-plan")]

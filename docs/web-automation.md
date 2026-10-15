@@ -44,8 +44,15 @@ success notice. Checking an idle schedule does not repeat an earlier scan error.
 AI schedules require installing the AI components with a manual scan first.
 
 Automatic selection after a scan previews all newly scanned groups. The
-highlighted-groups setting scopes manual previews only. No schedule deletes,
-quarantines, moves or creates links. A scan holds the shared busy reservation
+highlighted-groups setting scopes manual previews only.
+
+Explicit **Oldest (keep newest)** and **Newest (keep oldest)** actions order by
+the configured date source before quality or folder scores, even with weighted
+settings. Manual reviews, protected folders and NFO favourites still take
+precedence. **Saved selection profile** continues to use the saved scoring mode.
+
+No schedule deletes, quarantines, moves or creates links. A scan holds the shared
+busy reservation
 through preparation, scanning and result processing; its settings snapshot is
 separate from browser edits.
 

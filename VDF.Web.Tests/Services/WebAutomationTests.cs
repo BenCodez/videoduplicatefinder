@@ -76,6 +76,110 @@ public sealed class WebAutomationTests : IAsyncLifetime {
         return store;
     }
 
+    [Theory]
+    [InlineData(true, SelectionMode.Weighted, "quality")]
+    [InlineData(false, SelectionMode.Weighted, "quality")]
+    [InlineData(true, SelectionMode.Weighted, "folder")]
+    [InlineData(false, SelectionMode.Weighted, "folder")]
+    [InlineData(true, SelectionMode.Weighted, "both")]
+    [InlineData(false, SelectionMode.Weighted, "both")]
+    [InlineData(true, SelectionMode.StrictFolderPriority, "quality")]
+    [InlineData(false, SelectionMode.StrictFolderPriority, "quality")]
+    [InlineData(true, SelectionMode.StrictFolderPriority, "folder")]
+    [InlineData(false, SelectionMode.StrictFolderPriority, "folder")]
+    [InlineData(true, SelectionMode.StrictFolderPriority, "both")]
+    [InlineData(false, SelectionMode.StrictFolderPriority, "both")]
+    public async Task ExplicitDatePreviewOrdersByFullDateDespiteSavedScoringAndRestarts(bool keepNewest, SelectionMode mode, string conflict) {
+        var date = new DateTime(2026, 1, 1, 0, 0, 0, DateTimeKind.Utc);
+        var older = Seed("date-older.mp4", date); var newer = Seed("date-newer.mp4", date.AddTicks(1));
+        var wanted = keepNewest ? newer : older; var opposite = keepNewest ? older : newer;
+        wanted.FrameSize = "320x240"; opposite.FrameSize = "1920x1080";
+        Anchor(); ScanEngine.SaveDatabase(); await scan.RemoveFromResultsAsync([]);
+        var config = await scan.LoadAutomationAsync(); config.Selection.Mode = mode;
+        config.Selection.Criteria = [new() { Name = "Resolution", Weight = conflict == "folder" ? 0 : 10000 }];
+        config.Selection.FolderWeight = conflict == "quality" ? 0 : 10000;
+        if (conflict != "quality") config.Selection.FolderRules.Add(new() {
+            Directory = folder, Pattern = Path.GetFileName(opposite.Path), Priority = 1000 });
+        await scan.SaveAutomationAsync(config);
+        Assert.Equal(opposite.Path, Assert.Single((await scan.PreviewSelectionAsync()).Decisions, d => d.IsKeeper).Path);
+        var profile = keepNewest ? SelectionProfile.NewestFirst : SelectionProfile.OldestFirst;
+        var (plan, _) = await scan.PreviewResultsSelectionAsync(profile, [group], []);
+        Assert.Equal(wanted.Path, Assert.Single(plan.Decisions, d => d.IsKeeper).Path);
+        Assert.Equal(opposite.Path, Assert.Single(plan.Decisions, d => d.RemoveCandidate).Path);
+        using var restarted = NewService(); await restarted.InitializeWebAutomationAsync();
+        Assert.Equal(wanted.Path, Assert.Single(restarted.LastSelectionPlan!.Decisions, d => d.IsKeeper).Path);
+        var unchanged = await scan.LoadAutomationAsync();
+        Assert.Equal(mode, unchanged.Selection.Mode); Assert.Equal(config.Selection.FolderWeight, unchanged.Selection.FolderWeight);
+        Assert.Equal(config.Selection.FolderRules.Select(r => r.Priority), unchanged.Selection.FolderRules.Select(r => r.Priority));
+        Assert.All(new[] { older.Path, newer.Path }, path => Assert.Equal(new byte[] { 1, 2, 3, 4 }, File.ReadAllBytes(path)));
+    }
+
+    [Theory]
+    [InlineData(true, "keep")]
+    [InlineData(false, "keep")]
+    [InlineData(true, "protect")]
+    [InlineData(false, "protect")]
+    [InlineData(true, "folder")]
+    [InlineData(false, "folder")]
+    [InlineData(true, "nfo")]
+    [InlineData(false, "nfo")]
+    [InlineData(true, "uncertain")]
+    [InlineData(false, "uncertain")]
+    [InlineData(true, "ignore")]
+    [InlineData(false, "ignore")]
+    [InlineData(true, "reject")]
+    [InlineData(false, "reject")]
+    [InlineData(true, "remove")]
+    [InlineData(false, "remove")]
+    public async Task ExplicitDatePreviewPreservesDeliberateChoicesAndLiveProtection(bool keepNewest, string protection) {
+        var date = new DateTime(2026, 1, 1, 0, 0, 0, DateTimeKind.Utc);
+        var older = Seed("retained-older.mp4", date); var newer = Seed("retained-newer.mp4", date.AddTicks(1));
+        var wanted = keepNewest ? newer : older; var opposite = keepNewest ? older : newer;
+        Anchor(); var config = await scan.LoadAutomationAsync(); config.Selection.Mode = SelectionMode.Weighted;
+        config.Selection.FolderWeight = 10000;
+        config.Selection.FolderRules.Add(new() { Directory = folder, Pattern = Path.GetFileName(opposite.Path), Priority = 1000 });
+        if (protection == "folder") config.Selection.FolderRules.Add(new() {
+            Directory = folder, Pattern = Path.GetFileName(opposite.Path), Priority = -1000, ProtectAll = true });
+        if (protection is "nfo" or "uncertain") {
+            config.Nfo.Enabled = true;
+            File.WriteAllText(Path.ChangeExtension(opposite.Path, ".nfo"), protection == "nfo" ? "<movie><favorite>true</favorite></movie>" : "<movie>");
+        }
+        await scan.SaveAutomationAsync(config);
+        if (protection is "keep" or "protect" or "ignore" or "reject" or "remove") {
+            string target = protection == "remove" ? wanted.Path : opposite.Path;
+            var choice = protection switch { "keep" => ReviewChoice.Keep, "ignore" => ReviewChoice.Ignore,
+                "reject" => ReviewChoice.RejectGroup, "remove" => ReviewChoice.Remove, _ => ReviewChoice.None };
+            await (await Reviews()).UpdateAsync(records => [new ReviewRecord { Identity = FileIdentity.Capture(target)!,
+                Choice = choice, ManuallyProtected = protection == "protect", Reason = "Deliberate date-action review" }]);
+        }
+        var plan = await scan.PreviewSelectionAsync(keepNewest ? SelectionProfile.NewestFirst : SelectionProfile.OldestFirst);
+        if (protection is "ignore" or "reject") Assert.All(plan.Decisions, d => Assert.False(d.RemoveCandidate));
+        else if (protection == "remove") Assert.True(plan.Decisions.Single(d => d.Path == wanted.Path).RemoveCandidate);
+        else Assert.False(plan.Decisions.Single(d => d.Path == opposite.Path).RemoveCandidate);
+        Assert.All(new[] { older.Path, newer.Path }, path => Assert.Equal(new byte[] { 1, 2, 3, 4 }, File.ReadAllBytes(path)));
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task ExplicitDatePreviewBreaksExactDateTiesStablyWithoutChangingSavedRules(bool keepNewest) {
+        var date = new DateTime(2026, 1, 1, 0, 0, 0, DateTimeKind.Utc);
+        var a = Seed("tie-a.mp4", date); var b = Seed("tie-b.mp4", date); Anchor();
+        var config = await scan.LoadAutomationAsync(); config.Selection.Mode = SelectionMode.Weighted;
+        config.Selection.FolderWeight = 10000; config.Selection.Criteria = [new() { Name = "Resolution", Weight = 10000 }];
+        config.Selection.FolderRules.Add(new() { Directory = folder, Pattern = "tie-b.mp4", Priority = 1000 });
+        await scan.SaveAutomationAsync(config);
+        var profile = keepNewest ? SelectionProfile.NewestFirst : SelectionProfile.OldestFirst;
+        for (int order = 0; order < 2; order++) {
+            scan.Engine.Duplicates = scan.Duplicates.Reverse().ToHashSet();
+            var plan = await scan.PreviewSelectionAsync(profile);
+            Assert.Equal(a.Path, Assert.Single(plan.Decisions, d => d.IsKeeper).Path);
+            Assert.Contains("Tied criteria", plan.Decisions[0].Reason);
+        }
+        Assert.Equal(1000, Assert.Single((await scan.LoadAutomationAsync()).Selection.FolderRules).Priority);
+        Assert.True(File.Exists(a.Path) && File.Exists(b.Path));
+    }
+
     [Fact]
     public async Task LocalNfoAndProtectedFolderApplyToPreviewAndCleanup() {
         var a = Seed("a.mp4"); var b = Seed("b.mp4"); Anchor();
