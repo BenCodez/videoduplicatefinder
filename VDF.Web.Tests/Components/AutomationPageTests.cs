@@ -13,6 +13,7 @@ namespace VDF.Web.Tests.Components;
 
 [Collection("WebSettingsOverride")]
 public sealed class AutomationPageTests : BunitContext {
+    static readonly TimeSpan JournalIoTimeout = TimeSpan.FromSeconds(10);
     readonly string folder = Path.Combine(Path.GetTempPath(), "VDF.WebAutomationPage." + Guid.NewGuid().ToString("N"));
     readonly ScanService scan;
     readonly WebAutomationStore store;
@@ -38,12 +39,13 @@ public sealed class AutomationPageTests : BunitContext {
 
     async Task<IRenderedComponent<Automation>> RenderPageAsync() {
         var page = Render<Automation>();
-        // Initialization performs durable journal IO. Yield the test thread
-        // while the renderer completes it, rather than blocking its continuations.
+        // Initialization writes and verifies durable protection journals. It is
+        // not a one-second render-time contract, especially on hosted Windows
+        // filesystems. Keep the wait bounded and let IO continuations run.
         await page.WaitForAssertionAsync(() => {
             Assert.Contains("Saved automation settings loaded", page.Markup);
             Assert.False(Button(page, "Save automation settings").HasAttribute("disabled"));
-        });
+        }, JournalIoTimeout);
         return page;
     }
 
