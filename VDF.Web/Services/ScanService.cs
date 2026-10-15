@@ -62,6 +62,7 @@ namespace VDF.Web.Services {
 		/// <summary>Includes startup and terminal scan processing, even when an error is displayed.</summary>
 		public bool IsBusy { get { lock (_operationSync) return WorkActiveLocked; } }
 		public bool IsScanActive { get { lock (_operationSync) return !_disposed && (_scanStarting || _scanRunActive); } }
+		public bool IsScanStopRequested { get { lock (_operationSync) return !_disposed && (_scanStarting || _scanRunActive) && _cts.IsCancellationRequested; } }
 
 
 		public ScanState State { get; private set; } = ScanState.Idle;

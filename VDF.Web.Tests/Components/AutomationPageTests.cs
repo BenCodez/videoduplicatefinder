@@ -262,6 +262,81 @@ public sealed class AutomationPageTests : BunitContext {
     }
 
     [Fact]
+    public async Task DeferredInitialSettingsLoadRecoversWhenCompletionNotifiesDuringLocalWork() {
+        scan.Settings.IncludeList.Add(folder);
+        Assert.True(scan.SaveSettings());
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseScan = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseAction = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        scan.PrepareScanAsync = async (_, _) => { entered.SetResult(); await releaseScan.Task; };
+        scan.StartSearchOverride = () => throw new IOException("Synthetic scan failure");
+        var start = scan.StartScanAndCompare();
+        Task? action = null;
+        try {
+            await entered.Task.WaitAsync(JournalIoTimeout);
+            var page = Render<Automation>();
+            await page.WaitForAssertionAsync(() => Assert.Contains("Settings will load when it finishes", page.Markup), JournalIoTimeout);
+            // Hold the production action wrapper across the terminal event. This
+            // deterministically exercises the same suppression window as a busy
+            // Reload returning just after the service's idle notification.
+            await page.InvokeAsync(() => {
+                var run = typeof(Automation).GetMethod("RunAsync", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!;
+                action = Microsoft.AspNetCore.Components.EventCallback.Factory.Create(page.Instance,
+                    (Func<Task>)(() => (Task)run.Invoke(page.Instance, new object[] { (Func<Task>)(() => releaseAction.Task) })!)).InvokeAsync();
+            });
+            releaseScan.SetResult();
+            await start.WaitAsync(JournalIoTimeout);
+            Assert.False(scan.IsBusy);
+            Assert.DoesNotContain("Saved automation settings loaded", page.Markup);
+            releaseAction.SetResult();
+            await action!.WaitAsync(JournalIoTimeout);
+            await page.WaitForAssertionAsync(() => {
+                Assert.Contains("Saved automation settings loaded", page.Markup);
+                Assert.False(Button(page, "Save automation settings").HasAttribute("disabled"));
+            }, JournalIoTimeout);
+        }
+        finally {
+            releaseScan.TrySetResult(); releaseAction.TrySetResult();
+            await start.WaitAsync(JournalIoTimeout);
+            if (action is not null) await action.WaitAsync(JournalIoTimeout);
+        }
+    }
+
+    [Fact]
+    public async Task StopNoticeEndsWithTheStoppedScanAndDoesNotFollowAReplacement() {
+        scan.Settings.IncludeList.Add(folder);
+        Assert.True(scan.SaveSettings());
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        scan.PrepareScanAsync = async (_, token) => { entered.SetResult(); await release.Task; token.ThrowIfCancellationRequested(); };
+        scan.StartSearchOverride = () => throw new IOException("Synthetic scan failure");
+        var start = scan.StartScanAndCompare();
+        try {
+            await entered.Task.WaitAsync(JournalIoTimeout);
+            var recovery = Render<VDF.Web.Components.Layout.ScanRecovery>();
+            await recovery.FindAll("button").Single(b => b.TextContent.Trim() == "Stop scan").ClickAsync(new MouseEventArgs());
+            Assert.Contains("Waiting for the scan to finish", recovery.Markup);
+            // The notice is derived from the shared scan lifecycle, including
+            // when navigating to a different recovery component while stopping.
+            var other = Render<VDF.Web.Components.Layout.ScanRecovery>();
+            release.SetResult();
+            await start.WaitAsync(JournalIoTimeout);
+            await recovery.WaitForAssertionAsync(() => Assert.DoesNotContain("Waiting for the scan to finish", recovery.Markup), JournalIoTimeout);
+            await other.WaitForAssertionAsync(() => Assert.DoesNotContain("Waiting for the scan to finish", other.Markup), JournalIoTimeout);
+            entered = new(TaskCreationOptions.RunContinuationsAsynchronously);
+            release = new(TaskCreationOptions.RunContinuationsAsynchronously);
+            start = scan.StartScanAndCompare();
+            await entered.Task.WaitAsync(JournalIoTimeout);
+            Assert.True(scan.IsScanActive);
+            await recovery.WaitForAssertionAsync(() => {
+                Assert.Contains("Stop scan", recovery.Markup);
+                Assert.DoesNotContain("Waiting for the scan to finish", recovery.Markup);
+            }, JournalIoTimeout);
+        }
+        finally { release.TrySetResult(); await start.WaitAsync(JournalIoTimeout); }
+    }
+
+    [Fact]
     public async Task ScanCompletionRefreshKeepsAnExistingUnsavedDraft() {
         scan.Settings.IncludeList.Add(folder);
         Assert.True(scan.SaveSettings());

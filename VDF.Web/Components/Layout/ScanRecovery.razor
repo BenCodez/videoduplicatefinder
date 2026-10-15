@@ -27,26 +27,25 @@
     @if (!Scan.IsDiscardingResults && (Scan.RecoveryStatus is not null || Scan.RecoveryError is not null)) {
         <button @onclick="Scan.DismissRecoveryMessages">Dismiss recovery message</button>
     }
-    @if (_notice is not null) { <p role="status">@_notice</p> }
+    @if (Scan.IsScanStopRequested) { <p role="status">Stop requested. Waiting for the scan to finish.</p> }
     @if (_error is not null) { <p role="alert">@_error</p> }
 </section>
 
 @code {
     bool _confirm, _disposed;
-    string? _notice, _error;
+    string? _error;
 
     protected override void OnInitialized() => Scan.StateChanged += OnStateChanged;
 
     void StopScan() {
         _error = null;
         Scan.Stop();
-        _notice = "Stop requested. Waiting for the scan to finish.";
     }
 
     void Confirm() {
         if (Scan.IsDiscardingResults) return;
         _confirm = false;
-        _error = _notice = null;
+        _error = null;
         try { Scan.RequestDiscardResults(); }
         catch (Exception ex) { _error = "Results could not be discarded: " + ex.Message; }
     }
