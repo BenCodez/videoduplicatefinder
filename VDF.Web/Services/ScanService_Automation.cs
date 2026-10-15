@@ -414,20 +414,21 @@ public sealed partial class ScanService {
     }
     public async Task ResetAsync() {
         ReserveAutomationWork();
-        try {
-            if (_resultOriginFolder is { } folder) await SaveResultsAsync(folder, new());
-            ResultsPersistenceWarning = null;
-            _engine.Duplicates.Clear();
-            ClearCleanupSnapshots();
-            ClearThumbnailCaches();
-            ClearSelectionPlan();
-            _quarantinePreview = null;
-            State = ScanState.Idle;
-            ErrorMessage = null;
-            LastProgress = null;
-            FilesHashed = 0;
-        }
+        try { await ResetResultsCoreAsync(); }
         finally { EndDataWork(); }
+    }
+    async Task ResetResultsCoreAsync() {
+        if (_resultOriginFolder is { } folder) await SaveResultsAsync(folder, new());
+        ResultsPersistenceWarning = null;
+        _engine.Duplicates.Clear();
+        ClearCleanupSnapshots();
+        ClearThumbnailCaches();
+        ClearSelectionPlan();
+        _quarantinePreview = null;
+        State = ScanState.Idle;
+        ErrorMessage = null;
+        LastProgress = null;
+        FilesHashed = 0;
     }
     public async Task RemoveFromResultsAsync(IEnumerable<DuplicateItem> items) {
         var selected = items.ToList();

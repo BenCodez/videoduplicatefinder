@@ -10,6 +10,7 @@
 <PageTitle>Results — Video Duplicate Finder</PageTitle>
 
 <h1>Duplicate Groups</h1>
+<ScanRecovery />
 @if (Scan.ResultsPersistenceWarning is { } resultsWarning) { <p class="aborted-msg" role="alert">@resultsWarning</p> }
 @if (Scan.SelectionPersistenceWarning is { } selectionWarning) { <p class="aborted-msg" role="alert">@selectionWarning</p> }
 

@@ -55,11 +55,14 @@ namespace VDF.Web.Services {
 		bool _dataWorkActive;
 		bool _disposed;
 
-		bool WorkActiveLocked => FileOpRunning || _scanStarting || _scanRunActive || _dataWorkActive ||
+		bool OperationActiveLocked => FileOpRunning || _scanStarting || _scanRunActive || _dataWorkActive ||
 			State is ScanState.Scanning or ScanState.Comparing;
+		bool WorkActiveLocked => _pendingDiscard is not null || OperationActiveLocked;
 
 		/// <summary>Includes startup and terminal scan processing, even when an error is displayed.</summary>
 		public bool IsBusy { get { lock (_operationSync) return WorkActiveLocked; } }
+		public bool IsScanActive { get { lock (_operationSync) return !_disposed && (_scanStarting || _scanRunActive); } }
+		public bool IsScanStopRequested { get { lock (_operationSync) return !_disposed && (_scanStarting || _scanRunActive) && _cts.IsCancellationRequested; } }
 
 
 		public ScanState State { get; private set; } = ScanState.Idle;
@@ -118,6 +121,7 @@ namespace VDF.Web.Services {
 		async Task<string?> StartWebScanAsync(bool scheduled, DateTimeOffset now) {
 			lock (_operationSync) {
 				if (_disposed || WorkActiveLocked) return null;
+				ClearRecoveryMessagesLocked();
 				_scanStarting = true;
 				_scanRunActive = true;
 				_cts.Dispose();
@@ -277,6 +281,7 @@ namespace VDF.Web.Services {
 					return false;
 				}
 				FileOpRunning = true;
+				ClearRecoveryMessagesLocked();
 				FileOpVerb = verb;
 				FileOpCurrent = 0;
 				FileOpMax = max;
@@ -451,7 +456,10 @@ namespace VDF.Web.Services {
 			finally { EndDataWork(); }
 		}
 
-		void Notify() => StateChanged?.Invoke();
+		void Notify() {
+			StateChanged?.Invoke();
+			TryCompletePendingDiscard();
+		}
 
 		public void Dispose() {
 			lock (_operationSync) {

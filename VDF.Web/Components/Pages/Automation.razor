@@ -9,6 +9,7 @@
 <PageTitle>Automation — Video Duplicate Finder</PageTitle>
 
 <h1>Automation</h1>
+<ScanRecovery />
 @if (Scan.ResultsPersistenceWarning is { } resultsWarning) { <p class="aborted-msg" role="alert">@resultsWarning</p> }
 @if (Scan.SelectionPersistenceWarning is { } selectionWarning) { <p class="aborted-msg" role="alert">@selectionWarning</p> }
 <p>Save selection, protection, and schedule settings here. Selection previews never remove files.</p>
@@ -22,7 +23,12 @@
 @if (!string.IsNullOrWhiteSpace(Scan.AutomationStatus)) { <p role="status">@Scan.AutomationStatus</p> }
 
 @if (_draft is null) {
-    <p>Automation settings are unavailable. Use Reload saved settings to try again.</p>
+    @if (Scan.IsBusy) {
+        <p>Automation settings will load after the current operation finishes. You can stop a scan above.</p>
+    }
+    else {
+        <p>Automation settings are unavailable. Use Reload saved settings to try again.</p>
+    }
 }
 else {
     <fieldset disabled="@Busy" style="border:0;padding:0;min-width:0;">

@@ -1,0 +1,68 @@
+@implements IDisposable
+@inject ScanService Scan
+
+<section class="settings-section" aria-label="Scan recovery">
+    @if (Scan.IsScanActive) {
+        <p>A scan is running or finishing. Stop it to return to your settings.</p>
+        <button @onclick="StopScan" disabled="@Scan.IsDiscardingResults">Stop scan</button>
+    }
+    else if (Scan.IsBusy) {
+        <p>An operation is finishing. Results can be discarded when it finishes.</p>
+    }
+    <button @onclick="() => _confirm = true" disabled="@(Scan.IsDiscardingResults || (Scan.IsBusy && !Scan.IsScanActive))">
+        @(Scan.IsScanActive ? "Stop scan and discard results…" : "Discard scan results…")
+    </button>
+    @if (_confirm) {
+        <div role="group" aria-label="Confirm discard scan results">
+            <p>Stop any current scan and discard its result list? Media files, settings, saved reviews and the scan cache are kept.</p>
+            <button @onclick="Confirm" disabled="@Scan.IsDiscardingResults">Confirm discard results</button>
+            <button @onclick="() => _confirm = false">Cancel discard</button>
+        </div>
+    }
+    @if (Scan.IsDiscardPending) {
+        <button @onclick="Scan.CancelPendingDiscard">Cancel pending discard</button>
+    }
+    @if (Scan.RecoveryStatus is { } status) { <p role="status">@status</p> }
+    @if (Scan.RecoveryError is { } error) { <p role="alert">@error</p> }
+    @if (!Scan.IsDiscardingResults && (Scan.RecoveryStatus is not null || Scan.RecoveryError is not null)) {
+        <button @onclick="Scan.DismissRecoveryMessages">Dismiss recovery message</button>
+    }
+    @if (Scan.IsScanStopRequested) { <p role="status">Stop requested. Waiting for the scan to finish.</p> }
+    @if (_error is not null) { <p role="alert">@_error</p> }
+</section>
+
+@code {
+    bool _confirm, _disposed;
+    string? _error;
+
+    protected override void OnInitialized() => Scan.StateChanged += OnStateChanged;
+
+    void StopScan() {
+        _error = null;
+        Scan.Stop();
+    }
+
+    void Confirm() {
+        if (Scan.IsDiscardingResults) return;
+        _confirm = false;
+        _error = null;
+        try { Scan.RequestDiscardResults(); }
+        catch (Exception ex) { _error = "Results could not be discarded: " + ex.Message; }
+    }
+
+    void OnStateChanged() => _ = UpdateAsync();
+    async Task UpdateAsync() {
+        try {
+            await InvokeAsync(() => {
+                if (_disposed) return;
+                StateHasChanged();
+            });
+        }
+        catch (ObjectDisposedException) when (_disposed) { }
+        catch (InvalidOperationException) when (_disposed) { }
+    }
+    public void Dispose() {
+        _disposed = true;
+        Scan.StateChanged -= OnStateChanged;
+    }
+}

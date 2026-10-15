@@ -51,6 +51,362 @@ public sealed class AutomationPageTests : BunitContext {
         return page;
     }
 
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task AutomationOpenedDuringScanLoadsSettingsAfterStoppingAndDiscarding(bool cancelDiscard) {
+        scan.Settings.IncludeList.Add(folder);
+        Assert.True(scan.SaveSettings());
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        scan.PrepareScanAsync = async (_, token) => {
+            entered.SetResult();
+            await release.Task;
+            token.ThrowIfCancellationRequested();
+        };
+        var start = scan.StartScanAndCompare();
+        try {
+            await entered.Task.WaitAsync(JournalIoTimeout);
+            var page = Render<Automation>();
+            await page.WaitForAssertionAsync(() => Assert.Contains("Settings will load when it finishes", page.Markup), JournalIoTimeout);
+            Assert.DoesNotContain("Automation settings are unavailable", page.Markup);
+            await ClickAsync(page, "Stop scan and discard results…");
+            await ClickAsync(page, "Confirm discard results");
+            Assert.True(scan.IsBusy);
+            Assert.Contains("Results will be discarded after the operation finishes", page.Markup);
+            if (cancelDiscard) await ClickAsync(page, "Cancel pending discard");
+            release.SetResult();
+            await start.WaitAsync(JournalIoTimeout);
+            await page.WaitForAssertionAsync(() => {
+                Assert.Equal(cancelDiscard ? ScanState.Aborted : ScanState.Idle, scan.State);
+                if (cancelDiscard) Assert.DoesNotContain("Scan results discarded", page.Markup);
+                else Assert.Contains("Scan results discarded", page.Markup);
+                Assert.Contains("Saved automation settings loaded", page.Markup);
+                Assert.False(Button(page, "Save automation settings").HasAttribute("disabled"));
+            }, JournalIoTimeout);
+            Assert.Contains(folder, scan.Settings.IncludeList);
+        }
+        finally { release.TrySetResult(); await start.WaitAsync(JournalIoTimeout); }
+    }
+
+    [Fact]
+    public async Task ConfirmedDiscardSurvivesNavigationAndBlocksAReplacementScan() {
+        await AssertDiscardAcrossNavigationAsync(cancelAfterNavigation: false);
+    }
+
+    [Fact]
+    public async Task PendingDiscardCanBeCancelledFromAnotherPageAfterNavigation() {
+        await AssertDiscardAcrossNavigationAsync(cancelAfterNavigation: true);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public Task NavigationBeforeResultInvalidationRetainsOnlyExplicitlyCancelledResults(bool cancelDiscard) =>
+        AssertDiscardAcrossNavigationAsync(cancelDiscard, beforeInvalidation: true);
+
+    async Task AssertDiscardAcrossNavigationAsync(bool cancelAfterNavigation, bool beforeInvalidation = false) {
+        scan.Settings.IncludeList.Add(folder);
+        Assert.True(scan.SaveSettings());
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        int preparations = 0;
+        scan.PrepareScanAsync = async (_, token) => {
+            preparations++;
+            entered.SetResult();
+            await release.Task;
+            token.ThrowIfCancellationRequested();
+        };
+        if (beforeInvalidation) {
+            await ScanEngine.LoadDatabase(folder);
+            DatabaseUtils.Database.Clear();
+            var config = await scan.LoadAutomationAsync();
+            config.ScanAtStartup = true;
+            await scan.SaveAutomationAsync(config);
+            var group = Guid.NewGuid(); Seed("navigation-a.mp4", group); Seed("navigation-b.mp4", group);
+            foreach (var item in scan.Duplicates) DatabaseUtils.Database.Add(new FileEntry(item.Path));
+            ScanEngine.SaveDatabase();
+            await scan.CompleteWebScanAsync(false);
+            scan.ScheduledRunClaimed = () => {
+                preparations++;
+                entered.SetResult();
+                release.Task.WaitAsync(JournalIoTimeout).GetAwaiter().GetResult();
+            };
+        }
+        Task start = beforeInvalidation
+            ? Task.Run(async () => await scan.CheckScheduleAsync(DateTimeOffset.UtcNow))
+            : scan.StartScanAndCompare();
+        var idle = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        void ObserveIdle() { if (!scan.IsBusy) idle.TrySetResult(); }
+        scan.StateChanged += ObserveIdle;
+        try {
+            await entered.Task.WaitAsync(JournalIoTimeout);
+            if (beforeInvalidation) Assert.Equal(2, scan.Duplicates.Count);
+            var original = Render<VDF.Web.Components.Layout.ScanRecovery>();
+            await original.FindAll("button").Single(b => b.TextContent.Trim() == "Stop scan and discard results…").ClickAsync(new MouseEventArgs());
+            await original.FindAll("button").Single(b => b.TextContent.Trim() == "Confirm discard results").ClickAsync(new MouseEventArgs());
+            Assert.True(scan.IsDiscardPending);
+            original.Dispose();
+            await scan.StartScanAndCompare();
+            Assert.Equal(1, preparations);
+            IRenderedComponent<VDF.Web.Components.Layout.ScanRecovery>? next = null;
+            if (cancelAfterNavigation) {
+                next = Render<VDF.Web.Components.Layout.ScanRecovery>();
+                Assert.Contains("Results will be discarded after the operation finishes", next.Markup);
+                await next.FindAll("button").Single(b => b.TextContent.Trim() == "Cancel pending discard").ClickAsync(new MouseEventArgs());
+            }
+            // Without cancellation, no recovery page exists while the request
+            // completes. Only the singleton service can finish the discard.
+            release.SetResult();
+            await start.WaitAsync(JournalIoTimeout);
+            await idle.Task.WaitAsync(JournalIoTimeout);
+            next ??= Render<VDF.Web.Components.Layout.ScanRecovery>();
+            await next.WaitForAssertionAsync(() => {
+                Assert.False(scan.IsBusy);
+                Assert.Equal(cancelAfterNavigation ? ScanState.Aborted : ScanState.Idle, scan.State);
+                Assert.Contains(cancelAfterNavigation ? "Pending discard cancelled" : "Scan results discarded", next.Markup);
+            }, JournalIoTimeout);
+            if (beforeInvalidation) {
+                Assert.Equal(cancelAfterNavigation ? 2 : 0, scan.Duplicates.Count);
+                await scan.InitializeWebAutomationAsync();
+                Assert.Equal(cancelAfterNavigation ? 2 : 0, scan.Duplicates.Count);
+                Assert.Equal(2, DatabaseUtils.Database.Count);
+                foreach (var name in new[] { "navigation-a.mp4", "navigation-b.mp4" })
+                    Assert.Equal(new byte[] { 1, 2, 3, 4 }, File.ReadAllBytes(Path.Combine(folder, name)));
+            }
+        }
+        finally {
+            release.TrySetResult();
+            await start.WaitAsync(JournalIoTimeout);
+            scan.StateChanged -= ObserveIdle;
+        }
+    }
+
+    [Fact]
+    public async Task FailedDiscardReleasesItsReservationAndShowsTheFailureAfterNavigation() {
+        await ScanEngine.LoadDatabase(folder);
+        DatabaseUtils.Database.Clear();
+        scan.Settings.IncludeList.Add(folder);
+        Assert.True(scan.SaveSettings());
+        await scan.LoadAutomationAsync();
+        var group = Guid.NewGuid(); Seed("failure-a.mp4", group); Seed("failure-b.mp4", group);
+        await scan.CompleteWebScanAsync(false);
+        var resultsPath = Path.Combine(folder, "WebResults.json");
+        var unsupported = "{\"version\":99}";
+        await File.WriteAllTextAsync(resultsPath, unsupported);
+        var original = Render<VDF.Web.Components.Layout.ScanRecovery>();
+        await original.FindAll("button").Single(b => b.TextContent.Trim() == "Discard scan results…").ClickAsync(new MouseEventArgs());
+        await original.FindAll("button").Single(b => b.TextContent.Trim() == "Confirm discard results").ClickAsync(new MouseEventArgs());
+        original.Dispose();
+        var next = Render<VDF.Web.Components.Layout.ScanRecovery>();
+        await next.WaitForAssertionAsync(() => {
+            Assert.False(scan.IsBusy);
+            Assert.Contains("Results could not be discarded", next.Markup);
+            Assert.False(next.FindAll("button").Single(b => b.TextContent.Trim() == "Discard scan results…").HasAttribute("disabled"));
+        }, JournalIoTimeout);
+        Assert.Equal(2, scan.Duplicates.Count);
+        Assert.Equal(unsupported, await File.ReadAllTextAsync(resultsPath));
+        await next.FindAll("button").Single(b => b.TextContent == "Dismiss recovery message").ClickAsync(new MouseEventArgs());
+        Assert.Null(scan.RecoveryError);
+        Assert.Empty(next.FindAll("[role='alert']"));
+        Assert.Equal(2, scan.Duplicates.Count);
+    }
+
+    [Fact]
+    public async Task StartingReplacementScanClearsThePreviousDiscardNotice() {
+        scan.Settings.IncludeList.Add(folder);
+        Assert.True(scan.SaveSettings());
+        scan.RequestDiscardResults();
+        var recovery = Render<VDF.Web.Components.Layout.ScanRecovery>();
+        await recovery.WaitForAssertionAsync(() => Assert.Contains("Scan results discarded", recovery.Markup), JournalIoTimeout);
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        scan.PrepareScanAsync = async (_, token) => { entered.SetResult(); await release.Task; token.ThrowIfCancellationRequested(); };
+        scan.StartSearchOverride = () => throw new IOException("Synthetic completion failure");
+        var start = scan.StartScanAndCompare();
+        try {
+            await entered.Task.WaitAsync(JournalIoTimeout);
+            await recovery.WaitForAssertionAsync(() => {
+                Assert.DoesNotContain("Scan results discarded", recovery.Markup);
+                Assert.Null(scan.RecoveryStatus);
+                Assert.Null(scan.RecoveryError);
+            }, JournalIoTimeout);
+            release.SetResult();
+            await start.WaitAsync(JournalIoTimeout);
+            Assert.DoesNotContain("Scan results discarded", recovery.Markup);
+        }
+        finally { release.TrySetResult(); await start.WaitAsync(JournalIoTimeout); }
+    }
+
+    [Fact]
+    public async Task OpeningAutomationDuringScanAutomaticallyRecoversWithoutDiscarding() {
+        scan.Settings.IncludeList.Add(folder);
+        Assert.True(scan.SaveSettings());
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        scan.PrepareScanAsync = async (_, token) => { entered.SetResult(); await release.Task; token.ThrowIfCancellationRequested(); };
+        scan.StartSearchOverride = () => throw new IOException("Synthetic scan failure");
+        var start = scan.StartScanAndCompare();
+        try {
+            await entered.Task.WaitAsync(JournalIoTimeout);
+            var page = Render<Automation>();
+            await page.WaitForAssertionAsync(() => Assert.Contains("Settings will load when it finishes", page.Markup), JournalIoTimeout);
+            release.SetResult();
+            await start.WaitAsync(JournalIoTimeout);
+            await page.WaitForAssertionAsync(() => {
+                Assert.Contains("Saved automation settings loaded", page.Markup);
+                Assert.False(Button(page, "Save automation settings").HasAttribute("disabled"));
+            }, JournalIoTimeout);
+        }
+        finally { release.TrySetResult(); await start.WaitAsync(JournalIoTimeout); }
+    }
+
+    [Fact]
+    public async Task DeferredInitialSettingsLoadRecoversWhenCompletionNotifiesDuringLocalWork() {
+        scan.Settings.IncludeList.Add(folder);
+        Assert.True(scan.SaveSettings());
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseScan = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseAction = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        scan.PrepareScanAsync = async (_, _) => { entered.SetResult(); await releaseScan.Task; };
+        scan.StartSearchOverride = () => throw new IOException("Synthetic scan failure");
+        var start = scan.StartScanAndCompare();
+        Task? action = null;
+        try {
+            await entered.Task.WaitAsync(JournalIoTimeout);
+            var page = Render<Automation>();
+            await page.WaitForAssertionAsync(() => Assert.Contains("Settings will load when it finishes", page.Markup), JournalIoTimeout);
+            // Hold the production action wrapper across the terminal event. This
+            // deterministically exercises the same suppression window as a busy
+            // Reload returning just after the service's idle notification.
+            await page.InvokeAsync(() => {
+                var run = typeof(Automation).GetMethod("RunAsync", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!;
+                action = Microsoft.AspNetCore.Components.EventCallback.Factory.Create(page.Instance,
+                    (Func<Task>)(() => (Task)run.Invoke(page.Instance, new object[] { (Func<Task>)(() => releaseAction.Task) })!)).InvokeAsync();
+            });
+            releaseScan.SetResult();
+            await start.WaitAsync(JournalIoTimeout);
+            Assert.False(scan.IsBusy);
+            Assert.DoesNotContain("Saved automation settings loaded", page.Markup);
+            releaseAction.SetResult();
+            await action!.WaitAsync(JournalIoTimeout);
+            await page.WaitForAssertionAsync(() => {
+                Assert.Contains("Saved automation settings loaded", page.Markup);
+                Assert.False(Button(page, "Save automation settings").HasAttribute("disabled"));
+            }, JournalIoTimeout);
+        }
+        finally {
+            releaseScan.TrySetResult(); releaseAction.TrySetResult();
+            await start.WaitAsync(JournalIoTimeout);
+            if (action is not null) await action.WaitAsync(JournalIoTimeout);
+        }
+    }
+
+    [Fact]
+    public async Task StopNoticeEndsWithTheStoppedScanAndDoesNotFollowAReplacement() {
+        scan.Settings.IncludeList.Add(folder);
+        Assert.True(scan.SaveSettings());
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        scan.PrepareScanAsync = async (_, token) => { entered.SetResult(); await release.Task; token.ThrowIfCancellationRequested(); };
+        scan.StartSearchOverride = () => throw new IOException("Synthetic scan failure");
+        var start = scan.StartScanAndCompare();
+        try {
+            await entered.Task.WaitAsync(JournalIoTimeout);
+            var recovery = Render<VDF.Web.Components.Layout.ScanRecovery>();
+            await recovery.FindAll("button").Single(b => b.TextContent.Trim() == "Stop scan").ClickAsync(new MouseEventArgs());
+            Assert.Contains("Waiting for the scan to finish", recovery.Markup);
+            // The notice is derived from the shared scan lifecycle, including
+            // when navigating to a different recovery component while stopping.
+            var other = Render<VDF.Web.Components.Layout.ScanRecovery>();
+            release.SetResult();
+            await start.WaitAsync(JournalIoTimeout);
+            await recovery.WaitForAssertionAsync(() => Assert.DoesNotContain("Waiting for the scan to finish", recovery.Markup), JournalIoTimeout);
+            await other.WaitForAssertionAsync(() => Assert.DoesNotContain("Waiting for the scan to finish", other.Markup), JournalIoTimeout);
+            entered = new(TaskCreationOptions.RunContinuationsAsynchronously);
+            release = new(TaskCreationOptions.RunContinuationsAsynchronously);
+            start = scan.StartScanAndCompare();
+            await entered.Task.WaitAsync(JournalIoTimeout);
+            Assert.True(scan.IsScanActive);
+            await recovery.WaitForAssertionAsync(() => {
+                Assert.Contains("Stop scan", recovery.Markup);
+                Assert.DoesNotContain("Waiting for the scan to finish", recovery.Markup);
+            }, JournalIoTimeout);
+        }
+        finally { release.TrySetResult(); await start.WaitAsync(JournalIoTimeout); }
+    }
+
+    [Fact]
+    public async Task ScanCompletionRefreshKeepsAnExistingUnsavedDraft() {
+        scan.Settings.IncludeList.Add(folder);
+        Assert.True(scan.SaveSettings());
+        var page = await RenderPageAsync();
+        await ChangeCheckboxAsync(page, "Automatically prepare selection after scans", true);
+        scan.PrepareScanAsync = (_, _) => Task.FromException(new IOException("Synthetic preparation failure"));
+        await scan.StartScanAndCompare();
+        await page.WaitForAssertionAsync(() => {
+            Assert.False(Button(page, "Save automation settings").HasAttribute("disabled"));
+            Assert.True(Input(page, "Automatically prepare selection after scans").HasAttribute("checked"));
+            Assert.Contains("Unsaved draft changes", page.Markup);
+        }, JournalIoTimeout);
+        Assert.False((await store.LoadAsync()).Selection.AutoAfterScan);
+    }
+
+    [Fact]
+    public async Task RecoveryDoesNotInterruptAnActiveReviewWrite() {
+        await ScanEngine.LoadDatabase(folder);
+        DatabaseUtils.Database.Clear();
+        scan.Settings.IncludeList.Add(folder);
+        Assert.True(scan.SaveSettings());
+        await scan.LoadAutomationAsync();
+        Seed("review-a.mp4", Guid.NewGuid());
+        scan.CaptureCleanupSnapshots(folder);
+        var row = Assert.Single(await scan.GetReviewRowsAsync());
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        scan.BeforeReviewCommitAsync = async () => { entered.SetResult(); await release.Task; };
+        var write = scan.SetReviewAsync(row.Item, ReviewChoice.Keep, null, row.Revision);
+        try {
+            await entered.Task.WaitAsync(JournalIoTimeout);
+            var recovery = Render<VDF.Web.Components.Layout.ScanRecovery>();
+            Assert.False(scan.IsScanActive);
+            Assert.True(recovery.FindAll("button").Single(b => b.TextContent.Trim() == "Discard scan results…").HasAttribute("disabled"));
+            Assert.DoesNotContain(recovery.FindAll("button"), b => b.TextContent == "Stop scan");
+            await Assert.ThrowsAsync<InvalidOperationException>(() => scan.ResetAsync());
+        }
+        finally { release.TrySetResult(); await write.WaitAsync(JournalIoTimeout); }
+    }
+
+    [Fact]
+    public async Task DiscardResultsRequiresConfirmationAndKeepsMediaAndSavedConfiguration() {
+        await ScanEngine.LoadDatabase(folder);
+        DatabaseUtils.Database.Clear();
+        scan.Settings.IncludeList.Add(folder);
+        Assert.True(scan.SaveSettings());
+        var config = await scan.LoadAutomationAsync();
+        config.Selection.FolderRules.Add(new() { Directory = folder, ProtectAll = true });
+        config = await scan.SaveAutomationAsync(config);
+        var group = Guid.NewGuid(); Seed("retained-a.mp4", group); Seed("retained-b.mp4", group);
+        foreach (var item in scan.Duplicates) DatabaseUtils.Database.Add(new FileEntry(item.Path));
+        ScanEngine.SaveDatabase();
+        await scan.CompleteWebScanAsync(false);
+        await scan.RemoveFromResultsAsync([]);
+        var page = await RenderPageAsync();
+        await ClickAsync(page, "Discard scan results…");
+        await ClickAsync(page, "Cancel discard");
+        Assert.Equal(2, scan.Duplicates.Count);
+        await ClickAsync(page, "Discard scan results…");
+        await ClickAsync(page, "Confirm discard results");
+        await page.WaitForAssertionAsync(() => Assert.Contains("Scan results discarded", page.Markup), JournalIoTimeout);
+        Assert.Empty(scan.Duplicates);
+        Assert.Equal(config.Revision, (await store.LoadAsync()).Revision);
+        Assert.Equal(2, DatabaseUtils.Database.Count);
+        foreach (var name in new[] { "retained-a.mp4", "retained-b.mp4" })
+            Assert.Equal(new byte[] { 1, 2, 3, 4 }, File.ReadAllBytes(Path.Combine(folder, name)));
+        await scan.InitializeWebAutomationAsync();
+        Assert.Empty(scan.Duplicates);
+    }
+
     [Fact]
     public async Task FolderRuleBrowserUsesLiveScanPathsAndSavesOnlyOnRequest() {
         var root = Directory.CreateDirectory(Path.Combine(folder, "media")).FullName;

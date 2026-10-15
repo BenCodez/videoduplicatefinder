@@ -9,6 +9,18 @@ On **Scan**, add container-visible media paths and save scan settings. On
 drafts do not affect cleanup until saved. Conflicting saves preserve the newer
 generation; use **Reload saved settings** before reapplying a conflicting edit.
 
+To start over, use **Discard scan results…** on Scan, Results or Automation.
+During a scan the action is **Stop scan and discard results…**. Confirm it to
+request cancellation, wait for scan processing to finish, then clear the current
+and saved result list. Media files, the scan cache, saved reviews and settings
+are kept. **Cancel pending discard** cancels the queued clear; it does not resume
+the scan. A confirmed discard belongs to the server and survives navigation;
+its status and cancel control are shared across pages. Finish or cancel the
+pending discard before starting another operation. Other file or review
+operations must finish before results can be cleared.
+If Automation is opened during a scan or operation, its settings load automatically
+when that operation finishes. Existing unsaved Automation drafts are retained.
+
 Selection supports newest/oldest, quality, strict or weighted folder priorities,
 overlapping rules, protected folders, custom criteria and named selection
 profiles. Dates retain their stored precision; ties use deterministic path order.

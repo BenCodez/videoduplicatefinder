@@ -27,6 +27,7 @@ public partial class Automation {
     bool _refreshing;
     bool _refreshAgain;
     bool _draftDirty;
+    bool _reloadWhenIdle;
     bool _disposed;
     FolderBrowser? _ruleBrowser;
     FolderPriorityRule? _browsedRule;
@@ -51,10 +52,27 @@ public partial class Automation {
         catch (Exception ex) {
             _error = ex.Message + " Reload saved settings or refresh review data before trying again.";
         }
-        finally { _working = false; }
+        finally {
+            _working = false;
+            // Completion can notify while the busy rejection still owns _working.
+            // Retry a deferred initial load after releasing it; failed loads are
+            // left for the explicit Reload action rather than retried forever.
+            if (_reloadWhenIdle && !_disposed && !Scan.IsBusy) {
+                _reloadWhenIdle = false;
+                await ReloadAsync();
+            }
+        }
     }
 
     Task ReloadAsync() => RunAsync(async () => {
+        if (Scan.IsBusy) {
+            _reloadWhenIdle = _draft is null;
+            _notice = _draft is null
+                ? "A scan or operation is running. Settings will load when it finishes."
+                : "Wait for the current operation to finish before reloading settings. Your draft has been kept.";
+            return;
+        }
+        _reloadWhenIdle = false;
         var loaded = await Scan.LoadAutomationAsync();
         _draft = Clone(loaded);
         _draftDirty = false;
@@ -167,7 +185,10 @@ public partial class Automation {
                 // Read operations also emit StateChanged. Do not recursively
                 // refresh in response to our own reads or in-flight actions.
                 if (refresh && !_working && !_refreshing && !Scan.IsBusy && _refreshedGeneration != Scan.AutomationGeneration) {
-                    try { await RefreshDataAsync(); }
+                    try {
+                        if (_draft is null) await ReloadAsync();
+                        else await RefreshDataAsync();
+                    }
                     catch (Exception ex) { _error = "Unable to refresh automation data: " + ex.Message; }
                 }
                 if (!_disposed) StateHasChanged();
